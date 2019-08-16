@@ -5,5 +5,6 @@
 #include <linux/version.h>
 #include <linux/kernel.h>
 #include <kcl/kcl_moduleparam.h>
+#include <kcl/kcl_types.h>
 #include <kcl/kcl_idr.h>
 #endif /* AMDGPU_BACKPORT_H */
