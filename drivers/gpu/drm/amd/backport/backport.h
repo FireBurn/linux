@@ -7,4 +7,5 @@
 #include <kcl/kcl_moduleparam.h>
 #include <kcl/kcl_types.h>
 #include <kcl/kcl_idr.h>
+#include <kcl/kcl_dma_mapping.h>
 #endif /* AMDGPU_BACKPORT_H */
