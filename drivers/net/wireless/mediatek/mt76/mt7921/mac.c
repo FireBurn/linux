@@ -1092,7 +1092,6 @@ mt7921_mac_add_txs_skb(struct mt7921_dev *dev, struct mt76_wcid *wcid, int pid,
 		break;
 	case MT_PHY_TYPE_HT:
 	case MT_PHY_TYPE_HT_GF:
-		rate.mcs += (rate.nss - 1) * 8;
 		if (rate.mcs > 31)
 			goto out;
 
@@ -1195,6 +1194,7 @@ void mt7921_mac_add_txs(struct mt7921_dev *dev, void *data)
 out:
 	rcu_read_unlock();
 }
+EXPORT_SYMBOL_GPL(mt7921_mac_add_txs);
 
 void mt7921_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 			 struct sk_buff *skb)
@@ -1548,7 +1548,16 @@ void mt7921_pm_power_save_work(struct work_struct *work)
 
 	delta = dev->pm.idle_timeout;
 	if (test_bit(MT76_HW_SCANNING, &mphy->state) ||
-	    test_bit(MT76_HW_SCHED_SCANNING, &mphy->state))
+	    test_bit(MT76_HW_SCHED_SCANNING, &mphy->state) ||
+	    dev->fw_assert)
+		goto out;
+
+	if (mutex_is_locked(&dev->mt76.mutex))
+		/* if mt76 mutex is held we should not put the device
+		 * to sleep since we are currently accessing device
+		 * register map. We need to wait for the next power_save
+		 * trigger.
+		 */
 		goto out;
 
 	if (time_is_after_jiffies(dev->pm.last_activity + delta)) {
