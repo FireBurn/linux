@@ -4137,7 +4137,11 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
 		drm_modeset_unlock_all(dev);
 
 		if (aconnector->base.force == DRM_FORCE_UNSPECIFIED)
+#ifdef HAVE_DRM_KMS_HELPER_CONNECTOR_HOTPLUG_EVENT
 			drm_kms_helper_connector_hotplug_event(connector);
+#else
+			drm_kms_helper_hotplug_event(dev);
+#endif
 	} else if (debounce_required) {
 		/*
 		 * HDMI disconnect detected - schedule delayed work instead of
@@ -4180,7 +4184,11 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
 			drm_modeset_unlock_all(dev);
 
 			if (aconnector->base.force == DRM_FORCE_UNSPECIFIED)
+#ifdef HAVE_DRM_KMS_HELPER_CONNECTOR_HOTPLUG_EVENT
 				drm_kms_helper_connector_hotplug_event(connector);
+#else
+				drm_kms_helper_hotplug_event(dev);
+#endif
 		}
 	}
 }
@@ -4313,7 +4321,11 @@ out:
 			dm_restore_drm_connector_state(dev, connector);
 			drm_modeset_unlock_all(dev);
 
+#ifdef HAVE_DRM_KMS_HELPER_CONNECTOR_HOTPLUG_EVENT
 			drm_kms_helper_connector_hotplug_event(connector);
+#else
+			drm_kms_helper_hotplug_event(dev);
+#endif
 		} else {
 			bool ret = false;
 
@@ -4332,7 +4344,11 @@ out:
 				dm_restore_drm_connector_state(dev, connector);
 				drm_modeset_unlock_all(dev);
 
+#ifdef HAVE_DRM_KMS_HELPER_CONNECTOR_HOTPLUG_EVENT
 				drm_kms_helper_connector_hotplug_event(connector);
+#else
+				drm_kms_helper_hotplug_event(dev);
+#endif
 			}
 		}
 	}
