@@ -366,7 +366,7 @@ int amdgpu_ip_block_resume(struct amdgpu_ip_block *ip_block)
  * - "unknown"	- Not known
  *
  */
-
+#ifdef HAVE_PCI_DRIVER_DEV_GROUPS
 static ssize_t amdgpu_device_get_board_info(struct device *dev,
 					    struct device_attribute *attr,
 					    char *buf)
@@ -418,6 +418,7 @@ static const struct attribute_group amdgpu_board_attrs_group = {
 	.attrs = amdgpu_board_attrs,
 	.is_visible = amdgpu_board_attrs_is_visible
 };
+#endif
 
 static void amdgpu_device_get_pcie_info(struct amdgpu_device *adev);
 
@@ -4505,10 +4506,12 @@ static int amdgpu_device_sys_interface_init(struct amdgpu_device *adev)
 	if (r)
 		dev_err(adev->dev, "Could not create amdgpu device attr\n");
 
+#ifdef HAVE_PCI_DRIVER_DEV_GROUPS
 	r = devm_device_add_group(adev->dev, &amdgpu_board_attrs_group);
 	if (r)
 		dev_err(adev->dev,
 			"Could not create amdgpu board attributes\n");
+#endif
 
 	amdgpu_fru_sysfs_init(adev);
 	amdgpu_reg_state_sysfs_init(adev);
