@@ -5,6 +5,7 @@
 pub mod device;
 pub mod driver;
 pub mod file;
+pub mod fourcc;
 pub mod gem;
 pub mod gpuvm;
 pub mod ioctl;
