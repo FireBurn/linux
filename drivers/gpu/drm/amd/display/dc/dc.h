@@ -998,6 +998,7 @@ struct dc_debug_options {
 	bool disable_dfs_bypass;
 	bool disable_dpp_power_gate;
 	bool disable_hubp_power_gate;
+#ifdef CONFIG_DRM_AMD_DC_DSC_SUPPORT
 	bool disable_dsc_power_gate;
 	bool disable_optc_power_gate;
 	bool disable_hpo_power_gate;
@@ -1006,6 +1007,7 @@ struct dc_debug_options {
 	bool disable_dio_power_gate;
 	int dsc_min_slice_height_override;
 	int dsc_bpp_increment_div;
+#endif
 	bool disable_pplib_wm_range;
 	enum wm_report_mode pplib_wm_report_mode;
 	unsigned int min_disp_clk_khz;
@@ -2599,6 +2601,7 @@ struct dc_container_id {
 };
 
 
+#ifdef CONFIG_DRM_AMD_DC_DSC_SUPPORT
 struct dc_sink_dsc_caps {
 	// 'true' if these are virtual DPCD's DSC caps (immediately upstream of sink in MST topology),
 	// 'false' if they are sink's DSC caps
@@ -2608,6 +2611,7 @@ struct dc_sink_dsc_caps {
 	bool is_dsc_passthrough_supported;
 	struct dsc_dec_dpcd_caps dsc_dec_caps;
 };
+#endif
 
 struct dc_sink_hblank_expansion_caps {
 	// 'true' if these are virtual DPCD's HBlank expansion caps (immediately upstream of sink in MST topology),
