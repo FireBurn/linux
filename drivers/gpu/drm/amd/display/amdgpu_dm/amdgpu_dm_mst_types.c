@@ -1041,6 +1041,7 @@ struct dsc_mst_fairness_params {
 	uint32_t bpp_overwrite;
 	struct amdgpu_dm_connector *aconnector;
 };
+#endif
 
 #if defined(CONFIG_DRM_AMD_DC_FP)
 static uint64_t kbps_to_pbn(int kbps, bool is_peak_pbn)
@@ -1067,6 +1068,7 @@ static uint32_t pbn_to_kbps(unsigned int pbn, bool with_margin)
 	return DIV_U64_ROUND_UP(pbn_effective * 8 * 54, 64);
 }
 
+#if defined(HAVE_DRM_DP_MST_ATOMIC_CHECK)
 static void set_dsc_configs_from_fairness_vars(struct dsc_mst_fairness_params *params,
 		struct dsc_mst_fairness_vars *vars,
 		int count,
