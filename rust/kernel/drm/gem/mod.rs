@@ -381,6 +381,10 @@ impl<T: DriverObject, Ctx: DeviceContext> AllocImpl for Object<T, Ctx> {
         gem_prime_import_sg_table: None,
         dumb_create: None,
         dumb_map_offset: None,
+        #[cfg(CONFIG_DRM_FBDEV_EMULATION)]
+        fbdev_probe: Some(bindings::drm_fbdev_dma_driver_fbdev_probe),
+        #[cfg(not(CONFIG_DRM_FBDEV_EMULATION))]
+        fbdev_probe: None,
     };
 }
 
