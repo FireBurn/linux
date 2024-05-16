@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
+use core::marker::PhantomData;
+
 use kernel::{
     auxiliary,
     device::{
@@ -78,6 +80,7 @@ impl drm::Driver for NovaDriver {
     type File = File;
     type Object = gem::Object<NovaObject>;
     type ParentDevice<Ctx: DeviceContext> = auxiliary::Device<Ctx>;
+    type Kms = PhantomData<Self>;
 
     const INFO: drm::DriverInfo = INFO;
 
