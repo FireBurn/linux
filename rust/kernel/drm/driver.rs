@@ -7,7 +7,7 @@
 use crate::{
     bindings,
     device,
-    drm,
+    drm::{self, kms::private::KmsImpl as KmsImplPrivate},
     error::to_result,
     prelude::*,
     sync::aref::ARef, //
@@ -18,6 +18,12 @@ use core::ptr::NonNull;
 pub(crate) const FEAT_GEM: u32 = bindings::drm_driver_feature_DRIVER_GEM;
 /// Driver supports render nodes, i.e.: /dev/dri/renderDXX devices.
 pub(crate) const FEAT_RENDER: u32 = bindings::drm_driver_feature_DRIVER_RENDER;
+
+/// The driver supports modesetting.
+pub(crate) const FEAT_MODESET: u32 = bindings::drm_driver_feature_DRIVER_MODESET;
+
+/// The driver supports atomic modesetting.
+pub(crate) const FEAT_ATOMIC: u32 = bindings::drm_driver_feature_DRIVER_ATOMIC;
 
 /// Information data for a DRM Driver.
 pub struct DriverInfo {
@@ -86,6 +92,12 @@ pub struct AllocOps {
             offset: *mut u64,
         ) -> core::ffi::c_int,
     >,
+    pub(crate) fbdev_probe: Option<
+        unsafe extern "C" fn(
+            fbdev_helper: *mut bindings::drm_fb_helper,
+            sizes: *mut bindings::drm_fb_helper_surface_size,
+        ) -> core::ffi::c_int,
+    >,
 }
 
 /// Trait for memory manager implementations. Implemented internally.
@@ -122,6 +134,14 @@ pub trait Driver {
 
     /// The bus device type of the parent device that the DRM device is associated with.
     type ParentDevice<Ctx: device::DeviceContext>: device::AsBusDevice<Ctx>;
+
+    /// The KMS implementation for this driver.
+    ///
+    /// Drivers that wish to support KMS should pass their implementation of `drm::kms::KmsDriver`
+    /// here. Drivers which do not have KMS support can simply pass `drm::kms::NoKms` here.
+    type Kms: drm::kms::KmsImpl<Driver = Self>
+    where
+        Self: Sized;
 
     /// Driver metadata
     const INFO: DriverInfo;
@@ -170,6 +190,14 @@ impl<'a, T: Driver> Registration<'a, T> {
             return Err(EINVAL);
         }
 
+        let has_kms = drm::Device::<T>::has_kms();
+        let mode_config_info = if has_kms {
+            // SAFETY: `drm` is still an unregistered device and KMS setup only happens here.
+            Some(unsafe { T::Kms::setup_kms(&drm)? })
+        } else {
+            None
+        };
+
         let reg_data: Pin<KBox<T::RegistrationData<'a>>> = KBox::pin_init(reg_data, GFP_KERNEL)?;
 
         // Store the registration data pointer in the device before registration, so that it is
@@ -188,6 +216,20 @@ impl<'a, T: Driver> Registration<'a, T> {
             unsafe { *drm.registration_data.get() = NonNull::dangling() };
             return Err(e);
         }
+
+        #[cfg(CONFIG_DRM_CLIENT)]
+        if let Some(ref info) = mode_config_info {
+            if let Some(fourcc) = info.preferred_fourcc {
+                // SAFETY: The DRM device was successfully registered above.
+                unsafe { bindings::drm_client_setup_with_fourcc(drm.as_raw(), fourcc) }
+            } else {
+                // SAFETY: The DRM device was successfully registered above.
+                unsafe { bindings::drm_client_setup(drm.as_raw(), core::ptr::null()) }
+            }
+        }
+
+        #[cfg(not(CONFIG_DRM_CLIENT))]
+        let _ = mode_config_info;
 
         Ok(Self {
             drm: (&*drm).into(),
@@ -219,6 +261,13 @@ impl<T: Driver> Drop for Registration<'_, T> {
         // SAFETY: Safe by the invariant of `ARef<drm::Device<T>>`. The existence of this
         // `Registration` also guarantees that this `drm::Device` is actually registered.
         unsafe { bindings::drm_dev_unplug(self.drm.as_raw()) };
+
+        if drm::Device::<T>::has_kms() {
+            // SAFETY: KMS was initialized before registration and the device has just been
+            // unplugged, matching the teardown order used by removable DRM drivers.
+            unsafe { bindings::drm_atomic_helper_shutdown(self.drm.as_raw()) }
+        }
+
         // After drm_dev_unplug(), the SRCU barrier guarantees that all RegistrationGuard critical
         // sections have completed, so no one holds a reference to reg_data anymore.
         // reg_data is dropped here automatically.
