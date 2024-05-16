@@ -11,6 +11,7 @@ use crate::{
     drm::{
         self,
         driver::AllocImpl,
+        kms::private::KmsImpl as KmsImplPrivate,
         private::Sealed, //
     },
     error::from_err_ptr,
@@ -159,6 +160,10 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
             features |= drm::driver::FEAT_RENDER;
         }
 
+        if Device::<T>::has_kms() {
+            features |= drm::driver::FEAT_MODESET | drm::driver::FEAT_ATOMIC;
+        }
+
         features
     }
 
@@ -181,7 +186,7 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         dumb_map_offset: T::Object::ALLOC_OPS.dumb_map_offset,
 
         show_fdinfo: None,
-        fbdev_probe: None,
+        fbdev_probe: T::Object::ALLOC_OPS.fbdev_probe,
 
         major: T::INFO.major,
         minor: T::INFO.minor,
@@ -341,6 +346,10 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
     pub(crate) unsafe fn assume_ctx<NewCtx: DeviceContext>(&self) -> &Device<T, NewCtx> {
         // SAFETY: The data layout is identical via our type invariants.
         unsafe { mem::transmute(self) }
+    }
+
+    pub(crate) const fn has_kms() -> bool {
+        <T::Kms as KmsImplPrivate>::MODE_CONFIG_OPS.is_some()
     }
 }
 
