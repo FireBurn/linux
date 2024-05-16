@@ -2,6 +2,8 @@
 
 //! KMS driver abstractions for rust.
 
+pub mod connector;
+
 use crate::{
     device,
     drm::{device::Device, driver::Driver, private::Sealed},
@@ -86,6 +88,14 @@ impl<'a, T: Driver> UnregisteredKmsDevice<'a, T> {
 /// [`PhantomData<Self>`]: PhantomData
 #[vtable]
 pub trait KmsDriver: Driver {
+    /// The driver's [`DriverConnector`] implementation.
+    ///
+    /// TODO: This will be unneeded in the future once we support multiple [`DriverConnector`]
+    /// implementations.
+    ///
+    /// [`DriverConnector`]: connector::DriverConnector
+    type Connector: connector::DriverConnector;
+
     /// Return a [`ModeConfigInfo`] structure for this [`device::Device`].
     fn mode_config_info(
         dev: &device::Device,
@@ -282,7 +292,6 @@ impl<T: StaticModeObject> Clone for KmsRef<T> {
     }
 }
 
-#[expect(unused)]
 macro_rules! impl_aref_for_mode_object {
     (impl $( < $( $param:ident: $bound:ident ),+ > )? for $type:ty) => {
         // SAFETY: drm_mode_object_get()/put() ensure the type is ref-counted according to the
@@ -305,5 +314,4 @@ macro_rules! impl_aref_for_mode_object {
     };
 }
 
-#[expect(unused)]
 pub(super) use impl_aref_for_mode_object;
