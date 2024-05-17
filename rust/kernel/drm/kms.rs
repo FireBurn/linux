@@ -4,6 +4,7 @@
 
 pub mod connector;
 pub mod crtc;
+pub mod encoder;
 pub mod plane;
 
 use crate::{
@@ -112,6 +113,14 @@ pub trait KmsDriver: Driver {
     ///
     /// [`DriverCrtc`]: crtc::DriverCrtc
     type Crtc: crtc::DriverCrtc;
+
+    /// The driver's [`DriverEncoder`] implementation.
+    ///
+    /// TODO: This will be unneeded in the future once we support multiple [`DriverEncoder`]
+    /// implementations.
+    ///
+    /// [`DriverEncoder`]: encoder::DriverEncoder
+    type Encoder: encoder::DriverEncoder;
 
     /// Return a [`ModeConfigInfo`] structure for this [`device::Device`].
     fn mode_config_info(
