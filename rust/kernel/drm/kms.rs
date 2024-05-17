@@ -3,6 +3,7 @@
 //! KMS driver abstractions for rust.
 
 pub mod connector;
+pub mod plane;
 
 use crate::{
     device,
@@ -95,6 +96,14 @@ pub trait KmsDriver: Driver {
     ///
     /// [`DriverConnector`]: connector::DriverConnector
     type Connector: connector::DriverConnector;
+
+    /// The driver's [`DriverPlane`] implementation.
+    ///
+    /// TODO: This will be unneeded in the future once we support multiple [`DriverPlane`]
+    /// implemenations
+    ///
+    /// [`DriverPlane`](plane::DriverPlane)
+    type Plane: plane::DriverPlane;
 
     /// Return a [`ModeConfigInfo`] structure for this [`device::Device`].
     fn mode_config_info(
