@@ -38,7 +38,7 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_connector.h>
-#include <drm/drm_plane.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
