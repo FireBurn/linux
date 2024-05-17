@@ -51,6 +51,7 @@
 #include <drm/drm_gpuvm.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_plane.h>
+#include <drm/drm_probe_helper.h>
 #include <kunit/test.h>
 #include <linux/auxiliary_bus.h>
 #include <linux/bitmap.h>
