@@ -11,7 +11,6 @@ const fn fourcc_code(a: u8, b: u8, c: u8, d: u8) -> u32 {
 
 // TODO: We manually import this because we don't have a reasonable way of getting constants from
 // function-like macros in bindgen yet.
-#[allow(dead_code)]
 pub(crate) const FORMAT_MOD_INVALID: u64 = 0xffffffffffffff;
 
 // TODO: We need to automate importing all of these. For the time being, just add the single one
