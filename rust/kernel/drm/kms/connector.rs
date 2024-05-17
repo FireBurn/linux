@@ -4,7 +4,7 @@
 //!
 //! C header: [`include/drm/drm_connector.h`](srctree/include/drm/drm_connector.h)
 
-use super::{encoder::*, KmsDriver, ModeObject, Sealed};
+use super::{encoder::*, KmsDriver, ModeConfigGuard, ModeObject, Sealed};
 use crate::{
     alloc::KBox,
     bindings,
@@ -15,7 +15,7 @@ use crate::{
 };
 use core::{
     marker::*,
-    mem,
+    mem::{self, ManuallyDrop},
     ops::*,
     ptr::null_mut,
     stringify,
@@ -103,7 +103,7 @@ pub trait DriverConnector: Send + Sync + Sized {
             destroy: Some(connector_destroy_callback::<Self>),
             force: None,
             detect: None,
-            fill_modes: None,
+            fill_modes: Some(bindings::drm_helper_probe_single_connector_modes),
             debugfs_init: None,
             oob_hotplug_event: None,
             atomic_duplicate_state: Some(atomic_duplicate_state_callback::<Self::State>),
@@ -111,7 +111,7 @@ pub trait DriverConnector: Send + Sync + Sized {
         helper_funcs: bindings::drm_connector_helper_funcs {
             mode_valid: None,
             atomic_check: None,
-            get_modes: None,
+            get_modes: Some(get_modes_callback::<Self>),
             detect_ctx: None,
             enable_hpd: None,
             disable_hpd: None,
@@ -142,6 +142,12 @@ pub trait DriverConnector: Send + Sync + Sized {
     ///
     /// Drivers may use this to instantiate their [`DriverConnector`] object.
     fn new(device: &Device<Self::Driver>, args: Self::Args) -> impl PinInit<Self, Error>;
+
+    /// Retrieve a list of available display modes for this [`Connector`].
+    fn get_modes<'a>(
+        connector: ConnectorGuard<'a, Self>,
+        guard: &ModeConfigGuard<'a, Self::Driver>,
+    ) -> i32;
 }
 
 /// The generated C vtable for a [`DriverConnector`].
@@ -187,6 +193,21 @@ impl<T: DriverConnector> Deref for Connector<T> {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
+    }
+}
+
+impl<T: DriverConnector> Connector<T> {
+    /// Acquire a [`ConnectorGuard`] for this connector from a [`ModeConfigGuard`].
+    ///
+    /// This verifies using the provided reference that the given guard is actually for the same
+    /// device as this connector's parent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `guard` is not a [`ModeConfigGuard`] for this connector's parent [`Device`].
+    pub fn guard<'a>(&'a self, guard: &ModeConfigGuard<'a, T::Driver>) -> ConnectorGuard<'a, T> {
+        guard.assert_owner(self.drm_dev());
+        ConnectorGuard(self)
     }
 }
 
@@ -386,6 +407,39 @@ unsafe extern "C" fn connector_destroy_callback<T: DriverConnector>(
     // - We are guaranteed to hold the last remaining reference to this connector
     // - This cast is safe via `DriverConnector`s type invariants.
     drop(unsafe { KBox::from_raw(connector as *mut Connector<T>) });
+}
+
+unsafe extern "C" fn get_modes_callback<T: DriverConnector>(
+    connector: *mut bindings::drm_connector,
+) -> core::ffi::c_int {
+    // SAFETY: This is safe via `DriverConnector`s type invariants.
+    let connector = unsafe { Connector::<T>::from_raw(connector) };
+
+    // SAFETY: This FFI callback is only called while `mode_config.lock` is held
+    // We use ManuallyDrop here to prevent the lock from being released after the callback
+    // completes, as that should be handled by DRM.
+    let guard = ManuallyDrop::new(unsafe { ModeConfigGuard::new(connector.drm_dev()) });
+
+    T::get_modes(connector.guard(&guard), &guard)
+}
+
+/// A privileged [`Connector`] obtained while holding a [`ModeConfigGuard`].
+///
+/// This provides access to various methods for [`Connector`] that must happen under lock, such as
+/// setting resolution preferences and adding display modes.
+///
+/// # Invariants
+///
+/// Shares the invariants of [`ModeConfigGuard`].
+#[derive(Copy, Clone)]
+pub struct ConnectorGuard<'a, T: DriverConnector>(&'a Connector<T>);
+
+impl<T: DriverConnector> Deref for ConnectorGuard<'_, T> {
+    type Target = Connector<T>;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
 }
 
 /// A trait implemented by any type which can produce a reference to a
