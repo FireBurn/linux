@@ -6,6 +6,7 @@ pub mod atomic;
 pub mod connector;
 pub mod crtc;
 pub mod encoder;
+pub mod framebuffer;
 pub mod plane;
 
 use crate::{
