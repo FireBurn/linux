@@ -5,7 +5,8 @@
 //! C header: [`include/drm/drm_plane.h`](srctree/include/drm/drm_plane.h)
 
 use super::{
-    KmsDriver, ModeObject, ModeObjectVtable, StaticModeObject, UnregisteredKmsDevice, Sealed
+    atomic::*, KmsDriver, ModeObject, ModeObjectVtable, StaticModeObject, UnregisteredKmsDevice,
+    Sealed
 };
 use crate::{
     alloc::KBox,
@@ -16,11 +17,12 @@ use crate::{
     types::{NotThreadSafe, Opaque},
 };
 use core::{
+    cell::Cell,
     marker::*,
     mem,
     ops::*,
     pin::Pin,
-    ptr::{null, null_mut},
+    ptr::{null, null_mut, NonNull},
 };
 
 /// The main trait for implementing the [`struct drm_plane`] API for [`Plane`].
@@ -738,6 +740,104 @@ unsafe impl<T: KmsDriver> ModeObjectVtable for OpaquePlaneState<T> {
 
     fn vtable(&self) -> *const Self::Vtable {
         self.plane().vtable()
+    }
+}
+
+/// An interface for mutating a [`Plane`]s atomic state.
+///
+/// This type is typically returned by an [`AtomicStateMutator`] within contexts where it is
+/// possible to safely mutate a plane's state. In order to uphold rust's data-aliasing rules, only
+/// [`PlaneStateMutator`] may exist at a time.
+pub struct PlaneStateMutator<'a, T: FromRawPlaneState> {
+    state: &'a mut T,
+    mask: &'a Cell<u32>,
+}
+
+impl<'a, T: FromRawPlaneState> PlaneStateMutator<'a, T> {
+    pub(super) fn new<D: KmsDriver>(
+        mutator: &'a AtomicStateMutator<D>,
+        state: NonNull<bindings::drm_plane_state>,
+    ) -> Option<Self> {
+        // SAFETY: `plane` is invariant throughout the lifetime of the atomic state, is
+        // initialized by this point, and we're guaranteed it is of type `AsRawPlane` by type
+        // invariance
+        let plane = unsafe { T::Plane::from_raw((*state.as_ptr()).plane) };
+        let plane_mask = plane.mask();
+        let borrowed_mask = mutator.borrowed_planes.get();
+
+        if borrowed_mask & plane_mask == 0 {
+            mutator.borrowed_planes.set(borrowed_mask | plane_mask);
+            Some(Self {
+                mask: &mutator.borrowed_planes,
+                // SAFETY: We're guaranteed `state` is of `FromRawPlaneState` by type invariance,
+                // and we just confirmed by checking `borrowed_planes` that no other mutable borrows
+                // have been taken out for `state`
+                state: unsafe { T::from_raw_mut(state.as_ptr()) },
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl<'a, T: FromRawPlaneState> Drop for PlaneStateMutator<'a, T> {
+    fn drop(&mut self) {
+        let mask = self.state.plane().mask();
+        self.mask.set(self.mask.get() & !mask);
+    }
+}
+
+impl<'a, T: FromRawPlaneState> AsRawPlaneState for PlaneStateMutator<'a, T> {
+    type Plane = T::Plane;
+}
+
+impl<'a, T: FromRawPlaneState> private::AsRawPlaneState for PlaneStateMutator<'a, T> {
+    fn as_raw(&self) -> &bindings::drm_plane_state {
+        self.state.as_raw()
+    }
+
+    unsafe fn as_raw_mut(&mut self) -> &mut bindings::drm_plane_state {
+        // SAFETY: This function is bound by the same safety contract as `self.inner.as_raw_mut()`
+        unsafe { self.state.as_raw_mut() }
+    }
+}
+
+impl<'a, T: FromRawPlaneState> Sealed for PlaneStateMutator<'a, T> {}
+
+impl<'a, T: DriverPlaneState> Deref for PlaneStateMutator<'a, PlaneState<T>> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state.inner
+    }
+}
+
+impl<'a, T: DriverPlaneState> DerefMut for PlaneStateMutator<'a, PlaneState<T>> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state.inner
+    }
+}
+
+// SAFETY: Shares the safety guarantees of `T`'s ModeObjectVtable impl
+unsafe impl<'a, T: FromRawPlaneState> ModeObjectVtable for PlaneStateMutator<'a, T>
+where
+    T: FromRawPlaneState + ModeObjectVtable,
+{
+    type Vtable = T::Vtable;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        self.state.vtable()
+    }
+}
+
+impl<'a, T: DriverPlaneState> PlaneStateMutator<'a, PlaneState<T>> {
+    super::impl_from_opaque_mode_obj! {
+        fn <D, P>(PlaneStateMutator<'a, OpaquePlaneState<D>>) -> Self
+        where
+            T: DriverPlaneState<Plane = P>;
+        use
+            P as DriverPlane,
+            D as KmsDriver<Plane = ...>
     }
 }
 
