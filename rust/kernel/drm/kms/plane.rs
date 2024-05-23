@@ -68,7 +68,11 @@ pub trait DriverPlane: Send + Sync + Sized {
             begin_fb_access: None,
             end_fb_access: None,
             atomic_check: None,
-            atomic_update: None,
+            atomic_update: if Self::HAS_ATOMIC_UPDATE {
+                Some(atomic_update_callback::<Self>)
+            } else {
+                None
+            },
             atomic_enable: None,
             atomic_disable: None,
             atomic_async_check: None,
@@ -96,6 +100,16 @@ pub trait DriverPlane: Send + Sync + Sized {
     ///
     /// Drivers may use this to instantiate their [`DriverPlane`] object.
     fn new(device: &Device<Self::Driver>, args: Self::Args) -> impl PinInit<Self, Error>;
+
+    /// The optional [`drm_plane_helper_funcs.atomic_update`] hook for this plane.
+    ///
+    /// Drivers may use this to customize the atomic update phase of their [`Plane`] objects. If not
+    /// specified, this function is a no-op.
+    ///
+    /// [`drm_plane_helper_funcs.atomic_update`]: srctree/include/drm/drm_modeset_helper_vtables.h
+    fn atomic_update(_commit: PlaneAtomicCommit<'_, Self>) {
+        build_error::build_error("This should not be reachable")
+    }
 }
 
 /// The generated C vtable for a [`DriverPlane`].
@@ -841,6 +855,27 @@ impl<'a, T: DriverPlaneState> PlaneStateMutator<'a, PlaneState<T>> {
     }
 }
 
+/// A token provided to [`DriverPlane`] callbacks during the atomic commit phase for accessing the
+/// plane, atomic state, new and old states of the plane.
+///
+/// # Invariants
+///
+/// This token is proof that the old and new atomic state of `plane` are present in `state` and do
+/// not have any mutators taken out.
+pub struct PlaneAtomicCommit<'a, T: DriverPlane> {
+    state: &'a AtomicStateMutator<T::Driver>,
+    plane: &'a Plane<T>,
+}
+
+impl<'a, T: DriverPlane> PlaneAtomicCommit<'a, T> {
+    impl_atomic_state_token_ops!(
+        PlaneAtomicCommit,
+        AtomicStateMutator,
+        Plane,
+        use <'a, T>
+    );
+}
+
 unsafe extern "C" fn plane_destroy_callback<T: DriverPlane>(plane: *mut bindings::drm_plane) {
     // SAFETY: DRM guarantees that `plane` points to a valid initialized `drm_plane`.
     unsafe { bindings::drm_plane_cleanup(plane) };
@@ -924,4 +959,26 @@ unsafe extern "C" fn plane_reset_callback<T: DriverPlane>(plane: *mut bindings::
     // - DRM guarantees that `plane` points to a valid instance of `drm_plane`.
     // - The cast to `drm_plane_state` is safe via `PlaneState`s type invariants.
     unsafe { bindings::__drm_atomic_helper_plane_reset(plane, KBox::into_raw(new).cast()) };
+}
+
+unsafe extern "C" fn atomic_update_callback<T: DriverPlane>(
+    plane: *mut bindings::drm_plane,
+    state: *mut bindings::drm_atomic_state,
+) {
+    // SAFETY:
+    // - We're guaranteed `plane` is of type `Plane<T>` via type invariants.
+    // - We're guaranteed by DRM that `plane` is pointing to a valid initialized state.
+    let plane = unsafe { Plane::from_raw(plane) };
+
+    // SAFETY: DRM guarantees `state` points to a valid `drm_atomic_state`
+    let state = unsafe { AtomicStateMutator::new(NonNull::new_unchecked(state)) };
+
+    // SAFETY:
+    // - Since we're in the atomic_update callback, we're guaranteed by DRM that both the old and new
+    //   plane state are resent in this atomic state.
+    // - We just created the state mutator above, so other mutators cannot be taken out on the plane
+    //   state yet.
+    let commit = unsafe { PlaneAtomicCommit::new(plane, &state) };
+
+    T::atomic_update(commit);
 }
