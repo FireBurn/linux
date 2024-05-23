@@ -604,6 +604,33 @@ pub trait RawPlaneState: AsRawPlaneState {
         // SAFETY: This cast is guaranteed safe by `OpaqueCrtc`s invariants.
         NonNull::new(self.as_raw().crtc).map(|c| unsafe { OpaqueCrtc::from_raw(c.as_ptr()) })
     }
+
+    /// Run the atomic check helper for this plane and the given CRTC state.
+    fn atomic_helper_check<S, D>(
+        &mut self,
+        crtc_state: &CrtcStateMutator<'_, S>,
+        can_position: bool,
+        can_update_disabled: bool,
+    ) -> Result
+    where
+        D: KmsDriver,
+        S: FromRawCrtcState,
+        S::Crtc: ModesettableCrtc + ModeObject<Driver = D>,
+        Self::Plane: ModeObject<Driver = D>,
+    {
+        // SAFETY: We're passing the mutable reference from `self.as_raw_mut()` directly to DRM,
+        // which is safe.
+        to_result(unsafe {
+            bindings::drm_atomic_helper_check_plane_state(
+                self.as_raw_mut(),
+                crtc_state.as_raw(),
+                bindings::DRM_PLANE_NO_SCALING as _, // TODO: add parameters for scaling
+                bindings::DRM_PLANE_NO_SCALING as _,
+                can_position,
+                can_update_disabled,
+            )
+        })
+    }
 }
 impl<T: AsRawPlaneState + ?Sized> RawPlaneState for T {}
 
