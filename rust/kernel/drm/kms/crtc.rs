@@ -580,6 +580,8 @@ pub(crate) mod private {
     }
 }
 
+pub(super) use private::AsRawCrtcState as AsRawCrtcStatePrivate;
+
 /// Common methods available on any type which implements [`AsRawCrtcState`].
 ///
 /// This is implemented internally by DRM, and provides many of the basic methods for working with
