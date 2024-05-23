@@ -63,7 +63,6 @@ impl<T: KmsDriver> Framebuffer<T> {
     /// The caller guarantews that `ptr` points to a initialized `struct drm_framebuffer` for at
     /// least the entire lifetime of `'a`.
     #[inline]
-    #[allow(dead_code)]
     pub(super) unsafe fn from_raw<'a>(ptr: *const bindings::drm_framebuffer) -> &'a Self {
         // SAFETY: Our data layout is identical to drm_framebuffer
         unsafe { &*ptr.cast() }

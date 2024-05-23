@@ -5,7 +5,7 @@
 //! C header: [`include/drm/drm_plane.h`](srctree/include/drm/drm_plane.h)
 
 use super::{
-    atomic::*, crtc::*, KmsDriver, ModeObject, ModeObjectVtable, StaticModeObject,
+    atomic::*, crtc::*, framebuffer::*, KmsDriver, ModeObject, ModeObjectVtable, StaticModeObject,
     UnregisteredKmsDevice, Sealed
 };
 use crate::{
@@ -630,6 +630,22 @@ pub trait RawPlaneState: AsRawPlaneState {
                 can_update_disabled,
             )
         })
+    }
+
+    /// Return the framebuffer currently set for this plane state
+    #[inline]
+    fn framebuffer<D>(&self) -> Option<&Framebuffer<D>>
+    where
+        Self::Plane: ModeObject<Driver = D>,
+        D: KmsDriver,
+    {
+        // SAFETY: The layout of Framebuffer<T> is identical to `fb`
+        unsafe {
+            self.as_raw()
+                .fb
+                .as_ref()
+                .map(|fb| Framebuffer::from_raw(fb))
+        }
     }
 }
 impl<T: AsRawPlaneState + ?Sized> RawPlaneState for T {}
