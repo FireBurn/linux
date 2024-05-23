@@ -5,8 +5,8 @@
 //! C header: [`include/drm/drm_plane.h`](srctree/include/drm/drm_plane.h)
 
 use super::{
-    atomic::*, KmsDriver, ModeObject, ModeObjectVtable, StaticModeObject, UnregisteredKmsDevice,
-    Sealed
+    atomic::*, crtc::*, KmsDriver, ModeObject, ModeObjectVtable, StaticModeObject,
+    UnregisteredKmsDevice, Sealed
 };
 use crate::{
     alloc::KBox,
@@ -593,6 +593,16 @@ pub trait RawPlaneState: AsRawPlaneState {
         // SAFETY: The index is initialized by the time we expose Plane objects to users, and is
         // invariant throughout the lifetime of the Plane
         unsafe { Self::Plane::from_raw(self.as_raw().plane) }
+    }
+
+    /// Return the current [`OpaqueCrtc`] assigned to this plane, if there is one.
+    fn crtc<'a, 'b: 'a, D>(&'a self) -> Option<&'b OpaqueCrtc<D>>
+    where
+        Self::Plane: ModeObject<Driver = D>,
+        D: KmsDriver,
+    {
+        // SAFETY: This cast is guaranteed safe by `OpaqueCrtc`s invariants.
+        NonNull::new(self.as_raw().crtc).map(|c| unsafe { OpaqueCrtc::from_raw(c.as_ptr()) })
     }
 }
 impl<T: AsRawPlaneState + ?Sized> RawPlaneState for T {}
