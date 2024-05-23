@@ -4,7 +4,7 @@
 //!
 //! C header: [`include/drm/drm_crtc.h`](srctree/include/drm/drm_crtc.h)
 
-use super::{plane::*, KmsDriver, ModeObject, StaticModeObject, UnregisteredKmsDevice, Sealed};
+use super::{plane::*, KmsDriver, ModeObject, StaticModeObject, ModeObjectVtable, UnregisteredKmsDevice, Sealed};
 use crate::{
     alloc::KBox,
     bindings,
@@ -178,6 +178,25 @@ unsafe impl<T: DriverCrtc> ModeObject for Crtc<T> {
 
 // SAFETY: CRTCs are non-refcounted modesetting objects
 unsafe impl<T: DriverCrtc> StaticModeObject for Crtc<T> {}
+
+// SAFETY: `funcs` is initialized when the crtc is allocated
+unsafe impl<T: DriverCrtc> ModeObjectVtable for Crtc<T> {
+    type Vtable = bindings::drm_crtc_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        // SAFETY: `as_raw()` always returns a valid pointer to a CRTC
+        unsafe { *self.as_raw() }.funcs
+    }
+}
+
+impl<T: DriverCrtc> Crtc<T> {
+    super::impl_from_opaque_mode_obj! {
+        fn <'a, D>(&'a OpaqueCrtc<D>) -> &'a Self;
+        use
+            T as DriverCrtc,
+            D as KmsDriver<Crtc = ...>
+    }
+}
 
 /// A [`Crtc`] that has not yet been registered with userspace.
 ///
@@ -355,6 +374,86 @@ pub trait RawCrtc: AsRawCrtc {
 }
 impl<T: AsRawCrtc> RawCrtc for T {}
 
+/// A [`struct drm_crtc`] without a known [`DriverCrtc`] implementation.
+///
+/// This is mainly for situations where our bindings can't infer the [`DriverCrtc`] implementation
+/// for a [`struct drm_crtc`] automatically. It is identical to [`Crtc`], except that it does not
+/// provide access to the driver's private data.
+///
+/// It may be upcasted to a full [`Crtc`] using [`Crtc::from_opaque`] or
+/// [`Crtc::try_from_opaque`].
+///
+/// # Invariants
+///
+/// - `crtc` is initialized for as long as this object is made available to users.
+/// - The data layout of this structure is equivalent to [`struct drm_crtc`].
+///
+/// [`struct drm_crtc`]: srctree/include/drm/drm_crtc.h
+#[repr(transparent)]
+pub struct OpaqueCrtc<T: KmsDriver> {
+    crtc: Opaque<bindings::drm_crtc>,
+    _p: PhantomData<T>,
+}
+
+impl<T: KmsDriver> Sealed for OpaqueCrtc<T> {}
+
+// SAFETY:
+// - Via our type variants our data layout is identical to `drm_crtc`
+// - Since we don't expose `OpaqueCrtc` to users before it has been initialized, this and our data
+//   layout ensure that `as_raw()` always returns a valid pointer to a `drm_crtc`.
+unsafe impl<T: KmsDriver> AsRawCrtc for OpaqueCrtc<T> {
+    fn as_raw(&self) -> *mut bindings::drm_crtc {
+        self.crtc.get()
+    }
+
+    unsafe fn from_raw<'a>(ptr: *mut bindings::drm_crtc) -> &'a Self {
+        // SAFETY: Our data layout starts with `bindings::drm_crtc`
+        unsafe { &*ptr.cast() }
+    }
+}
+
+// SAFETY: We only expose this object to users directly after KmsDriver::create_objects has been
+// called.
+unsafe impl<T: KmsDriver> ModesettableCrtc for OpaqueCrtc<T> {
+    type State = OpaqueCrtcState<T>;
+}
+
+// SAFETY: We don't expose OpaqueCrtc<T> to users before `base` is initialized in Crtc::<T>::new(),
+// so `raw_mode_obj` always returns a valid pointer to a bindings::drm_mode_object.
+unsafe impl<T: KmsDriver> ModeObject for OpaqueCrtc<T> {
+    type Driver = T;
+
+    fn drm_dev(&self) -> &Device<Self::Driver> {
+        // SAFETY: The parent device for a DRM connector will never outlive the connector, and this
+        // pointer is invariant through the lifetime of the connector
+        unsafe { Device::from_raw((*self.as_raw()).dev) }
+    }
+
+    fn raw_mode_obj(&self) -> *mut bindings::drm_mode_object {
+        // SAFETY: We don't expose DRM connectors to users before `base` is initialized
+        unsafe { &raw mut (*self.as_raw()).base }
+    }
+}
+
+// SAFETY: CRTCs are non-refcounted modesetting objects
+unsafe impl<T: KmsDriver> StaticModeObject for OpaqueCrtc<T> {}
+
+// SAFETY: Our CRTC interface is guaranteed to be thread-safe
+unsafe impl<T: KmsDriver> Send for OpaqueCrtc<T> {}
+
+// SAFETY: Our CRTC interface is guaranteed to be thread-safe
+unsafe impl<T: KmsDriver> Sync for OpaqueCrtc<T> {}
+
+// SAFETY: `funcs` is initialized when the CRTC is allocated
+unsafe impl<T: KmsDriver> ModeObjectVtable for OpaqueCrtc<T> {
+    type Vtable = bindings::drm_crtc_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        // SAFETY: `as_raw()` always returns a valid pointer to a crtc
+        unsafe { (*self.as_raw()).funcs }
+    }
+}
+
 impl<T: DriverCrtcState> Sealed for CrtcState<T> {}
 
 /// The main trait for implementing the [`struct drm_crtc_state`] API for a [`Crtc`].
@@ -418,6 +517,26 @@ impl<T: DriverCrtcState> Deref for CrtcState<T> {
 impl<T: DriverCrtcState> DerefMut for CrtcState<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner.get_mut()
+    }
+}
+
+// SAFETY: Shares the safety guarantee of Crtc<T>'s ModeObjectVtable impl
+unsafe impl<T: DriverCrtcState> ModeObjectVtable for CrtcState<T> {
+    type Vtable = bindings::drm_crtc_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        self.crtc().vtable()
+    }
+}
+
+impl<T: DriverCrtcState> CrtcState<T> {
+    super::impl_from_opaque_mode_obj! {
+        fn <'a, D, C>(&'a OpaqueCrtcState<D>) -> &'a Self
+        where
+            T: DriverCrtcState<Crtc = C>;
+        use
+            C as DriverCrtc,
+            D as KmsDriver<Crtc = ...>
     }
 }
 
@@ -491,6 +610,50 @@ impl<T: DriverCrtcState> FromRawCrtcState for CrtcState<T> {
     unsafe fn from_raw<'a>(ptr: *const bindings::drm_crtc_state) -> &'a Self {
         // SAFETY: Our data layout starts with `bindings::drm_crtc_state`
         unsafe { &*(ptr.cast()) }
+    }
+}
+
+/// A [`struct drm_crtc_state`] without a known [`DriverCrtcState`] implementation.
+///
+/// This is mainly for situations where our bindings can't infer the [`DriverCrtcState`]
+/// implementation for a [`struct drm_crtc_state`] automatically. It is identical to [`Crtc`],
+/// except that it does not provide access to the driver's private data.
+///
+/// # Invariants
+///
+/// - `state` is initialized for as long as this object is exposed to users.
+/// - The data layout of this type is identical to [`struct drm_crtc_state`].
+///
+/// [`struct drm_crtc_state`]: srctree/include/drm/drm_crtc.h
+#[repr(transparent)]
+pub struct OpaqueCrtcState<T: KmsDriver> {
+    state: Opaque<bindings::drm_crtc_state>,
+    _p: PhantomData<T>,
+}
+
+impl<T: KmsDriver> AsRawCrtcState for OpaqueCrtcState<T> {
+    type Crtc = OpaqueCrtc<T>;
+}
+
+impl<T: KmsDriver> private::AsRawCrtcState for OpaqueCrtcState<T> {
+    fn as_raw(&self) -> *mut bindings::drm_crtc_state {
+        self.state.get()
+    }
+}
+
+impl<T: KmsDriver> FromRawCrtcState for OpaqueCrtcState<T> {
+    unsafe fn from_raw<'a>(ptr: *const bindings::drm_crtc_state) -> &'a Self {
+        // SAFETY: Our data layout is identical to `bindings::drm_crtc_state`
+        unsafe { &*(ptr.cast()) }
+    }
+}
+
+// SAFETY: Shares the safety guarantees of OpaqueCrtc<T>'s ModeObjectVtable impl
+unsafe impl<T: KmsDriver> ModeObjectVtable for OpaqueCrtcState<T> {
+    type Vtable = bindings::drm_crtc_funcs;
+
+    fn vtable(&self) -> *const Self::Vtable {
+        self.crtc().vtable()
     }
 }
 
