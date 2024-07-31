@@ -16,9 +16,12 @@ use crate::{
     },
     error::from_err_ptr,
     prelude::*,
-    sync::aref::{
-        ARef,
-        AlwaysRefCounted, //
+    sync::{
+        aref::{
+            ARef,
+            AlwaysRefCounted, //
+        },
+        SpinLock,
     },
     types::{
         NotThreadSafe,
@@ -346,6 +349,13 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
     pub(crate) unsafe fn assume_ctx<NewCtx: DeviceContext>(&self) -> &Device<T, NewCtx> {
         // SAFETY: The data layout is identical via our type invariants.
         unsafe { mem::transmute(self) }
+    }
+
+    /// Returns a reference to the `event` spinlock
+    #[allow(dead_code)]
+    pub(crate) fn event_lock(&self) -> &SpinLock<()> {
+        // SAFETY: `event_lock` is initialized for as long as `self` is exposed to users
+        unsafe { SpinLock::from_raw(&mut (*self.as_raw()).event_lock) }
     }
 
     pub(crate) const fn has_kms() -> bool {
