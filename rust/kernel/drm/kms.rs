@@ -342,6 +342,17 @@ impl<T: KmsDriver> Device<T> {
         // held throughout ModeConfigGuard's lifetime.
         ModeConfigGuard(self.mode_config_mutex().lock(), PhantomData)
     }
+
+    /// Return the number of registered CRTCs
+    #[inline]
+    pub fn num_crtcs(&self) -> u32 {
+        // SAFETY:
+        // * This can only be modified during the single-threaded context before registration, so
+        //   this is safe
+        // * num_crtc could be >= 0, but no less - so casting to u32 is fine (and better to prevent
+        //   errors)
+        unsafe { (*self.as_raw()).mode_config.num_crtc as u32 }
+    }
 }
 
 /// A modesetting object in DRM.
