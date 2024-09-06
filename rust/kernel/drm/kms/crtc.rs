@@ -87,8 +87,16 @@ pub trait DriverCrtc: Send + Sync + Sized {
             mode_set: None,
             mode_valid: None,
             mode_fixup: None,
-            atomic_begin: None,
-            atomic_flush: None,
+            atomic_begin: if Self::HAS_ATOMIC_BEGIN {
+                Some(atomic_begin_callback::<Self>)
+            } else {
+                None
+            },
+            atomic_flush: if Self::HAS_ATOMIC_FLUSH {
+                Some(atomic_flush_callback::<Self>)
+            } else {
+                None
+            },
             mode_set_nofb: None,
             mode_set_base: None,
             mode_set_base_atomic: None,
@@ -123,6 +131,26 @@ pub trait DriverCrtc: Send + Sync + Sized {
     /// [`drm_crtc_helper_funcs.atomic_check`]: srctree/include/drm/drm_modeset_helper_vtables.h
     fn atomic_check(_check: CrtcAtomicCheck<'_, Self>) -> Result {
         build_error::build_error("This should not be reachable")
+    }
+
+    /// The optional [`drm_crtc_helper_funcs.atomic_begin`] hook.
+    ///
+    /// This hook will be called before a set of [`Plane`] updates are performed for the given
+    /// [`Crtc`].
+    ///
+    /// [`drm_crtc_helper_funcs.atomic_begin`]: srctree/include/drm/drm_modeset_helper_vtables.h
+    fn atomic_begin(_commit: CrtcAtomicCommit<'_, Self>) {
+        build_error::build_error("This should not be reachable")
+    }
+
+    /// The optional [`drm_crtc_helper_funcs.atomic_flush`] hook.
+    ///
+    /// This hook will be called after a set of [`Plane`] updates are performed for the given
+    /// [`Crtc`].
+    ///
+    /// [`drm_crtc_helper_funcs.atomic_flush`]: srctree/include/drm/drm_modeset_helper_vtables.h
+    fn atomic_flush(_commit: CrtcAtomicCommit<'_, Self>) {
+        build_error::build_error("This should never be reachable")
     }
 }
 
@@ -802,6 +830,28 @@ impl<'a, T: DriverCrtc> CrtcAtomicCheck<'a, T> {
         use <'a, T>
     );
 }
+
+/// A token provided to [`DriverCrtc`] callbacks during the atomic commit phase for accessing the
+/// crtc, atomic state, new and old states of the crtc.
+///
+/// # Invariants
+///
+/// This token is proof that the old and new atomic state of `crtc` are present in `state` and do
+/// not have any mutators taken out.
+pub struct CrtcAtomicCommit<'a, T: DriverCrtc> {
+    state: &'a AtomicStateMutator<T::Driver>,
+    crtc: &'a Crtc<T>,
+}
+
+impl<'a, T: DriverCrtc> CrtcAtomicCommit<'a, T> {
+    impl_atomic_state_token_ops!(
+        CrtcAtomicCommit,
+        AtomicStateMutator,
+        Crtc,
+        use <'a, T>
+    );
+}
+
 unsafe extern "C" fn crtc_destroy_callback<T: DriverCrtc>(crtc: *mut bindings::drm_crtc) {
     // SAFETY: DRM guarantees that `crtc` points to a valid initialized `drm_crtc`.
     unsafe { bindings::drm_crtc_cleanup(crtc) };
@@ -924,4 +974,48 @@ unsafe extern "C" fn atomic_check_callback<T: DriverCrtc>(
         T::atomic_check(check)?;
         Ok(0)
     })
+}
+
+unsafe extern "C" fn atomic_begin_callback<T: DriverCrtc>(
+    crtc: *mut bindings::drm_crtc,
+    state: *mut bindings::drm_atomic_state,
+) {
+    // SAFETY:
+    // * We're guaranteed `crtc` is of type `Crtc<T>` via type invariants.
+    // * We're guaranteed by DRM that `crtc` is pointing to a valid initialized state.
+    let crtc = unsafe { Crtc::from_raw(crtc) };
+
+    // SAFETY: We're guaranteed by DRM that `state` points to a valid instance of `drm_atomic_state`
+    let state = unsafe { AtomicStateMutator::new(NonNull::new_unchecked(state)) };
+
+    // SAFETY:
+    // - Since we're in the atomic_begin callback, we're guaranteed by DRM that both the old and new
+    //   crtc state are resent in this atomic state.
+    // - We just created the state mutator above, so other mutators cannot be taken out on the crtc
+    //   state yet.
+    let commit = unsafe { CrtcAtomicCommit::new(crtc, &state) };
+
+    T::atomic_begin(commit);
+}
+
+unsafe extern "C" fn atomic_flush_callback<T: DriverCrtc>(
+    crtc: *mut bindings::drm_crtc,
+    state: *mut bindings::drm_atomic_state,
+) {
+    // SAFETY:
+    // - We're guaranteed `crtc` is of type `Crtc<T>` via type invariants.
+    // - We're guaranteed by DRM that `crtc` is pointing to a valid initialized state.
+    let crtc = unsafe { Crtc::from_raw(crtc) };
+
+    // SAFETY: We're guaranteed by DRM that `state` points to a valid instance of `drm_atomic_state`
+    let state = unsafe { AtomicStateMutator::new(NonNull::new_unchecked(state)) };
+
+    // SAFETY:
+    // - Since we're in the atomic_flush callback, we're guaranteed by DRM that both the old and new
+    //   crtc state are resent in this atomic state.
+    // - We just created the state mutator above, so other mutators cannot be taken out on the crtc
+    //   state yet.
+    let commit = unsafe { CrtcAtomicCommit::new(crtc, &state) };
+
+    T::atomic_flush(commit);
 }
