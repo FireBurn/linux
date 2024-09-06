@@ -8,6 +8,7 @@ pub mod crtc;
 pub mod encoder;
 pub mod framebuffer;
 pub mod plane;
+pub mod vblank;
 
 use crate::{
     container_of, device,
@@ -19,6 +20,7 @@ use crate::{
 };
 use bindings;
 use core::{
+    cell::Cell,
     marker::PhantomData,
     ops::Deref,
     ptr::{self, addr_of_mut, NonNull},
@@ -168,6 +170,13 @@ pub(crate) use impl_from_opaque_mode_obj;
 /// state required during the initialization process of a [`Device`].
 pub struct UnregisteredKmsDevice<'a, T: Driver> {
     drm: &'a Device<T>,
+    // TODO: Get rid of this - I think the solution we came up on the C side to just make it so that
+    // DRM is a bit more consistent with verifying whether all CRTCs have this implemented or not -
+    // meaning we don't need to keep track of this and can just make the vblank setup conditional on
+    // the implementation of `VblankSupport`.
+    // Note that this also applies to headless devices - those are literally the same but
+    // `dev.num_crtc()` = 0
+    pub(crate) has_vblanks: Cell<bool>,
 }
 
 impl<'a, T: Driver> Deref for UnregisteredKmsDevice<'a, T> {
@@ -185,7 +194,10 @@ impl<'a, T: Driver> UnregisteredKmsDevice<'a, T> {
     ///
     /// The caller promises that `drm` is an unregistered [`Device`].
     pub(crate) unsafe fn new(drm: &'a Device<T>) -> Self {
-        Self { drm }
+        Self {
+            drm,
+            has_vblanks: Cell::new(false),
+        }
     }
 }
 
@@ -293,6 +305,11 @@ impl<T: KmsDriver> private::KmsImpl for T {
 
         T::create_objects(&drm)?;
 
+        if drm.has_vblanks.get() {
+            // SAFETY: `has_vblank` is only true if CRTCs with vblank support were registered
+            to_result(unsafe { bindings::drm_vblank_init(drm.as_raw(), drm.num_crtcs()) })?;
+        }
+
         // TODO: Eventually add a hook to customize how state readback happens, for now just reset
         // SAFETY: Since all static modesetting objects were created in `T::create_objects()`, and
         // that is the only place they can be created, this fulfills the C API requirements.
@@ -343,7 +360,7 @@ impl<T: KmsDriver> Device<T> {
         ModeConfigGuard(self.mode_config_mutex().lock(), PhantomData)
     }
 
-    /// Return the number of registered CRTCs
+    /// Return the number of registered [`Crtc`](crtc::Crtc) objects on this [`Device`].
     #[inline]
     pub fn num_crtcs(&self) -> u32 {
         // SAFETY:

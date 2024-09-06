@@ -21,7 +21,7 @@ use crate::{
             ARef,
             AlwaysRefCounted, //
         },
-        SpinLock,
+        SpinLockIrq,
     },
     types::{
         NotThreadSafe,
@@ -352,10 +352,9 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
     }
 
     /// Returns a reference to the `event` spinlock
-    #[allow(dead_code)]
-    pub(crate) fn event_lock(&self) -> &SpinLock<()> {
+    pub(crate) fn event_lock(&self) -> &SpinLockIrq<()> {
         // SAFETY: `event_lock` is initialized for as long as `self` is exposed to users
-        unsafe { SpinLock::from_raw(&mut (*self.as_raw()).event_lock) }
+        unsafe { SpinLockIrq::from_raw(&mut (*self.as_raw()).event_lock) }
     }
 
     pub(crate) const fn has_kms() -> bool {
