@@ -5,7 +5,7 @@
 //! C header: [`include/drm/drm_crtc.h`](srctree/include/drm/drm_crtc.h)
 
 use super::{
-    atomic::*, plane::*, KmsDriver, ModeObject, ModeObjectVtable, StaticModeObject,
+    atomic::*, plane::*, vblank::*, KmsDriver, ModeObject, ModeObjectVtable, StaticModeObject,
     UnregisteredKmsDevice, Sealed,
 };
 use crate::{
@@ -55,13 +55,13 @@ pub trait DriverCrtc: Send + Sync + Sized {
             cursor_set2: None,
             cursor_set: None,
             destroy: Some(crtc_destroy_callback::<Self>),
-            disable_vblank: None,
+            disable_vblank: <Self::VblankImpl as VblankImpl>::VBLANK_OPS.disable_vblank,
             early_unregister: None,
-            enable_vblank: None,
+            enable_vblank: <Self::VblankImpl as VblankImpl>::VBLANK_OPS.enable_vblank,
             gamma_set: None,
             get_crc_sources: None,
             get_vblank_counter: None,
-            get_vblank_timestamp: None,
+            get_vblank_timestamp: <Self::VblankImpl as VblankImpl>::VBLANK_OPS.get_vblank_timestamp,
             late_register: None,
             page_flip: Some(bindings::drm_atomic_helper_page_flip),
             page_flip_target: None,
@@ -125,6 +125,12 @@ pub trait DriverCrtc: Send + Sync + Sized {
     ///
     /// See [`DriverCrtcState`] for more info.
     type State: DriverCrtcState;
+
+    /// The driver's optional hardware vblank implementation
+    ///
+    /// See [`VblankSupport`] for more info. Drivers that don't care about this can just pass
+    /// [`PhantomData<Self>`].
+    type VblankImpl: VblankImpl<Crtc = Self>;
 
     /// The constructor for creating a [`Crtc`] using this [`DriverCrtc`] implementation.
     ///
@@ -267,6 +273,15 @@ impl<T: DriverCrtc> Crtc<T> {
             T as DriverCrtc,
             D as KmsDriver<Crtc = ...>
     }
+
+    pub(crate) fn get_vblank_ptr(&self) -> *mut bindings::drm_vblank_crtc {
+        // SAFETY: FFI Call with no special requirements
+        unsafe { bindings::drm_crtc_vblank_crtc(self.as_raw()) }
+    }
+
+    pub(crate) const fn has_vblank() -> bool {
+        T::OPS.funcs.enable_vblank.is_some()
+    }
 }
 
 /// A [`Crtc`] that has not yet been registered with userspace.
@@ -297,6 +312,10 @@ impl<T: DriverCrtc> UnregisteredCrtc<T> {
         PrimaryData: DriverPlane<Driver = T::Driver>,
         CursorData: DriverPlane<Driver = T::Driver>,
     {
+        if Crtc::<T>::has_vblank() {
+            dev.has_vblanks.set(true)
+        }
+
         let this: Pin<KBox<Crtc<T>>> = KBox::try_pin_init(
             try_pin_init!(Crtc {
                 crtc: Opaque::new(bindings::drm_crtc {
