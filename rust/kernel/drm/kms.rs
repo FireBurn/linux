@@ -250,6 +250,29 @@ pub trait KmsDriver: Driver {
     fn create_objects(drm: &UnregisteredKmsDevice<'_, Self>) -> Result
     where
         Self: Sized;
+
+    /// The optional [`atomic_commit_tail`] callback for this [`Device`].
+    ///
+    /// It must return a [`CommittedAtomicState`] to prove that it has signaled completion of the hw
+    /// commit phase. Drivers may use this function to customize the order in which commits are
+    /// performed during the atomic commit phase.
+    ///
+    /// If not provided, DRM will use its own default atomic commit tail helper
+    /// [`drm_atomic_helper_commit_tail`].
+    ///
+    /// [`CommittedAtomicState`]: atomic::CommittedAtomicState
+    /// [`atomic_commit_tail`]: srctree/include/drm/drm_modeset_helper_vtables.h
+    /// [`drm_atomic_helper_commit_tail`]: srctree/include/drm/drm_atomic_helpers.h
+    fn atomic_commit_tail<'a>(
+        _state: atomic::AtomicCommitTail<'a, Self>,
+        _modeset_token: atomic::ModesetsReadyToken<'_>,
+        _plane_update_token: atomic::PlaneUpdatesReadyToken<'_>,
+    ) -> atomic::CommittedAtomicState<'a, Self>
+    where
+        Self: Sized,
+    {
+        build_error::build_error("This function should not be reachable")
+    }
 }
 
 impl<T: KmsDriver> private::KmsImpl for T {
@@ -269,7 +292,11 @@ impl<T: KmsDriver> private::KmsImpl for T {
 
         kms_helper_vtable: bindings::drm_mode_config_helper_funcs {
             atomic_commit_setup: None,
-            atomic_commit_tail: None,
+            atomic_commit_tail: if Self::HAS_ATOMIC_COMMIT_TAIL {
+                Some(atomic::commit_tail_callback::<Self>)
+            } else {
+                None
+            },
         },
     });
 
