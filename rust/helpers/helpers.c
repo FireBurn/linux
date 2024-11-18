@@ -62,7 +62,7 @@
 #include "dma_fence.c"
 #include "dma-resv.c"
 #endif
-#include "drm.c"
+#include "drm/drm.c"
 #include "drm_gpuvm.c"
 #include "err.c"
 #include "fs.c"
