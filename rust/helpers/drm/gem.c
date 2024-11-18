@@ -2,9 +2,6 @@
 
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
-#include <drm/drm_vma_manager.h>
-
-#ifdef CONFIG_DRM
 
 __rust_helper void rust_helper_drm_gem_object_get(struct drm_gem_object *obj)
 {
@@ -14,12 +11,6 @@ __rust_helper void rust_helper_drm_gem_object_get(struct drm_gem_object *obj)
 __rust_helper void rust_helper_drm_gem_object_put(struct drm_gem_object *obj)
 {
 	drm_gem_object_put(obj);
-}
-
-__rust_helper __u64
-rust_helper_drm_vma_node_offset_addr(struct drm_vma_offset_node *node)
-{
-	return drm_vma_node_offset_addr(node);
 }
 
 #ifdef CONFIG_DRM_GEM_SHMEM_HELPER
@@ -75,4 +66,3 @@ rust_helper_drm_gem_shmem_object_mmap(struct drm_gem_object *obj, struct vm_area
 }
 
 #endif /* CONFIG_DRM_GEM_SHMEM_HELPER */
-#endif /* CONFIG_DRM */
