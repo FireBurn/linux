@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0
+
+#include <drm/drm_vma_manager.h>
+
+__rust_helper __u64
+rust_helper_drm_vma_node_offset_addr(struct drm_vma_offset_node *node)
+{
+	return drm_vma_node_offset_addr(node);
+}
