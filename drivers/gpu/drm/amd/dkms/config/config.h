@@ -669,8 +669,20 @@
 /* fault_flag_allow_retry_first() is available */
 #define HAVE_FAULT_FLAG_ALLOW_RETRY_FIRST 1
 
-/* drm_mode_object->free_cb is available */
-/* #undef HAVE_FREE_CB_IN_STRUCT_DRM_MODE_OBJECT */
+/* file_operation->fop_flags is available */
+#define HAVE_FILE_OPERATION_FOP_FLAGS 1
+
+/* firmware_request_nowarn() is available */
+#define HAVE_FIRMWARE_REQUEST_NOWARN 1
+
+/* follow_pfn() is available */
+/* #undef HAVE_FOLLOW_PFN */
+
+/* follow_pfnmap_start() is available */
+#define HAVE_FOLLOW_PFNMAP_START 1
+
+/* fsleep() is available */
+#define HAVE_FSLEEP 1
 
 /* fs_reclaim_acquire() is available */
 #define HAVE_FS_RECLAIM_ACQUIRE 1
