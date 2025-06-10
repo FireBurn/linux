@@ -121,12 +121,7 @@ pub trait DriverPlane: Send + Sync + Sized {
     /// result of this function determines whether the atomic check passed or failed.
     ///
     /// [`drm_plane_helper_funcs.atomic_check`]: srctree/include/drm/drm_modeset_helper_vtables.h
-    fn atomic_check(
-        _plane: &Plane<Self>,
-        _new_state: PlaneStateMutator<'_, PlaneState<Self::State>>,
-        _old_state: &PlaneState<Self::State>,
-        _state: &AtomicStateComposer<Self::Driver>,
-    ) -> Result {
+    fn atomic_check(_check: PlaneAtomicCheck<'_, Self>) -> Result {
         build_error::build_error("This should not be reachable")
     }
 }
@@ -874,6 +869,24 @@ impl<'a, T: DriverPlaneState> PlaneStateMutator<'a, PlaneState<T>> {
     }
 }
 
+/// A token provided during [`atomic_check`] callbacks for accessing the plane, atomic state, and
+/// the old and new states of the plane.
+///
+/// [`atomic_check`]: DriverPlane::atomic_check
+pub struct PlaneAtomicCheck<'a, T: DriverPlane> {
+    state: &'a AtomicStateComposer<T::Driver>,
+    plane: &'a Plane<T>,
+}
+
+impl<'a, T: DriverPlane> PlaneAtomicCheck<'a, T> {
+    impl_atomic_state_token_ops!(
+        PlaneAtomicCheck,
+        AtomicStateComposer,
+        Plane,
+        use <'a, T>
+    );
+}
+
 /// A token provided to [`DriverPlane`] callbacks during the atomic commit phase for accessing the
 /// plane, atomic state, new and old states of the plane.
 ///
@@ -1018,14 +1031,12 @@ unsafe extern "C" fn atomic_check_callback<T: DriverPlane>(
         AtomicStateComposer::<T::Driver>::new(NonNull::new_unchecked(state))
     });
 
-    // SAFETY: We're guaranteed by DRM that both the old and new atomic state are present within
-    // this `drm_atomic_state`
-    let (old_state, new_state) = unsafe {
-        (
-            state.get_old_plane_state(plane).unwrap_unchecked(),
-            state.get_new_plane_state(plane).unwrap_unchecked(),
-        )
-    };
+    // SAFETY:
+    // - Since we're in the atomic check callback, we're guaranteed by DRM that both the old and
+    //   new plane state are present in this atomic state
+    // - We just created the state composer above, so other composers cannot be taken out on the
+    //   plane state yet.
+    let check = unsafe { PlaneAtomicCheck::new(plane, &state) };
 
-    from_result(|| T::atomic_check(plane, new_state, old_state, &state).map(|_| 0))
+    from_result(|| T::atomic_check(check).map(|_| 0))
 }
