@@ -4,7 +4,7 @@
 //!
 //! C header: [`include/drm/drm_connector.h`](srctree/include/drm/drm_connector.h)
 
-use super::{KmsDriver, ModeObject, Sealed};
+use super::{encoder::*, KmsDriver, ModeObject, Sealed};
 use crate::{
     alloc::KBox,
     bindings,
@@ -357,6 +357,18 @@ impl<T: DriverConnector> UnregisteredConnector<T> {
 
         // SAFETY: We just allocated the connector above, so this pointer must be valid
         Ok(unsafe { &*this })
+    }
+
+    /// Attach an encoder to this [`Connector`].
+    #[must_use]
+    pub fn attach_encoder(&self, encoder: &impl AsRawEncoder) -> Result {
+        // SAFETY:
+        // - Both as_raw() calls are guaranteed to return a valid pointer
+        // - We're guaranteed this connector is not registered via our type invariants, thus this
+        //   function is safe to call
+        to_result(unsafe {
+            bindings::drm_connector_attach_encoder(self.as_raw(), encoder.as_raw())
+        })
     }
 }
 
