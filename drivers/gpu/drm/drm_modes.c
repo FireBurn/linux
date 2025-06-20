@@ -2788,7 +2788,7 @@ EXPORT_SYMBOL(drm_mode_is_420);
  * and @vpref.
  */
 void drm_set_preferred_mode(struct drm_connector *connector,
-			    int hpref, int vpref)
+			    unsigned int hpref, unsigned int vpref)
 {
 	struct drm_display_mode *mode;
 
