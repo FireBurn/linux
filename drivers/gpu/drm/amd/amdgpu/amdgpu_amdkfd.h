@@ -484,7 +484,7 @@ void kgd2kfd_spm_interrupt(struct kfd_dev *kfd, int xcc_id);
 int kgd2kfd_quiesce_mm(struct mm_struct *mm, uint32_t trigger);
 int kgd2kfd_resume_mm(struct mm_struct *mm);
 int kgd2kfd_schedule_evict_and_restore_process(struct mm_struct *mm,
-						struct dma_fence *fence);
+					       u16 context_id, struct dma_fence *fence);
 #if IS_ENABLED(CONFIG_HSA_AMD)
 int kgd2kfd_init(void);
 void kgd2kfd_exit(void);
