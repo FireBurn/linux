@@ -978,6 +978,18 @@
 /* release_pages() wants 2 args */
 #define HAVE_MM_RELEASE_PAGES_2ARGS 1
 
+/* MODULE_IMPORT_NS() wants a string arguments */
+#define HAVE_MODULE_IMPORT_NS_NEED_A_STRING 1
+
+/* kvrealloc() isn't available */
+/* #undef HAVE_NO_KVREALLOC */
+
+/* class_create has one argument */
+#define HAVE_ONE_ARGUMENT_OF_CLASS_CREATE 1
+
+/* page_pgmap() is available */
+#define HAVE_PAGE_PGMAP 1
+
 /* pcie_aspm_enabled() is available */
 #define HAVE_PCIE_ASPM_ENABLED 1
 
