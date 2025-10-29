@@ -7,6 +7,7 @@ pub mod connector;
 pub mod crtc;
 pub mod encoder;
 pub mod framebuffer;
+pub mod modes;
 pub mod plane;
 pub mod vblank;
 
