@@ -471,6 +471,10 @@ struct psp_context {
 #if defined(CONFIG_DEBUG_FS)
 	struct spirom_bo *spirom_dump_trip;
 #endif
+	enum amdgpu_ptl_fmt		ptl_fmt1;
+	enum amdgpu_ptl_fmt		ptl_fmt2;
+	bool				ptl_enabled;
+	bool				ptl_hw_supported;
 };
 
 struct amdgpu_psp_funcs {
@@ -653,5 +657,7 @@ void amdgpu_psp_debugfs_init(struct amdgpu_device *adev);
 int amdgpu_psp_get_fw_type(struct amdgpu_firmware_info *ucode,
 			   enum psp_gfx_fw_type *type);
 
+int psp_performance_monitor_hw(struct psp_context *psp, u32 req_code,
+			       u32 *ptl_state, u32 *fmt1, u32 *fmt2);
 
 #endif
