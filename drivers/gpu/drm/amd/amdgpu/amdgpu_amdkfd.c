@@ -336,7 +336,8 @@ int amdgpu_amdkfd_alloc_kernel_mem(struct amdgpu_device *adev, size_t size,
 	bp.byte_align = PAGE_SIZE;
 	bp.domain = domain;
 	if (is_uswc_mode)
-		bp.flags = AMDGPU_GEM_CREATE_CPU_GTT_USWC;
+		bp.flags = AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS |
+			AMDGPU_GEM_CREATE_CPU_GTT_USWC;
 	else
 		bp.flags = 0;
 	bp.type = ttm_bo_type_kernel;
