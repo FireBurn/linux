@@ -563,13 +563,14 @@ static int vangogh_get_dpm_clk_limited(struct smu_context *smu, enum smu_clk_typ
 	return 0;
 }
 
-static int vangogh_print_legacy_clk_levels(struct smu_context *smu,
-			enum smu_clk_type clk_type, char *buf)
+static int vangogh_emit_legacy_clk_levels(struct smu_context *smu,
+					   enum smu_clk_type clk_type, char *buf,
+					   int *offset)
 {
+	int i, idx, size = *offset, ret = 0, start_offset = *offset;
 	DpmClocks_t *clk_table = smu->smu_table.clocks_table;
 	SmuMetrics_legacy_t metrics;
 	struct smu_dpm_context *smu_dpm_ctx = &(smu->smu_dpm);
-	int i, idx, size = 0, ret = 0, start_offset = 0;
 	uint32_t cur_value = 0, value = 0, count = 0;
 	bool cur_value_match_level = false;
 
@@ -578,9 +579,6 @@ static int vangogh_print_legacy_clk_levels(struct smu_context *smu,
 	ret = smu_cmn_get_metrics_table(smu, &metrics, false);
 	if (ret)
 		return ret;
-
-	smu_cmn_get_sysfs_buf(&buf, &size);
-	start_offset = size;
 
 	switch (clk_type) {
 	case SMU_OD_SCLK:
@@ -663,15 +661,18 @@ static int vangogh_print_legacy_clk_levels(struct smu_context *smu,
 		break;
 	}
 
-	return size - start_offset;
+	*offset += size - start_offset;
+
+	return 0;
 }
 
-static int vangogh_print_clk_levels(struct smu_context *smu,
-			enum smu_clk_type clk_type, char *buf)
+static int vangogh_emit_clk_levels(struct smu_context *smu,
+				    enum smu_clk_type clk_type, char *buf,
+				    int *offset)
 {
+	int i, idx, size = *offset, ret = 0, start_offset = *offset;
 	DpmClocks_t *clk_table = smu->smu_table.clocks_table;
 	SmuMetrics_t metrics;
-	int i, idx, size = 0, ret = 0, start_offset = 0;
 	uint32_t cur_value = 0, value = 0, count = 0;
 	bool cur_value_match_level = false;
 	uint32_t min, max;
@@ -681,9 +682,6 @@ static int vangogh_print_clk_levels(struct smu_context *smu,
 	ret = smu_cmn_get_metrics_table(smu, &metrics, false);
 	if (ret)
 		return ret;
-
-	smu_cmn_get_sysfs_buf(&buf, &size);
-	start_offset = size;
 
 	switch (clk_type) {
 	case SMU_OD_SCLK:
@@ -785,18 +783,21 @@ static int vangogh_print_clk_levels(struct smu_context *smu,
 		break;
 	}
 
-	return size - start_offset;
+	*offset += size - start_offset;
+
+	return 0;
 }
 
-static int vangogh_common_print_clk_levels(struct smu_context *smu,
-			enum smu_clk_type clk_type, char *buf)
+static int vangogh_common_emit_clk_levels(struct smu_context *smu,
+					   enum smu_clk_type clk_type, char *buf,
+					   int *offset)
 {
 	int ret = 0;
 
 	if (smu->smc_fw_if_version < 0x3)
-		ret = vangogh_print_legacy_clk_levels(smu, clk_type, buf);
+		ret = vangogh_emit_legacy_clk_levels(smu, clk_type, buf, offset);
 	else
-		ret = vangogh_print_clk_levels(smu, clk_type, buf);
+		ret = vangogh_emit_clk_levels(smu, clk_type, buf, offset);
 
 	return ret;
 }
@@ -2528,7 +2529,7 @@ static const struct pptable_funcs vangogh_ppt_funcs = {
 	.interrupt_work = smu_v11_0_interrupt_work,
 	.get_gpu_metrics = vangogh_common_get_gpu_metrics,
 	.od_edit_dpm_table = vangogh_od_edit_dpm_table,
-	.print_clk_levels = vangogh_common_print_clk_levels,
+	.emit_clk_levels = vangogh_common_emit_clk_levels,
 	.set_default_dpm_table = vangogh_set_default_dpm_tables,
 	.set_fine_grain_gfx_freq_parameters = vangogh_set_fine_grain_gfx_freq_parameters,
 	.notify_rlc_state = vangogh_notify_rlc_state,
