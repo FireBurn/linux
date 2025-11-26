@@ -1611,10 +1611,11 @@ static int smu_v13_0_6_print_clks(struct smu_context *smu, char *buf, int size,
 	return size;
 }
 
-static int smu_v13_0_6_print_clk_levels(struct smu_context *smu,
-					enum smu_clk_type type, char *buf)
+static int smu_v13_0_6_emit_clk_levels(struct smu_context *smu,
+				       enum smu_clk_type type, char *buf,
+				       int *offset)
 {
-	int now, size = 0, start_offset = 0;
+	int now, size = *offset, start_offset = *offset;
 	int ret = 0;
 	struct smu_umd_pstate_table *pstate_table = &smu->pstate_table;
 	struct smu_13_0_dpm_table *single_dpm_table;
@@ -1622,12 +1623,9 @@ static int smu_v13_0_6_print_clk_levels(struct smu_context *smu,
 	struct smu_13_0_dpm_context *dpm_context = NULL;
 	uint32_t min_clk, max_clk;
 
-	smu_cmn_get_sysfs_buf(&buf, &size);
-	start_offset = size;
-
 	if (amdgpu_ras_intr_triggered()) {
-		size += sysfs_emit_at(buf, size, "unavailable\n");
-		return size - start_offset;
+		sysfs_emit_at(buf, size, "unavailable\n");
+		return -EBUSY;
 	}
 
 	dpm_context = smu_dpm->dpm_context;
@@ -1704,7 +1702,7 @@ static int smu_v13_0_6_print_clk_levels(struct smu_context *smu,
 		if (ret < 0)
 			return ret;
 
-		size += ret;
+		size = ret;
 		break;
 	case SMU_SOCCLK:
 		ret = smu_v13_0_6_get_current_clk_freq_by_table(smu, SMU_SOCCLK,
@@ -1722,7 +1720,7 @@ static int smu_v13_0_6_print_clk_levels(struct smu_context *smu,
 		if (ret < 0)
 			return ret;
 
-		size += ret;
+		size = ret;
 		break;
 	case SMU_FCLK:
 		ret = smu_v13_0_6_get_current_clk_freq_by_table(smu, SMU_FCLK,
@@ -1740,7 +1738,7 @@ static int smu_v13_0_6_print_clk_levels(struct smu_context *smu,
 		if (ret < 0)
 			return ret;
 
-		size += ret;
+		size = ret;
 		break;
 	case SMU_VCLK:
 		ret = smu_v13_0_6_get_current_clk_freq_by_table(smu, SMU_VCLK,
@@ -1758,7 +1756,7 @@ static int smu_v13_0_6_print_clk_levels(struct smu_context *smu,
 		if (ret < 0)
 			return ret;
 
-		size += ret;
+		size = ret;
 		break;
 	case SMU_DCLK:
 		ret = smu_v13_0_6_get_current_clk_freq_by_table(smu, SMU_DCLK,
@@ -1776,13 +1774,15 @@ static int smu_v13_0_6_print_clk_levels(struct smu_context *smu,
 		if (ret < 0)
 			return ret;
 
-		size += ret;
+		size = ret;
 		break;
 	default:
 		break;
 	}
 
-	return size - start_offset;
+	*offset += size - start_offset;
+
+	return 0;
 }
 
 static int smu_v13_0_6_upload_dpm_level(struct smu_context *smu, bool max,
@@ -4190,7 +4190,7 @@ static const struct pptable_funcs smu_v13_0_6_ppt_funcs = {
 	/* dpm/clk tables */
 	.set_default_dpm_table = smu_v13_0_6_set_default_dpm_table,
 	.populate_umd_state_clk = smu_v13_0_6_populate_umd_state_clk,
-	.print_clk_levels = smu_v13_0_6_print_clk_levels,
+	.emit_clk_levels = smu_v13_0_6_emit_clk_levels,
 	.force_clk_levels = smu_v13_0_6_force_clk_levels,
 	.read_sensor = smu_v13_0_6_read_sensor,
 	.set_performance_level = smu_v13_0_6_set_performance_level,
