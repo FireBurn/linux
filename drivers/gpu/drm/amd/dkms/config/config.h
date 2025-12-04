@@ -112,9 +112,6 @@
 /* drm_edid_raw() is available */
 #define HAVE_CRTC_DRM_VBLANK_CRTC 1
 
-/* debugfs_create_file_size() is available */
-#define HAVE_DEBUGFS_CREATE_FILE_SIZE 1
-
 /* kobj_type->default_groups is available */
 #define HAVE_DEFAULT_GROUP_IN_KOBJ_TYPE 1
 
