@@ -4520,6 +4520,7 @@ static int amdgpu_device_sys_interface_init(struct amdgpu_device *adev)
 	amdgpu_fru_sysfs_init(adev);
 	amdgpu_reg_state_sysfs_init(adev);
 	amdgpu_xcp_sysfs_init(adev);
+	amdgpu_ptl_sysfs_init(adev);
 
 	return r;
 }
@@ -4535,6 +4536,7 @@ static void amdgpu_device_sys_interface_fini(struct amdgpu_device *adev)
 
 	amdgpu_reg_state_sysfs_fini(adev);
 	amdgpu_xcp_sysfs_fini(adev);
+	amdgpu_ptl_sysfs_fini(adev);
 }
 
 /**
