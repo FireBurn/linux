@@ -841,9 +841,6 @@
 /* io_mapping_unmap_local() is available */
 #define HAVE_IO_MAPPING_UNMAP_LOCAL 1
 
-/* irq_domain_create_linear() is available */
-#define HAVE_IRQ_DOMAIN_CREATE_LINEAR 1
-
 /* is_cow_mapping() is available */
 #define HAVE_IS_COW_MAPPING 1
 

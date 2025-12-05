@@ -151,7 +151,6 @@
 #include <kcl/kcl_overflow.h>
 #include <kcl/kcl_drm_probe_helper.h>
 #include <kcl/kcl_ratelimit.h>
-#include <kcl/kcl_irq.h>
 #include <kcl/kcl_uio.h>
 #include <kcl/kcl_mempool.h>
 
