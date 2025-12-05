@@ -829,9 +829,6 @@
 /* import_guid() is available */
 #define HAVE_IMPORT_GUID 1
 
-/* in_compat_syscall is defined */
-#define HAVE_IN_COMPAT_SYSCALL 1
-
 /* io_mapping_map_local_wc() is available */
 #define HAVE_IO_MAPPING_MAP_LOCAL_WC 1
 
