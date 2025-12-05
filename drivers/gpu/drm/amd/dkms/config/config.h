@@ -67,9 +67,6 @@
 /* bin_attrs in struct attribute_group is const */
 #define HAVE_ATTRIBUTE_GROUP_BIN_ATTRS_NEW 1
 
-/* backlight_device_set_brightness() is available */
-#define HAVE_BACKLIGHT_DEVICE_SET_BRIGHTNESS 1
-
 /* bin_attribute.read is const args */
 #define HAVE_BIN_ATTR_CONST_ARGS 1
 
