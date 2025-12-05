@@ -1117,9 +1117,6 @@
 /* pm_suspend_target_state is available */
 #define HAVE_PM_SUSPEND_TARGET_STATE 1
 
-/* pm_suspend_via_firmware() is available */
-#define HAVE_PM_SUSPEND_VIA_FIRMWARE 1
-
 /* pxm_to_node() is available */
 #define HAVE_PXM_TO_NODE 1
 

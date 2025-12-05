@@ -19,12 +19,6 @@ static inline void ksys_sync_helper(void) {}
 #endif /* HAVE_KSYS_SYNC_HELPER */
 #endif /* CONFIG_PM_SLEEP */
 
-#ifndef HAVE_PM_SUSPEND_VIA_FIRMWARE
-static inline bool pm_suspend_via_firmware(void) { return false; }
-
-static inline bool pm_resume_via_firmware(void) { return false; }
-#endif /* HAVE_PM_SUSPEND_VIA_FIRMWARE */
-
 #ifndef HAVE_PM_HIBERNATE_IS_RECOVERING
 static inline bool pm_hibernate_is_recovering(void) { return false; }
 #endif /* HAVE_PM_HIBERNATE_IS_RECOVERING */
