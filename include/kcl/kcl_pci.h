@@ -113,18 +113,6 @@ static inline enum pcie_link_width kcl_pcie_get_width_cap(struct pci_dev *dev)
 	return pcie_get_width_cap(dev);
 }
 
-/* Copied from v3.12-rc2-29-gc6bde215acfd include/linux/pci.h */
-#if !defined(HAVE_PCI_UPSTREAM_BRIDGE)
-static inline struct pci_dev *pci_upstream_bridge(struct pci_dev *dev)
-{
-	dev = pci_physfn(dev);
-	if (pci_is_root_bus(dev->bus))
-		return NULL;
-
-	return dev->bus->self;
-}
-#endif
-
 #if !defined(HAVE_PCI_CONFIGURE_EXTENDED_TAGS)
 void _kcl_pci_configure_extended_tags(struct pci_dev *dev);
 #endif

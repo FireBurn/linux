@@ -1096,9 +1096,6 @@
 /* pci_rebar_bytes_to_size() is available */
 #define HAVE_PCI_REBAR_BYTES_TO_SIZE 1
 
-/* pci_upstream_bridge() is available */
-#define HAVE_PCI_UPSTREAM_BRIDGE 1
-
 /* PIDTYPE is availablea */
 #define HAVE_PIDTYPE_TGID 1
 
