@@ -2482,7 +2482,6 @@ static void amdgpu_ras_interrupt_poison_creation_handler(struct ras_manager *obj
 	event_id = amdgpu_ras_acquire_event_id(adev, type);
 	RAS_EVENT_LOG(adev, event_id, "Poison is created\n");
 
-#ifdef HAVE_KFIFO_PUT_NON_POINTER
 	if (amdgpu_ip_version(obj->adev, UMC_HWIP, 0) >= IP_VERSION(12, 0, 0)) {
 		struct amdgpu_ras *con = amdgpu_ras_get_context(obj->adev);
 
@@ -2491,7 +2490,6 @@ static void amdgpu_ras_interrupt_poison_creation_handler(struct ras_manager *obj
 
 		wake_up(&con->page_retirement_wq);
 	}
-#endif
 }
 
 static void amdgpu_ras_interrupt_umc_handler(struct ras_manager *obj,
@@ -3510,7 +3508,6 @@ static void amdgpu_ras_validate_threshold(struct amdgpu_device *adev,
 	}
 }
 
-#ifdef HAVE_KFIFO_PUT_NON_POINTER
 int amdgpu_ras_put_poison_req(struct amdgpu_device *adev,
 		enum amdgpu_ras_block block, uint16_t pasid,
 		pasid_notify pasid_fn, void *data, uint32_t reset)
@@ -3542,7 +3539,6 @@ static int amdgpu_ras_get_poison_req(struct amdgpu_device *adev,
 
 	return kfifo_get(&con->poison_fifo, poison_msg);
 }
-#endif
 
 #ifdef HAVE_RADIX_TREE_ITER_DELETE
 static void amdgpu_ras_ecc_log_init(struct ras_ecc_log_info *ecc_log)
@@ -3658,7 +3654,6 @@ static int amdgpu_ras_poison_creation_handler(struct amdgpu_device *adev,
 	return 0;
 }
 
-#ifdef HAVE_KFIFO_PUT_NON_POINTER
 static void amdgpu_ras_clear_poison_fifo(struct amdgpu_device *adev)
 {
 	struct amdgpu_ras *con = amdgpu_ras_get_context(adev);
@@ -3717,7 +3712,6 @@ static int amdgpu_ras_poison_consumption_handler(struct amdgpu_device *adev,
 
 	return 0;
 }
-#endif
 
 static int amdgpu_ras_page_retirement_thread(void *param)
 {
@@ -3752,7 +3746,6 @@ static int amdgpu_ras_page_retirement_thread(void *param)
 		} while (atomic_read(&con->poison_creation_count) &&
 			!atomic_read(&con->poison_consumption_count));
 
-#ifdef HAVE_KFIFO_PUT_NON_POINTER
 		if (ret != -EIO) {
 			msg_count = kfifo_len(&con->poison_fifo);
 			if (msg_count) {
@@ -3799,7 +3792,6 @@ static int amdgpu_ras_page_retirement_thread(void *param)
 			schedule_delayed_work(&con->page_retirement_dwork, 0);
 		}
 		mutex_unlock(&con->poison_lock);
-#endif
 	}
 
 	return 0;
