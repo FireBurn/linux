@@ -1238,9 +1238,6 @@
 /* system_percpu_wq is available */
 #define HAVE_SYSTEM_PERCPU_WQ 1
 
-/* time64_to_tm() is available */
-#define HAVE_TIME64_TO_TM 1
-
 /* timer_delete() is available */
 #define HAVE_TIMER_DELETE 1
 
