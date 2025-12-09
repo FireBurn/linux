@@ -3540,7 +3540,6 @@ static int amdgpu_ras_get_poison_req(struct amdgpu_device *adev,
 	return kfifo_get(&con->poison_fifo, poison_msg);
 }
 
-#ifdef HAVE_RADIX_TREE_ITER_DELETE
 static void amdgpu_ras_ecc_log_init(struct ras_ecc_log_info *ecc_log)
 {
 	mutex_init(&ecc_log->lock);
@@ -3569,7 +3568,6 @@ static void amdgpu_ras_ecc_log_fini(struct ras_ecc_log_info *ecc_log)
 	ecc_log->de_queried_count = 0;
 	ecc_log->consumption_q_count = 0;
 }
-#endif
 
 static bool amdgpu_ras_schedule_retirement_dwork(struct amdgpu_ras *con,
 				uint32_t delayed_ms)
@@ -3907,9 +3905,7 @@ int amdgpu_ras_recovery_init(struct amdgpu_device *adev, bool init_bp_info)
 	}
 
 	INIT_DELAYED_WORK(&con->page_retirement_dwork, amdgpu_ras_do_page_retirement);
-#ifdef HAVE_RADIX_TREE_ITER_DELETE
 	amdgpu_ras_ecc_log_init(&con->umc_ecc_log);
-#endif
 #ifdef CONFIG_X86_MCE_AMD
 	if ((adev->asic_type == CHIP_ALDEBARAN) &&
 	    (adev->gmc.xgmi.connected_to_cpu))
@@ -3966,9 +3962,7 @@ static int amdgpu_ras_recovery_fini(struct amdgpu_device *adev)
 
 	cancel_delayed_work_sync(&con->page_retirement_dwork);
 
-#ifdef HAVE_RADIX_TREE_ITER_DELETE
 	amdgpu_ras_ecc_log_fini(&con->umc_ecc_log);
-#endif
 
 	mutex_lock(&con->recovery_lock);
 	con->eh_data = NULL;

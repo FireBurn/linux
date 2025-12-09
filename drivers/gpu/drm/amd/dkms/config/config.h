@@ -1105,9 +1105,6 @@
 /* queue_work_node() is available */
 #define HAVE_QUEUE_WORK_NODE 1
 
-/* radix_tree_iter_delete() is available */
-#define HAVE_RADIX_TREE_ITER_DELETE 1
-
 /* range_overflows() is available */
 #define HAVE_RANGE_OVERFLOWS 1
 
