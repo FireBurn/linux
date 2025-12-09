@@ -33,6 +33,7 @@
 #include <drm/drm_vblank.h>
 
 #include <linux/cc_platform.h>
+#include <linux/console.h>
 #include <linux/dynamic_debug.h>
 #include <linux/module.h>
 #include <linux/mmu_notifier.h>
@@ -2772,7 +2773,9 @@ static int amdgpu_pmops_thaw(struct device *dev)
 
 #if defined(HAVE_PM_HIBERNATION_MODE_IS_SUSPEND) || defined(HAVE_PM_HIBERNATE_IS_RECOVERING)
 	/* do not resume device if it's normal hibernation */
-	if (!pm_hibernate_is_recovering() && !pm_hibernation_mode_is_suspend())
+	if (console_suspend_enabled &&
+	    !pm_hibernate_is_recovering() &&
+	    !pm_hibernation_mode_is_suspend())
 		return 0;
 #endif
 
