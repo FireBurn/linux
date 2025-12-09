@@ -802,9 +802,6 @@
 /* hypervisor_is_type() is available */
 #define HAVE_HYPERVISOR_IS_TYPE 1
 
-/* struct i2c_lock_operations is defined */
-#define HAVE_I2C_LOCK_OPERATIONS_STRUCT 1
-
 /* i2c_new_client_device() is enabled */
 #define HAVE_I2C_NEW_CLIENT_DEVICE 1
 

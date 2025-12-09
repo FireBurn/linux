@@ -638,22 +638,17 @@ static void unlock_bus(struct i2c_adapter *i2c, unsigned int flags)
 	mutex_unlock(&smu_i2c->mutex);
 }
 
-#if defined(HAVE_I2C_LOCK_OPERATIONS_STRUCT)
 static const struct i2c_lock_operations smu_v11_0_i2c_i2c_lock_ops = {
 	.lock_bus = lock_bus,
 	.trylock_bus = trylock_bus,
 	.unlock_bus = unlock_bus,
 };
-#endif
 
 static int smu_v11_0_i2c_xfer(struct i2c_adapter *i2c_adap,
 			      struct i2c_msg *msg, int num)
 {
 	int i, ret;
 	u16 addr, dir;
-#if !defined(HAVE_I2C_LOCK_OPERATIONS_STRUCT)
-	lock_bus(i2c_adap, 0);
-#endif
 
 
 	smu_v11_0_i2c_init(i2c_adap);
@@ -714,9 +709,6 @@ static int smu_v11_0_i2c_xfer(struct i2c_adapter *i2c_adap,
 
 	smu_v11_0_i2c_fini(i2c_adap);
 
-#if !defined(HAVE_I2C_LOCK_OPERATIONS_STRUCT)
-	unlock_bus(i2c_adap, 0);
-#endif
 	return num;
 }
 
@@ -748,9 +740,7 @@ int smu_v11_0_i2c_control_init(struct amdgpu_device *adev)
 	control->dev.parent = &adev->pdev->dev;
 	control->algo = &smu_v11_0_i2c_algo;
 	snprintf(control->name, sizeof(control->name), "AMDGPU SMU 0");
-#if defined(HAVE_I2C_LOCK_OPERATIONS_STRUCT)
 	control->lock_ops = &smu_v11_0_i2c_i2c_lock_ops;
-#endif
 	control->quirks = &smu_v11_0_i2c_control_quirks;
 	i2c_set_adapdata(control, smu_i2c);
 
