@@ -772,12 +772,6 @@
 /* generic_handle_domain_irq() is available */
 #define HAVE_GENERIC_HANDLE_DOMAIN_IRQ 1
 
-/* get_user_pages() wants 6 args */
-/* #undef HAVE_GET_USER_PAGES_6ARGS */
-
-/* get_user_pages() wants gup_flags parameter */
-/* #undef HAVE_GET_USER_PAGES_GUP_FLAGS */
-
 /* get_user_pages_remote() wants gup_flags parameter */
 /* #undef HAVE_GET_USER_PAGES_REMOTE_GUP_FLAGS */
 
