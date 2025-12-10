@@ -79,7 +79,6 @@ struct amdgpu_usermode_queue {
 	struct dentry		*debugfs_queue;
 
 	struct list_head	userq_va_list;
-	u64		generation;
 };
 
 struct amdgpu_userq_funcs {
