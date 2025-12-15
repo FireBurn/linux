@@ -81,6 +81,7 @@ enum hdcp_version {
 	HDCP_Unknown = 0,
 	HDCP_VERSION_14,
 	HDCP_VERSION_22,
+	HDCP_VERSION_23,
 };
 
 enum hdcp_link {
