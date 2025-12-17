@@ -7,16 +7,6 @@
 #include <linux/sched.h>
 #include <linux/pagemap.h>
 
-#ifndef HAVE_MMPUT_ASYNC
-void (*_kcl_mmput_async)(struct mm_struct *mm);
-EXPORT_SYMBOL(_kcl_mmput_async);
-
-void __kcl_mmput_async(struct mm_struct *mm)
-{
-	pr_warn_once("This kernel version not support API: mmput_async !\n");
-}
-#endif
-
 #ifndef HAVE_ZONE_DEVICE_PAGE_INIT
 /* copied from v6.0-rc3-597-g0dc45ca1ce18 mm/memremap.c and modified for kcl usage */
 void zone_device_page_init(struct page *page)
@@ -38,10 +28,6 @@ extern struct kmem_cache *(*_kcl_kmalloc_slab)(size_t size, gfp_t flags);
 
 void amdkcl_mm_init(void)
 {
-#ifndef HAVE_MMPUT_ASYNC
-	_kcl_mmput_async = amdkcl_fp_setup("mmput_async", __kcl_mmput_async);
-#endif
-
 #ifndef HAVE_KMALLOC_SIZE_ROUNDUP
 #ifndef CONFIG_SLOB
 	_kcl_kmalloc_slab = amdkcl_fp_setup("kmalloc_slab", NULL);

@@ -19,10 +19,6 @@
 #define untagged_addr(addr) (addr)
 #endif
 
-#ifndef HAVE_MMPUT_ASYNC
-extern void (*_kcl_mmput_async)(struct mm_struct *mm);
-#endif
-
 #ifndef HAVE_ZONE_DEVICE_PAGE_INIT
 void zone_device_page_init(struct page *page);
 #endif
