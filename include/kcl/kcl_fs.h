@@ -20,10 +20,6 @@ static inline long compat_ptr_ioctl(struct file *file, unsigned int cmd,
 #endif /* CONFIG_COMPAT */
 #endif /* HAVE_COMPAT_PTR_IOCTL */
 
-#ifndef HAVE_KERNEL_WRITE_PPOS
-ssize_t _kcl_kernel_write(struct file *file, const void *buf, size_t count,
-                            loff_t *pos);
-#endif
 
 #ifdef HAVE_FILE_OPERATION_FOP_FLAGS
 #ifndef FOP_UNSIGNED_OFFSET

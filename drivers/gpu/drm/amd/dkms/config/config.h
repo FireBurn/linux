@@ -826,9 +826,6 @@
 /* close_fd() is available */
 #define HAVE_KERNEL_CLOSE_FD 1
 
-/* kernel_write() take arg type of position as pointer */
-#define HAVE_KERNEL_WRITE_PPOS 1
-
 /* HAVE_KFD_PEERDIRECT_SUPPORT is available */
 /* #undef HAVE_KFD_PEERDIRECT_SUPPORT */
 
