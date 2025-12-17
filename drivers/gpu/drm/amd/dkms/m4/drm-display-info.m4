@@ -1,6 +1,6 @@
 dnl #
-dnl # commit v4.9-rc1-522171951761153172c75b94ae1f4bc9ab631745
-dnl # drm: Extract drm_connector.[hc]
+dnl # commit v5.16-rc5-908-g4adc33f36d80
+dnl # drm/edid: Split deep color modes between RGB and YUV444
 dnl #
 AC_DEFUN([AC_AMDGPU_DRM_DISPLAY_INFO_EDID_HDMI_RGB444_DC_MODES], [
 	AC_KERNEL_DO_BACKGROUND([
