@@ -1262,9 +1262,6 @@
 /* vm_operations_struct->fault() wants 1 arg */
 #define HAVE_VM_OPERATIONS_STRUCT_FAULT_1ARG 1
 
-/* wait_queue_entry_t exists */
-#define HAVE_WAIT_QUEUE_ENTRY 1
-
 /* want_init_on_free() is available */
 #define HAVE_WANT_INIT_ON_FREE 1
 
