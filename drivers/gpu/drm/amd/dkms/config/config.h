@@ -994,9 +994,6 @@
 /* enum MCE_PRIO_UC is available */
 #define HAVE_MCE_PRIO_UC 1
 
-/* memalloc_nofs_{save,restore}() are available */
-#define HAVE_MEMALLOC_NOFS_SAVE 1
-
 /* memalloc_noreclaim_save() is available */
 #define HAVE_MEMALLOC_NORECLAIM_SAVE 1
 

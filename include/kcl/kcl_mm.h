@@ -35,17 +35,6 @@ static inline bool fault_flag_allow_retry_first(unsigned int flags)
 }
 #endif
 
-#if !defined(HAVE_MEMALLOC_NOFS_SAVE)
-static inline unsigned int memalloc_nofs_save(void)
-{
-	return current->flags;
-}
-
-static inline void memalloc_nofs_restore(unsigned int flags)
-{
-}
-#endif
-
 #if !defined(HAVE_ZONE_MANAGED_PAGES)
 /* Copied from v4.20-6505-g9705bea5f833 include/linux/mmzone.h and modified for KCL */
 static inline unsigned long zone_managed_pages(struct zone *zone)
