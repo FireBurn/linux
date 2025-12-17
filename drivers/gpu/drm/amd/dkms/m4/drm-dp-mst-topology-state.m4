@@ -1,6 +1,6 @@
 dnl #
-dnl # commit v4.11-rc7-1869-g3f3353b7e121
-dnl # drm/dp: Introduce MST topology state to track available link bandwidth
+dnl # commit v5.15-rc2-1075-gd6c6a76f80a1
+dnl # Update MST First Link Slot Information Based on Encoding Format
 dnl #
 AC_DEFUN([AC_AMDGPU_DRM_DP_MST_TOPOLOGY_STATE_TOTAL_AVAIL_SLOTS], [
 	AC_KERNEL_DO_BACKGROUND([
