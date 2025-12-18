@@ -453,7 +453,7 @@ struct psp_context {
 	enum amdgpu_ptl_fmt		ptl_fmt1;
 	enum amdgpu_ptl_fmt		ptl_fmt2;
 	bool				ptl_enabled;
-	bool				ptl_hw_supported;
+	enum amdgpu_ptl_hw_supported_state	ptl_hw_supported_state;
 };
 
 struct amdgpu_psp_funcs {

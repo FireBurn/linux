@@ -1922,7 +1922,7 @@ int kfd_ptl_control(struct kfd_process_device *pdd, bool enable)
 	uint32_t ptl_state = enable ? 1 : 0;
 	int ret;
 
-	if (!adev->psp.ptl_hw_supported)
+	if (adev->psp.ptl_hw_supported_state != AMDGPU_PTL_HW_SUPPORTED)
 		return -EOPNOTSUPP;
 
 	if (!pdd->dev->kfd2kgd || !pdd->dev->kfd2kgd->ptl_ctrl)
