@@ -1018,9 +1018,6 @@
 /* mmu_notifier_synchronize() is available */
 #define HAVE_MMU_NOTIFIER_SYNCHRONIZE 1
 
-/* release_pages() wants 2 args */
-#define HAVE_MM_RELEASE_PAGES_2ARGS 1
-
 /* MODULE_IMPORT_NS() wants a string arguments */
 #define HAVE_MODULE_IMPORT_NS_NEED_A_STRING 1
 
