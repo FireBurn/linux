@@ -87,7 +87,6 @@
 #include <kcl/kcl_module.h>
 #include <kcl/kcl_stddef.h>
 #include <kcl/kcl_mce.h>
-#include <kcl/kcl_hypervisor.h>
 #include <kcl/backport/kcl_workqueue_backport.h>
 #include <kcl/kcl_string_helpers.h>
 #include <kcl/kcl_cpumask.h>

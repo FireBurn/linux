@@ -793,9 +793,6 @@
 /* hrtimer_setup() is available */
 #define HAVE_HRTIMER_SETUP 1
 
-/* hypervisor_is_type() is available */
-#define HAVE_HYPERVISOR_IS_TYPE 1
-
 /* i2c_new_client_device() is enabled */
 #define HAVE_I2C_NEW_CLIENT_DEVICE 1
 
