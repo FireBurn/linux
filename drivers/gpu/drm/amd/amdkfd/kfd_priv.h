@@ -996,9 +996,7 @@ struct kfd_process_device {
 
 struct svm_range_list {
 	struct mutex			lock;
-#ifdef HAVE_TREE_INSERT_HAVE_RB_ROOT_CACHED
 	struct rb_root_cached		objects;
-#endif
 	struct list_head		list;
 	struct work_struct		deferred_list_work;
 	struct list_head		deferred_range_list;
@@ -1079,11 +1077,7 @@ struct kfd_process {
 	size_t signal_event_count;
 	bool signal_event_limit_reached;
 
-#ifndef HAVE_TREE_INSERT_HAVE_RB_ROOT_CACHED
-	struct rb_root bo_interval_tree;
-#else
 	struct rb_root_cached bo_interval_tree;
-#endif
 
 	/* Information used for memory eviction */
 	void *kgd_process_info;
