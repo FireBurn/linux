@@ -47,18 +47,6 @@ do {									\
 	dev_level_ratelimited(dev_err, dev, fmt, ##__VA_ARGS__)
 #endif
 
-#if !defined(HAVE_DEV_PM_SET_DRIVER_FLAGS)
-/* rhel7.7 wrap macro dev_pm_set_driver_flags in drm/drm_backport.h */
-#ifdef dev_pm_set_driver_flags
-#undef dev_pm_set_driver_flags
-#endif
-#define DPM_FLAG_NEVER_SKIP    BIT(0)
-#define DPM_FLAG_SMART_PREPARE BIT(1)
-static inline void dev_pm_set_driver_flags(struct device *dev, u32 flags)
-{
-	pr_warn_once("%s is not available\n", __func__);
-}
-#endif
 
 #ifndef HAVE_DEV_IS_REMOVABLE
 static inline bool _kcl_dev_is_removable(struct device *dev)
