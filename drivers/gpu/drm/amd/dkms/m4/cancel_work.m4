@@ -1,6 +1,6 @@
 dnl #
-dnl # commit id:c46fd358070f22ba68d6e74c22016a33b914c20a
-dnl # PCI/ASPM: Enable Latency Tolerance Reporting when supported
+dnl # v5.18-rc5-2003-g73b4b53276a1
+dnl # Revert "workqueue: remove unused cancel_work()"
 dnl #
 dnl #
 AC_DEFUN([AC_AMDGPU_CANCEL_WORK], [
