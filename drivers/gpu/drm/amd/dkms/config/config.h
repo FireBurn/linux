@@ -1214,9 +1214,6 @@
 /* totalram_pages() is available */
 #define HAVE_TOTALRAM_PAGES 1
 
-/* __poll_t is available */
-#define HAVE_TYPE__POLL_T 1
-
 /* usleep_range_state() is available */
 #define HAVE_USLEEP_RANGE_STATE 1
 

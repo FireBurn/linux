@@ -5,7 +5,6 @@
 #include <linux/version.h>
 #include <linux/kernel.h>
 #include <kcl/kcl_moduleparam.h>
-#include <kcl/kcl_types.h>
 #include <kcl/kcl_idr.h>
 #include <kcl/kcl_kernel.h>
 #include <kcl/kcl_compiler_attributes.h>
