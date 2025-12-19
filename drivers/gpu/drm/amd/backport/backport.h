@@ -135,7 +135,6 @@
 #include <kcl/kcl_scatterlist.h>
 #include <kcl/kcl_kfifo.h>
 #include <kcl/kcl_drm_dp_mst_helper.h>
-#include <kcl/kcl_firmware.h>
 #include <kcl/kcl_cec.h>
 #include <kcl/kcl_const.h>
 #include <kcl/kcl_time.h>
