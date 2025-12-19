@@ -1036,9 +1036,6 @@
 /* pci_dev_id() is available */
 #define HAVE_PCI_DEV_ID 1
 
-/* strurct pci_dev->ltr_path is available */
-#define HAVE_PCI_DEV_LTR_PATH 1
-
 /* struct pci_driver has field dev_groups */
 #define HAVE_PCI_DRIVER_DEV_GROUPS 1
 
