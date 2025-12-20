@@ -503,13 +503,34 @@ static void asus_kbd_backlight_work(struct work_struct *work)
 	int ret;
 	unsigned long flags;
 
+	/* 
+	 * Packet for ASUS Aura Core (Report 0x5D)
+	 * Format: ID (1) + Cmd (1) + Data (15) = 17 bytes
+	 * 0xB3: Set Mode
+	 * 0x01: Mode = Static
+	 * 0x00, 0x00, 0x00: R, G, B = Black
+	 */
+	u8 aura_black[17] = { FEATURE_KBD_LED_REPORT_ID1, 0xb3, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+	/* Apply command (0xB4) to make the previous command take effect */
+	u8 aura_apply[17] = { FEATURE_KBD_LED_REPORT_ID1, 0xb4 };
+
 	spin_lock_irqsave(&led->lock, flags);
 	buf[4] = led->brightness;
 	spin_unlock_irqrestore(&led->lock, flags);
 
+	/* 1. Send standard brightness command */
 	ret = asus_kbd_set_report(led->hdev, buf, sizeof(buf));
 	if (ret < 0)
 		hid_err(led->hdev, "Asus failed to set keyboard backlight: %d\n", ret);
+
+	/* 
+	 * 2. If brightness is 0, send Aura "Static Black" to kill lightbars/logos.
+	 * The 1866 controller requires 17-byte packets and an Apply (0xB4) command.
+	 */
+	if (led->brightness == 0) {
+		asus_kbd_set_report(led->hdev, aura_black, sizeof(aura_black));
+		asus_kbd_set_report(led->hdev, aura_apply, sizeof(aura_apply));
+	}
 }
 
 /* WMI-based keyboard backlight LED control (via asus-wmi driver) takes
