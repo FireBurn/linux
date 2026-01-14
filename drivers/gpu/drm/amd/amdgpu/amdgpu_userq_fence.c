@@ -165,6 +165,8 @@ static void amdgpu_userq_walk_and_drop_fence_drv(struct idr *idr, spinlock_t *id
 void
 amdgpu_userq_fence_driver_free(struct amdgpu_usermode_queue *userq)
 {
+	dma_fence_put(userq->last_fence);
+
 #ifdef HAVE_STRUCT_XARRAY
 	amdgpu_userq_walk_and_drop_fence_drv(&userq->fence_drv_xa);
 	xa_destroy(&userq->fence_drv_xa);
