@@ -55,6 +55,7 @@
 #include "cpufreq.c"
 #include "cpumask.c"
 #include "cred.c"
+#include "crypto.c"
 #include "device.c"
 #include "dma.c"
 #ifdef CONFIG_DMA_SHARED_BUFFER
