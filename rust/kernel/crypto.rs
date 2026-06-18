@@ -9,8 +9,12 @@
 //! synchronously in the calling context with no allocation; the hashes and the
 //! MAC are infallible.
 //!
+//! Also exposes the `lib/crypto` RSA public-key primitive
+//! ([`rsa_pubkey_encrypt`]) for callers that do their own padding.
+//!
 //! C headers: [`include/crypto/aes.h`](srctree/include/crypto/aes.h),
 //! [`include/crypto/aes-cbc-macs.h`](srctree/include/crypto/aes-cbc-macs.h),
+//! [`include/crypto/rsa.h`](srctree/include/crypto/rsa.h),
 //! [`include/crypto/sha2.h`](srctree/include/crypto/sha2.h).
 
 use crate::{bindings, error::to_result, prelude::*};
@@ -112,4 +116,38 @@ impl Drop for Aes128 {
         // `write_volatile` keeps the store from being optimised away.
         unsafe { core::ptr::write_volatile(&mut self.0, core::mem::zeroed()) };
     }
+}
+
+/// Computes the RSA public-key primitive `out = (input ^ exponent) mod modulus`
+/// using the in-tree `lib/crypto` RSA library (`rsa_pubkey_encrypt()` in
+/// [`lib/crypto/rsa.c`](srctree/lib/crypto/rsa.c)).
+///
+/// All buffers are unsigned big-endian. `out` is written fixed-width to exactly
+/// `out.len()` bytes (left zero-padded); pass `out.len()` equal to the modulus
+/// size (e.g. 128 for RSA-1024). This is the bare primitive: the caller applies
+/// any padding (PKCS#1 v1.5, EME-OAEP, …) to `input` first.
+///
+/// `input` interpreted as an integer must be less than `modulus`, as RSA
+/// requires; otherwise an error is returned. On any error `out` is zeroed by the
+/// library, so it never retains data from a partial computation.
+///
+/// Only available when `CONFIG_CRYPTO_LIB_RSA` is enabled (a consumer selects
+/// it); the backing library is then built into the kernel.
+#[cfg(CONFIG_CRYPTO_LIB_RSA)]
+pub fn rsa_pubkey_encrypt(modulus: &[u8], exponent: &[u8], input: &[u8], out: &mut [u8]) -> Result {
+    // SAFETY: each slice is valid for its stated length; the library function
+    // reads `modulus`/`exponent`/`input` and writes exactly `out.len()` bytes
+    // into `out` (left zero-padded), zeroing it on any error.
+    to_result(unsafe {
+        bindings::rsa_pubkey_encrypt(
+            modulus.as_ptr(),
+            modulus.len(),
+            exponent.as_ptr(),
+            exponent.len(),
+            input.as_ptr(),
+            input.len(),
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    })
 }

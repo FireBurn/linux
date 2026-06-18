@@ -45,6 +45,15 @@ config CRYPTO_LIB_AESGCM
 config CRYPTO_LIB_ARC4
 	tristate
 
+config CRYPTO_LIB_RSA
+	bool
+	select MPILIB
+	help
+	  The RSA public-key primitive (RSAEP, out = in^e mod n), built on the
+	  MPI big-integer library. The bare primitive only; callers apply their
+	  own padding. Bool rather than tristate: the in-kernel consumer is the
+	  built-in Rust crypto bindings, so it must live in vmlinux.
+
 config CRYPTO_LIB_GF128MUL
 	tristate
 

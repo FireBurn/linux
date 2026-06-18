@@ -69,6 +69,9 @@ libaesgcm-y					:= aesgcm.o
 obj-$(CONFIG_CRYPTO_LIB_ARC4)			+= libarc4.o
 libarc4-y					:= arc4.o
 
+obj-$(CONFIG_CRYPTO_LIB_RSA)			+= librsa.o
+librsa-y					:= rsa.o
+
 obj-$(CONFIG_CRYPTO_LIB_GF128MUL)		+= gf128mul.o
 
 ################################################################################

@@ -29,6 +29,7 @@
 #include <linux/hrtimer_types.h>
 
 #include <crypto/aes.h>
+#include <crypto/rsa.h>
 #include <crypto/sha2.h>
 
 #include <linux/acpi.h>
