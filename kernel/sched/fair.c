@@ -7483,15 +7483,16 @@ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
 	int overrun;
 	int idle = 0;
 	int count = 0;
+	unsigned long flags;
 
-	CLASS(raw_spinlock_irqsave, cfsb_guard)(&cfs_b->lock);
+	raw_spin_lock_irqsave(&cfs_b->lock, flags);
 
 	for (;;) {
 		overrun = hrtimer_forward_now(timer, cfs_b->period);
 		if (!overrun)
 			break;
 
-		idle = do_sched_cfs_period_timer(cfs_b, overrun, cfsb_guard.flags);
+		idle = do_sched_cfs_period_timer(cfs_b, overrun, flags);
 
 		if (++count > 3) {
 			u64 new, old = ktime_to_ns(cfs_b->period);
@@ -7525,10 +7526,13 @@ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
 		}
 	}
 
-	if (idle) {
+	if (idle)
 		cfs_b->period_active = 0;
+
+	raw_spin_unlock_irqrestore(&cfs_b->lock, flags);
+
+	if (idle)
 		return HRTIMER_NORESTART;
-	}
 
 	return HRTIMER_RESTART;
 }
