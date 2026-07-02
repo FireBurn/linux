@@ -30,3 +30,17 @@ __rust_helper const char *rust_helper_dev_name(const struct device *dev)
 {
 	return dev_name(dev);
 }
+
+__rust_helper int
+rust_helper_device_add_group(struct device *dev,
+			     const struct attribute_group *group)
+{
+	return device_add_group(dev, group);
+}
+
+__rust_helper void
+rust_helper_device_remove_group(struct device *dev,
+				const struct attribute_group *group)
+{
+	device_remove_group(dev, group);
+}
