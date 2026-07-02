@@ -357,6 +357,17 @@ impl<T: DriverCrtc> UnregisteredCrtc<T> {
         // SAFETY: We just allocated the crtc above, so this pointer must be valid
         Ok(unsafe { &*this })
     }
+
+    /// Enable colour management on this CRTC, creating a `GAMMA_LUT` property of `gamma_size`
+    /// entries that userspace can program (no degamma LUT, no CTM). The set LUT is then readable
+    /// from the CRTC state via [`RawCrtcState::gamma_lut`].
+    ///
+    /// Call this during [`KmsDriver::probe`](crate::drm::kms::KmsDriver::probe), before the device
+    /// is registered.
+    pub fn enable_gamma(&self, gamma_size: u32) {
+        // SAFETY: `as_raw()` is a valid, not-yet-registered CRTC.
+        unsafe { bindings::drm_crtc_enable_color_mgmt(self.as_raw(), 0, false, gamma_size) };
+    }
 }
 
 // SAFETY: We inherit all relevant invariants of `Crtc`
@@ -685,6 +696,28 @@ pub trait RawCrtcState: AsRawCrtcState {
         // SAFETY: `mode` is embedded in the CRTC state and therefore has the same lifetime. The
         // atomic-state API serializes access while the mode can be changed.
         unsafe { DisplayMode::as_ref(core::ptr::addr_of!((*self.as_raw()).mode)) }
+    }
+
+    /// Returns the CRTC's gamma LUT for this state as an array of [`drm_color_lut`] entries, or
+    /// [`None`] if no gamma LUT is programmed. Requires gamma to have been enabled on the CRTC
+    /// (see [`UnregisteredCrtc::enable_gamma`]).
+    ///
+    /// [`drm_color_lut`]: bindings::drm_color_lut
+    fn gamma_lut(&self) -> Option<&[bindings::drm_color_lut]> {
+        // SAFETY: `as_raw()` is a valid `drm_crtc_state`.
+        let blob = unsafe { (*self.as_raw()).gamma_lut };
+        if blob.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null gamma_lut blob is valid for the state's lifetime.
+        let (data, length) = unsafe { ((*blob).data, (*blob).length) };
+        let n = length / core::mem::size_of::<bindings::drm_color_lut>();
+        if data.is_null() || n == 0 {
+            return None;
+        }
+        // SAFETY: the blob's `data` holds `n` contiguous `drm_color_lut` entries (the blob length
+        // is a multiple of the entry size), valid for the state's lifetime.
+        Some(unsafe { core::slice::from_raw_parts(data.cast::<bindings::drm_color_lut>(), n) })
     }
 }
 impl<T: AsRawCrtcState> RawCrtcState for T {}
