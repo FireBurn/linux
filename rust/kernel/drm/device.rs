@@ -203,7 +203,7 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
         fops: &Self::GEM_FOPS,
     };
 
-    const GEM_FOPS: bindings::file_operations = drm::gem::create_fops();
+    const GEM_FOPS: bindings::file_operations = drm::gem::create_fops::<T>();
 
     /// Create a new `UnregisteredDevice` for a `drm::Driver`.
     ///
