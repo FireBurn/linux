@@ -215,3 +215,110 @@ macro_rules! declare_drm_ioctls {
         };
     };
 }
+
+/// Declare the DRM ioctls for a driver whose uAPI lives outside `kernel::uapi`.
+///
+/// [`declare_drm_ioctls!`] resolves each `argument_type` and `DRM_IOCTL_*` number from the
+/// in-tree `kernel::uapi` crate, which an out-of-tree driver with its own private ioctl range
+/// cannot extend. This variant takes, per entry, the argument **type** and the fully-formed ioctl
+/// **number** directly, so the driver can keep its own `#[repr(C)]` uAPI mirror inside its own
+/// crate. Each entry is:
+///
+/// `(handler_name, argument_type, ioctl_number, flags, user_callback)`
+///
+/// `handler_name` is any identifier (used to name the generated trampoline and as the debug name);
+/// `argument_type` is the `#[repr(C)]` argument struct (any path, e.g. `crate::uapi::Foo`);
+/// `ioctl_number` is the full command number (e.g. `crate::uapi::DRM_IOCTL_FOO`, typically built
+/// with [`IOWR`]/[`IOR`]/[`IOW`]/[`IO`]). `user_callback` has the exact same prototype as for
+/// [`declare_drm_ioctls!`], and the handler still runs inside a `drm_dev_enter/exit` critical
+/// section (returning `ENODEV` if the device has been unplugged).
+///
+/// The ioctl array is indexed by the DRM core as `number - DRM_COMMAND_BASE`, so entries must be
+/// listed in ascending, contiguous order starting at the driver's command base.
+///
+/// # Examples
+///
+/// ```ignore
+/// kernel::declare_drm_ioctls_ext! {
+///     (EVDI_CONNECT, crate::uapi::DrmEvdiConnect, crate::uapi::DRM_IOCTL_EVDI_CONNECT,
+///         0, evdi_connect_ioctl),
+/// }
+/// ```
+#[macro_export]
+macro_rules! declare_drm_ioctls_ext {
+    ( $(($cmd:ident, $arg_ty:ty, $num:expr, $flags:expr, $func:expr)),* $(,)? ) => {
+        const IOCTLS: &'static [$crate::drm::ioctl::DrmIoctlDescriptor] = {
+            const _:() = {
+                // The argument struct size must match what the ioctl number encodes, so the DRM
+                // core copies exactly `size_of::<argument_type>()` bytes to/from userspace.
+                $(
+                    ::core::assert!(::core::mem::size_of::<$arg_ty>() ==
+                                    $crate::ioctl::_IOC_SIZE($num));
+                )*
+            };
+
+            let ioctls = &[$(
+                $crate::drm::ioctl::internal::drm_ioctl_desc {
+                    cmd: $num as u32,
+                    func: {
+                        #[allow(non_snake_case)]
+                        unsafe extern "C" fn $cmd(
+                                raw_dev: *mut $crate::drm::ioctl::internal::drm_device,
+                                raw_data: *mut ::core::ffi::c_void,
+                                raw_file: *mut $crate::drm::ioctl::internal::drm_file,
+                        ) -> core::ffi::c_int {
+                            // INVARIANT: DRM only dispatches ioctls after registration. The
+                            // `Ioctl` context prevents this reference from escaping the callback.
+                            let dev: &$crate::drm::device::Device<_, $crate::drm::Ioctl> =
+                                unsafe { $crate::drm::device::Device::from_raw(raw_dev) };
+
+                            // Anchor the inferred driver type to the handler's first parameter.
+                            #[allow(unreachable_code)]
+                            let _ = || {
+                                let __ptr = $crate::drm::ioctl::internal::__dev_ctx_cast(
+                                    ::core::ptr::from_ref(dev),
+                                );
+                                $func(
+                                    // SAFETY: This closure is never called; the dereference only
+                                    // participates in type inference.
+                                    unsafe { &*__ptr },
+                                    unreachable!(),
+                                    unreachable!(),
+                                    unreachable!(),
+                                )
+                            };
+
+                            // Require a higher-ranked handler, so no callback reference can be
+                            // constrained to an escaping lifetime.
+                            let _: for<'a> fn(&'a _, &'a _, &'a mut _, &'a _) -> _ = $func;
+
+                            let Some(guard) = dev.registration_guard() else {
+                                return $crate::error::code::ENODEV.to_errno();
+                            };
+                            // SAFETY: The ioctl argument has size `_IOC_SIZE($num)`, asserted above
+                            // to match `size_of::<$arg_ty>()`; `drm_ioctl()` guarantees the buffer
+                            // is valid and exclusively owned for the duration of this call.
+                            let data = unsafe { &mut *(raw_data.cast::<$arg_ty>()) };
+                            // SAFETY: This is just the DRM file structure.
+                            let file = unsafe { $crate::drm::File::from_raw(raw_file) };
+
+                            match guard.registration_data_with(|reg_data| {
+                                $func(&*guard, reg_data, data, file)
+                            }) {
+                                Err(e) => e.to_errno(),
+                                Ok(i) => i.try_into()
+                                            .unwrap_or($crate::error::code::ERANGE.to_errno()),
+                            }
+                        }
+                        Some($cmd)
+                    },
+                    flags: $flags,
+                    name: $crate::str::as_char_ptr_in_const_context(
+                        $crate::c_str!(::core::stringify!($cmd)),
+                    ),
+                }
+            ),*];
+            ioctls
+        };
+    };
+}
