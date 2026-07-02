@@ -395,7 +395,7 @@ impl<T: DriverObject, Ctx: DeviceContext> AllocImpl for Object<T, Ctx> {
     };
 }
 
-pub(super) const fn create_fops() -> bindings::file_operations {
+pub(super) const fn create_fops<T: drm::Driver>() -> bindings::file_operations {
     let mut fops: bindings::file_operations = pin_init::zeroed();
 
     fops.owner = core::ptr::null_mut();
@@ -404,7 +404,7 @@ pub(super) const fn create_fops() -> bindings::file_operations {
     fops.unlocked_ioctl = Some(bindings::drm_ioctl);
     #[cfg(CONFIG_COMPAT)]
     {
-        fops.compat_ioctl = Some(bindings::drm_compat_ioctl);
+        fops.compat_ioctl = Some(drm::ioctl::compat_ioctl::<T>);
     }
     fops.poll = Some(bindings::drm_poll);
     fops.read = Some(bindings::drm_read);
