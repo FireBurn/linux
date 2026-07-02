@@ -149,6 +149,12 @@ pub trait Driver {
     /// IOCTL list. See `kernel::drm::ioctl::declare_drm_ioctls!{}`.
     const IOCTLS: &'static [drm::ioctl::DrmIoctlDescriptor];
 
+    /// Translations for pointer-bearing private ioctls issued by 32-bit userspace.
+    ///
+    /// Drivers should leave this empty unless an established UAPI has a different 32-bit layout.
+    /// See [`declare_drm_compat_ioctls`](crate::declare_drm_compat_ioctls).
+    const COMPAT_IOCTLS: &'static [drm::ioctl::DrmCompatIoctlDescriptor] = &[];
+
     /// Sets the `DRIVER_RENDER` feature for this driver.
     ///
     /// When enabled, the driver exposes `/dev/dri/renderDXX` render nodes to
