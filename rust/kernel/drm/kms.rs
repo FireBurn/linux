@@ -55,7 +55,7 @@ pub(crate) mod private {
         type Driver: Driver;
 
         /// The optional KMS callback operations for this driver.
-        const MODE_CONFIG_OPS: Option<ModeConfigOps>;
+        const MODE_CONFIG_OPS: Option<&'static ModeConfigOps>;
 
         /// The callback for setting up KMS on a device
         ///
@@ -279,7 +279,7 @@ pub trait KmsDriver: Driver {
 impl<T: KmsDriver> private::KmsImpl for T {
     type Driver = Self;
 
-    const MODE_CONFIG_OPS: Option<ModeConfigOps> = Some(ModeConfigOps {
+    const MODE_CONFIG_OPS: Option<&'static ModeConfigOps> = Some(&ModeConfigOps {
         kms_vtable: bindings::drm_mode_config_funcs {
             atomic_check: Some(bindings::drm_atomic_helper_check),
             fb_create: Some(bindings::drm_gem_fb_create),
@@ -305,7 +305,7 @@ impl<T: KmsDriver> private::KmsImpl for T {
         let mode_config_info = T::mode_config_info(drm.as_ref().as_ref(), drm)?;
 
         // SAFETY: `MODE_CONFIG_OPS` is always Some() in this implementation
-        let ops = unsafe { T::MODE_CONFIG_OPS.as_ref().unwrap_unchecked() };
+        let ops = unsafe { T::MODE_CONFIG_OPS.unwrap_unchecked() };
 
         // SAFETY:
         // - This function can only be called before registration via our safety contract.
@@ -352,7 +352,7 @@ impl<T: KmsDriver> KmsImpl for T {}
 impl<T: Driver> private::KmsImpl for PhantomData<T> {
     type Driver = T;
 
-    const MODE_CONFIG_OPS: Option<ModeConfigOps> = None;
+    const MODE_CONFIG_OPS: Option<&'static ModeConfigOps> = None;
 }
 
 impl<T: Driver> KmsImpl for PhantomData<T> {}
