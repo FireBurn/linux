@@ -758,6 +758,65 @@ pub trait RawPlaneState: AsRawPlaneState {
         self.as_raw().crtc_h
     }
 
+    /// Return the requested source X coordinate in 16.16 fixed-point pixels.
+    fn source_x_16_16(&self) -> u32 {
+        self.as_raw().src_x
+    }
+
+    /// Return the requested source Y coordinate in 16.16 fixed-point pixels.
+    fn source_y_16_16(&self) -> u32 {
+        self.as_raw().src_y
+    }
+
+    /// Return the requested source width in 16.16 fixed-point pixels.
+    fn source_width_16_16(&self) -> u32 {
+        self.as_raw().src_w
+    }
+
+    /// Return the requested source height in 16.16 fixed-point pixels.
+    fn source_height_16_16(&self) -> u32 {
+        self.as_raw().src_h
+    }
+
+    /// Return whether [`Self::atomic_helper_check`] found any visible part of the plane.
+    fn visible(&self) -> bool {
+        self.as_raw().visible
+    }
+
+    /// Return the helper-clipped source rectangle in integer framebuffer pixels.
+    ///
+    /// This is valid after [`Self::atomic_helper_check`]. Fractional source coordinates are
+    /// rejected with [`EINVAL`].
+    fn visible_source(&self) -> Result<Option<Rect>> {
+        if !self.visible() {
+            return Ok(None);
+        }
+
+        let src = &self.as_raw().src;
+        if src.x1 < 0
+            || src.y1 < 0
+            || src.x2 < 0
+            || src.y2 < 0
+            || (src.x1 | src.y1 | src.x2 | src.y2) & 0xffff != 0
+        {
+            return Err(EINVAL);
+        }
+
+        Ok(Some(Rect {
+            x1: src.x1 >> 16,
+            y1: src.y1 >> 16,
+            x2: src.x2 >> 16,
+            y2: src.y2 >> 16,
+        }))
+    }
+
+    /// Return the helper-clipped destination rectangle in CRTC pixels.
+    ///
+    /// This is valid after [`Self::atomic_helper_check`].
+    fn visible_destination(&self) -> Option<Rect> {
+        self.visible().then(|| Rect::from_raw(&self.as_raw().dst))
+    }
+
     /// The plane's rotation/reflection (`DRM_MODE_ROTATE_*` | `DRM_MODE_REFLECT_*` bitmask), for a
     /// plane with a rotation property (see
     /// [`UnregisteredPlane::create_rotation_property`]). Defaults to `DRM_MODE_ROTATE_0`.
