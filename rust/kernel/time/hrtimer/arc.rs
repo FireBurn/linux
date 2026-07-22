@@ -39,6 +39,29 @@ where
     }
 }
 
+impl<T> ArcHrTimerHandle<T>
+where
+    T: HasHrTimer<T>,
+{
+    /// Restart the timer with a new expiry time, without cancelling it first.
+    ///
+    /// If the timer is queued it is removed and re-inserted at the new expiry; if it has already
+    /// expired it is queued again. Unlike dropping the handle and calling
+    /// [`HrTimerPointer::start`] again, this never blocks waiting for a running callback, so it
+    /// can be used from contexts that cannot sleep -- re-arming a timer from a driver callback
+    /// invoked with interrupts disabled, for instance.
+    ///
+    /// This handle keeps its timer alive and still cancels it on drop, so the timer cannot outlive
+    /// the restart.
+    pub fn restart(&self, expires: <<T as HasHrTimer<T>>::TimerMode as HrTimerMode>::Expires) {
+        // SAFETY:
+        // - `self.inner` is a live `Arc<T>` held by this handle, so the pointer is valid.
+        // - The caller cannot leak past the timer's death: this handle owns the `Arc` and cancels
+        //   the timer when dropped, which is the requirement `HasHrTimer::start` places on us.
+        unsafe { T::start(Arc::as_ptr(&self.inner), expires) };
+    }
+}
+
 impl<T> Drop for ArcHrTimerHandle<T>
 where
     T: HasHrTimer<T>,
