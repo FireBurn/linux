@@ -25,6 +25,9 @@ pub(crate) const FEAT_MODESET: u32 = bindings::drm_driver_feature_DRIVER_MODESET
 /// The driver supports atomic modesetting.
 pub(crate) const FEAT_ATOMIC: u32 = bindings::drm_driver_feature_DRIVER_ATOMIC;
 
+/// The driver expects the cursor plane's hotspot properties to be maintained by userspace.
+pub(crate) const FEAT_CURSOR_HOTSPOT: u32 = bindings::drm_driver_feature_DRIVER_CURSOR_HOTSPOT;
+
 /// Information data for a DRM Driver.
 pub struct DriverInfo {
     /// Driver major version.
@@ -158,6 +161,17 @@ pub trait Driver {
     /// usable from the render node (i.e. marked DRM_RENDER_ALLOW), whereas
     /// userspace processes using the master node can invoke any ioctl.
     const FEAT_RENDER: bool = false;
+
+    /// Sets the `DRIVER_CURSOR_HOTSPOT` feature for this driver.
+    ///
+    /// Enable this for a driver whose hardware composites the cursor plane itself, rather than the
+    /// driver blending it into the primary scanout. The DRM core then exposes the `HOTSPOT_X` and
+    /// `HOTSPOT_Y` cursor-plane properties, and userspace tells the driver where within the cursor
+    /// bitmap the click point lies -- without which the pointer's active point does not match
+    /// where it is drawn.
+    ///
+    /// This is the same feature virtualised drivers use for their host-drawn cursors.
+    const FEAT_CURSOR_HOTSPOT: bool = false;
 }
 
 /// The registration type of a `drm::Device`.

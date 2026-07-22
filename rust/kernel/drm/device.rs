@@ -167,6 +167,10 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
             features |= drm::driver::FEAT_MODESET | drm::driver::FEAT_ATOMIC;
         }
 
+        if T::FEAT_CURSOR_HOTSPOT {
+            features |= drm::driver::FEAT_CURSOR_HOTSPOT;
+        }
+
         features
     }
 
