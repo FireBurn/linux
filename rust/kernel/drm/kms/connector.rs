@@ -404,11 +404,22 @@ impl<T: DriverConnector> UnregisteredConnector<T> {
 
     /// Attach an encoder to this [`Connector`].
     #[must_use]
-    pub fn attach_encoder(&self, encoder: &impl AsRawEncoder) -> Result {
+    pub fn attach_encoder<E>(&self, encoder: &UnregisteredEncoder<E>) -> Result
+    where
+        E: DriverEncoder<Driver = T::Driver>,
+    {
+        // SAFETY: Both unregistered objects have been initialized, so their parent device
+        // pointers are valid and invariant for their lifetimes.
+        let same_device = unsafe { (*self.as_raw()).dev == (*encoder.as_raw()).dev };
+        if !same_device {
+            return Err(EINVAL);
+        }
+
         // SAFETY:
-        // - Both as_raw() calls are guaranteed to return a valid pointer
-        // - We're guaranteed this connector is not registered via our type invariants, thus this
-        //   function is safe to call
+        // - Both `as_raw()` calls return valid pointers.
+        // - The generic bound and check above prove that both objects belong to the same driver
+        //   and device.
+        // - `self` is unregistered, as required by the C API.
         to_result(unsafe {
             bindings::drm_connector_attach_encoder(self.as_raw(), encoder.as_raw())
         })
