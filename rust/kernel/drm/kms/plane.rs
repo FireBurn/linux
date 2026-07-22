@@ -255,8 +255,29 @@ impl<T: DriverPlane> UnregisteredPlane<T> {
     /// A driver may use this from their [`KmsDriver::create_objects`] callback in order to
     /// construct new [`UnregisteredPlane`] objects.
     ///
+    /// The returned plane cannot outlive the device borrow:
+    ///
+    /// ```ignore,compile_fail
+    /// use kernel::{drm::kms::{plane::{DriverPlane, Type, UnregisteredPlane},
+    ///                         UnregisteredKmsDevice},
+    ///              error::Result,
+    ///              str::CStr};
+    ///
+    /// fn reject_leaking_signature<T: DriverPlane>() {
+    ///     let _: for<'a> fn(
+    ///         &'a UnregisteredKmsDevice<'a, T::Driver>,
+    ///         u32,
+    ///         &[u32],
+    ///         Option<&[u64]>,
+    ///         Type,
+    ///         Option<&CStr>,
+    ///         T::Args,
+    ///     ) -> Result<&'static UnregisteredPlane<T>> = UnregisteredPlane::<T>::new;
+    /// }
+    /// ```
+    ///
     /// [`KmsDriver::create_objects`]: kernel::drm::kms::KmsDriver::create_objects
-    pub fn new<'a, 'b: 'a>(
+    pub fn new<'a>(
         dev: &'a UnregisteredKmsDevice<'a, T::Driver>,
         possible_crtcs: u32,
         formats: &[u32],
@@ -264,7 +285,7 @@ impl<T: DriverPlane> UnregisteredPlane<T> {
         type_: Type,
         name: Option<&CStr>,
         args: T::Args,
-    ) -> Result<&'b Self> {
+    ) -> Result<&'a Self> {
         let this: Pin<KBox<Plane<T>>> = KBox::try_pin_init(
             try_pin_init!(Plane {
                 plane: Opaque::new(bindings::drm_plane {
@@ -597,7 +618,22 @@ pub trait RawPlaneState: AsRawPlaneState {
     }
 
     /// Return the current [`OpaqueCrtc`] assigned to this plane, if there is one.
-    fn crtc<'a, 'b: 'a, D>(&'a self) -> Option<&'b OpaqueCrtc<D>>
+    ///
+    /// The returned CRTC reference cannot outlive the plane-state borrow:
+    ///
+    /// ```ignore,compile_fail
+    /// use kernel::drm::kms::{crtc::OpaqueCrtc, plane::RawPlaneState, KmsDriver, ModeObject};
+    ///
+    /// fn reject_leaking_signature<S, D>()
+    /// where
+    ///     S: RawPlaneState,
+    ///     S::Plane: ModeObject<Driver = D>,
+    ///     D: KmsDriver,
+    /// {
+    ///     let _: for<'a> fn(&'a S) -> Option<&'static OpaqueCrtc<D>> = S::crtc::<D>;
+    /// }
+    /// ```
+    fn crtc<D>(&self) -> Option<&OpaqueCrtc<D>>
     where
         Self::Plane: ModeObject<Driver = D>,
         D: KmsDriver,
