@@ -7,6 +7,7 @@
 use super::{KmsDriver, ModeObject, Sealed};
 use crate::{
     drm::device::Device,
+    error::to_result,
     prelude::*,
     sync::aref::{ARef, AlwaysRefCounted},
     types::*,
@@ -233,6 +234,38 @@ impl<T: KmsDriver> Framebuffer<T> {
             return Err(EINVAL);
         }
         Ok(raw.pitches[plane])
+    }
+
+    /// Create a handle for the plane-zero GEM object in `file`'s handle space.
+    ///
+    /// This is useful when a display service needs access to a cursor buffer selected by a
+    /// different DRM client. The driver type is shared at compile time and the device instance is
+    /// checked before entering the C helper. This operation may sleep.
+    pub fn create_handle<F>(&self, file: &crate::drm::File<F>) -> Result<u32>
+    where
+        F: crate::drm::file::DriverFile<Driver = T>,
+        T: crate::drm::Driver<File = F>,
+    {
+        // SAFETY: The framebuffer is initialized and keeps each non-null backing object alive.
+        let object = unsafe { (*self.0.get()).obj[0] };
+        if object.is_null() {
+            return Err(EINVAL);
+        }
+
+        // The shared driver type is not enough to distinguish two instances of that driver.
+        // Reject an object and file belonging to different DRM devices.
+        // SAFETY: `object` is non-null and live through the framebuffer reference.
+        if unsafe { (*object).dev } != file.device_raw() {
+            return Err(EINVAL);
+        }
+
+        let mut handle = 0;
+        // SAFETY: The object and file are live and the instance check above proves they belong to
+        // the same DRM device. The helper initializes `handle` on success.
+        to_result(unsafe {
+            bindings::drm_gem_handle_create(file.as_raw().cast(), object, &mut handle)
+        })?;
+        Ok(handle)
     }
 
     /// Map a packed, single-plane, linear Rust shmem framebuffer.

@@ -692,6 +692,26 @@ pub trait RawPlaneState: AsRawPlaneState {
         self.as_raw().crtc_h
     }
 
+    /// Return the X position of the destination rectangle in CRTC coordinates.
+    fn crtc_x(&self) -> i32 {
+        self.as_raw().crtc_x
+    }
+
+    /// Return the Y position of the destination rectangle in CRTC coordinates.
+    fn crtc_y(&self) -> i32 {
+        self.as_raw().crtc_y
+    }
+
+    /// Return the virtual cursor hotspot's X offset.
+    fn hotspot_x(&self) -> i32 {
+        self.as_raw().hotspot_x
+    }
+
+    /// Return the virtual cursor hotspot's Y offset.
+    fn hotspot_y(&self) -> i32 {
+        self.as_raw().hotspot_y
+    }
+
     /// The plane's rotation/reflection (`DRM_MODE_ROTATE_*` | `DRM_MODE_REFLECT_*` bitmask), for a
     /// plane with a rotation property (see
     /// [`UnregisteredPlane::create_rotation_property`]). Defaults to `DRM_MODE_ROTATE_0`.
