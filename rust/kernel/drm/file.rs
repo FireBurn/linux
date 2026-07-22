@@ -45,6 +45,13 @@ impl<T: DriverFile> File<T> {
         self.0.get()
     }
 
+    /// Return the DRM device that owns this open file.
+    pub(crate) fn device_raw(&self) -> *mut bindings::drm_device {
+        // SAFETY: An open `drm_file` has a valid `minor`, whose `dev` pointer remains valid for
+        // the lifetime of the file.
+        unsafe { (*(*self.as_raw()).minor).dev }
+    }
+
     fn driver_priv(&self) -> *mut T {
         // SAFETY: By the type invariants of `Self`, `self.as_raw()` is always valid.
         unsafe { (*self.as_raw()).driver_priv }.cast()
