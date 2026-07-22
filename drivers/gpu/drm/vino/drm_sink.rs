@@ -36,44 +36,37 @@
 //!
 //! CP, per-head EDID/modesetting and dual-head EP08 scanout are live on hardware.
 
-use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use kernel::{
     bindings, drm,
     drm::kms::{
         self,
         connector::{self, Connector, ConnectorGuard, ModeStatus, Status},
-        crtc::{
-            self, AsRawCrtc as _, CrtcAtomicCheck, CrtcAtomicCommit, RawCrtc as _,
-            RawCrtcState as _,
-        },
+        crtc::{self, CrtcAtomicCheck, CrtcAtomicCommit, RawCrtc as _, RawCrtcState as _},
         encoder,
         modes::DisplayMode,
         plane::{self, PlaneAtomicCheck, PlaneAtomicCommit, RawPlaneState as _},
-        vblank::{RawVblankCrtcState as _, VblankGuard, VblankSupport, VblankTimestamp},
+        vblank::{
+            OwnedVblankRef, RawVblankCrtcState as _, VblankGuard, VblankSupport, VblankTimestamp,
+        },
         KmsDriver, ModeConfigGuard, ModeConfigInfo, ModeObject as _, UnregisteredKmsDevice,
     },
     error::code::{EINVAL, ENOTSUPP, ENXIO},
     i2c, impl_has_hr_timer,
     interrupt::LocalInterruptDisabled,
     prelude::*,
-    sync::{aref::ARef, new_mutex, new_spinlock, Arc, ArcBorrow, Mutex, SpinLock},
+    sync::{aref::ARef, new_mutex, new_spinlock, Arc, ArcBorrow, Mutex, SetOnce, SpinLock},
     time::{
         delay::fsleep,
         hrtimer::{
-            ArcHrTimerHandle, HasHrTimer, HrTimer, HrTimerCallback, HrTimerCallbackContext,
-            HrTimerPointer, HrTimerRestart, RelativeMode,
+            ArcHrTimerHandle, HrTimer, HrTimerCallback, HrTimerCallbackContext, HrTimerPointer,
+            HrTimerRestart, RelativeMode,
         },
         Delta, Instant, Monotonic,
     },
     workqueue::{self, impl_has_work, new_work, Work, WorkItem},
+    xxhash,
 };
-
-// `xxh64` is an exported kernel symbol (`lib/xxhash.c`). Calling the optimized implementation on
-// each contiguous 256-byte tile row is substantially cheaper than millions of scalar Rust mixes
-// per 1440p frame while retaining a full-content 64-bit fingerprint for every hardware strip.
-unsafe extern "C" {
-    fn xxh64(input: *const u8, length: usize, seed: u64) -> u64;
-}
 
 /// Fallback connector mode advertised by `get_modes` when the dock has not delivered a real
 /// downstream EDID yet. The live scanout geometry follows the actual framebuffer/negotiated
@@ -1091,10 +1084,7 @@ impl KmsDriver for VinoDrmDriver {
             // ambiguous framebuffer swaps. That left the first keyframe frozen when empty damage
             // was correctly treated as a no-op, or forced multi-megabyte full frames when it was
             // treated as a repaint. EVDI exposes the same property before plane registration.
-            // SAFETY: `primary` is a valid, not-yet-registered plane in the KMS probing phase.
-            unsafe {
-                bindings::drm_plane_enable_fb_damage_clips(plane::AsRawPlane::as_raw(primary))
-            };
+            primary.enable_fb_damage_clips();
             // Advertise every rotation vino's re-encode can produce by remapping source pixels
             // (`rot_src`): the four 90-degree rotations plus the two reflections.
             primary.create_rotation_property(
@@ -1165,7 +1155,7 @@ impl KmsDriver for VinoDrmDriver {
 /// `drm_vblank_timer_function`, which returns `HRTIMER_NORESTART` on a zeroed interval): the
 /// callback sees `enabled == false` and returns [`HrTimerRestart::NoRestart`], so an idle or
 /// DPMS-off output costs no wakeups. `enable_vblank` re-arms it with a raw
-/// [`HasHrTimer::start`], which re-queues the timer whether it is dead or still pending -- no new
+/// [`ArcHrTimerHandle::restart`], which re-queues the timer whether it is dead or still pending -- no new
 /// handle is minted, so the single `ArcHrTimerHandle` taken at first start remains the sole owner
 /// and its drop (at CRTC teardown, before the `drm_crtc` is freed) is the only full
 /// `hrtimer_cancel`. This is the same design `revdi`'s `EvdiCrtc`/`VblankTimer` uses.
@@ -1190,8 +1180,10 @@ impl KmsDriver for VinoDrmDriver {
 pub(super) struct VblankTimer {
     #[pin]
     timer: HrTimer<Self>,
-    /// The `drm_crtc` to deliver vblanks to (set when vblank is first enabled).
-    crtc: AtomicPtr<bindings::drm_crtc>,
+    /// The CRTC to deliver vblanks to, published the first time vblank is enabled. An owned
+    /// handle rather than a raw pointer: it keeps the DRM device alive, so the timer callback can
+    /// safely reach the CRTC from outside any DRM callback.
+    crtc: SetOnce<crtc::CrtcRef<VinoCrtc>>,
     /// One scanout frame in nanoseconds (from the mode's `framedur_ns`).
     interval_ns: AtomicI64,
     /// Whether vblanks should currently be delivered (toggled by enable/disable_vblank).
@@ -1202,7 +1194,7 @@ impl VblankTimer {
     fn new() -> impl PinInit<Self> {
         pin_init!(VblankTimer {
             timer <- HrTimer::new(),
-            crtc: AtomicPtr::new(core::ptr::null_mut()),
+            crtc: SetOnce::new(),
             interval_ns: AtomicI64::new(16_666_666), // ~60 Hz until a mode sets it
             enabled: AtomicBool::new(false),
         })
@@ -1219,11 +1211,8 @@ impl HrTimerCallback for VblankTimer {
         if !this.enabled.load(Ordering::Relaxed) {
             return HrTimerRestart::NoRestart;
         }
-        let crtc = this.crtc.load(Ordering::Relaxed);
-        if !crtc.is_null() {
-            // SAFETY: `crtc` is the `drm_crtc` stored in `enable_vblank` while the device is live;
-            // the timer is cancelled (its handle dropped) before the crtc is freed at teardown.
-            unsafe { bindings::drm_crtc_handle_vblank(crtc) };
+        if let Some(crtc) = this.crtc.as_ref() {
+            crtc.crtc().handle_vblank();
         }
         let interval = this.interval_ns.load(Ordering::Relaxed).max(1_000_000);
         ctx.forward_now(Delta::from_nanos(interval));
@@ -1255,7 +1244,11 @@ pub(super) struct VinoCrtc {
     /// initial page-flip event is attached, the DRM core never calls `enable_vblank`, the software
     /// timer never starts, and KWin leaves the first framebuffer frozen forever. Pinning one ref
     /// while active starts the clock deterministically; `atomic_disable` balances it before off.
-    vblank_pinned: AtomicBool,
+    /// The vblank reference held for the whole time this CRTC is active. Taken in
+    /// `atomic_enable` and released in `atomic_disable`, which is longer than a borrowed
+    /// `VblankRef` can live, so an owned one is stored here.
+    #[pin]
+    vblank_pinned: Mutex<Option<OwnedVblankRef<VinoCrtc>>>,
 }
 
 #[derive(Clone, Default)]
@@ -1277,7 +1270,7 @@ impl crtc::DriverCrtc for VinoCrtc {
             head: *head,
             vblank: Arc::pin_init(VblankTimer::new(), GFP_KERNEL)?,
             vblank_handle <- new_spinlock!(None),
-            vblank_pinned: AtomicBool::new(false),
+            vblank_pinned <- new_mutex!(None),
         })
     }
 
@@ -1325,21 +1318,20 @@ impl crtc::DriverCrtc for VinoCrtc {
     fn atomic_enable(commit: CrtcAtomicCommit<'_, Self>) {
         let crtc = commit.crtc();
         crtc.vblank_on();
-        // Keep the software presentation clock running for the complete active interval. This
-        // `VblankRef` is deliberately transferred to `vblank_pinned`; `atomic_disable` drops the
-        // corresponding raw DRM reference. Page-flip events take their own additional refs.
-        if !crtc.vblank_pinned.swap(true, Ordering::AcqRel) {
+        // Keep the software presentation clock running for the complete active interval. The
+        // reference is stored as an owned one because it must outlive this callback and is only
+        // released in `atomic_disable`. Page-flip events take their own additional refs.
+        let mut pinned = crtc.vblank_pinned.lock();
+        if pinned.is_none() {
             match crtc.vblank_get() {
-                Ok(vblank_ref) => core::mem::forget(vblank_ref),
-                Err(e) => {
-                    crtc.vblank_pinned.store(false, Ordering::Release);
-                    pr_warn!(
-                        "vino: failed to start head {} software vblank clock ({e:?})\n",
-                        crtc.head
-                    );
-                }
+                Ok(vblank_ref) => *pinned = Some(vblank_ref.into_owned()),
+                Err(e) => pr_warn!(
+                    "vino: failed to start head {} software vblank clock ({e:?})\n",
+                    crtc.head
+                ),
             }
         }
+        drop(pinned);
         let head = crtc.head;
         let dev: &VinoDrmDevice = crtc.drm_dev();
         let data: &VinoDrmData = dev;
@@ -1373,11 +1365,8 @@ impl crtc::DriverCrtc for VinoCrtc {
     /// the DisplayLink stream (it can also leave a panel asleep across a dock cold plug).
     fn atomic_disable(commit: CrtcAtomicCommit<'_, Self>) {
         let crtc = commit.crtc();
-        if crtc.vblank_pinned.swap(false, Ordering::AcqRel) {
-            // SAFETY: `atomic_enable` transferred exactly one successful `vblank_get()` reference
-            // into `vblank_pinned`, and the swap above guarantees it is balanced exactly once.
-            unsafe { bindings::drm_crtc_vblank_put(crtc.as_raw()) };
-        }
+        // Dropping the stored reference releases the vblank reference `atomic_enable` took.
+        drop(crtc.vblank_pinned.lock().take());
         crtc.vblank_off();
         let head = crtc.head;
         let dev: &VinoDrmDevice = crtc.drm_dev();
@@ -1429,7 +1418,9 @@ impl VblankSupport for VinoCrtc {
         if fd > 0 {
             data.vblank.interval_ns.store(fd as i64, Ordering::Relaxed);
         }
-        data.vblank.crtc.store(crtc.as_raw(), Ordering::Relaxed);
+        // Publish the CRTC for the timer callback. Only the first enable stores it; the CRTC a
+        // given timer serves never changes.
+        data.vblank.crtc.populate(crtc.to_owned_ref());
         data.vblank.enabled.store(true, Ordering::Relaxed);
         let interval = data.vblank.interval_ns.load(Ordering::Relaxed);
         let mut handle = data.vblank_handle.lock();
@@ -1437,20 +1428,12 @@ impl VblankSupport for VinoCrtc {
             // First enable: start the timer, keeping the handle as the sole owner whose drop
             // (at CRTC teardown) is the one full cancel.
             *handle = Some(data.vblank.clone().start(Delta::from_nanos(interval)));
-        } else {
+        } else if let Some(h) = handle.as_ref() {
             // Re-enable after `disable_vblank` let the timer die (NoRestart): re-queue it in
-            // place. `hrtimer_start` removes and re-inserts a still-pending timer, so this is
-            // correct whether the final disabled tick has already fired or not, and it never
-            // blocks on the callback (safe under the vblank locks we are called with).
-            // SAFETY: the pointee is kept alive by `data.vblank` (an `Arc` held for the CRTC's
-            // lifetime) and the timer is cancelled at teardown by the handle drop, satisfying
-            // "lives until the timer fires or is canceled".
-            unsafe {
-                <VblankTimer as HasHrTimer<VblankTimer>>::start(
-                    &raw const *data.vblank,
-                    Delta::from_nanos(interval),
-                )
-            };
+            // place. `restart` removes and re-inserts a still-pending timer, so this is correct
+            // whether the final disabled tick has already fired or not, and it never blocks on the
+            // callback -- which matters because we are called under the vblank locks.
+            h.restart(Delta::from_nanos(interval));
         }
         Ok(())
     }
@@ -1856,8 +1839,13 @@ fn framebuffer_strip_hashes(
             let mut y = sy;
             while y < y_end {
                 // SAFETY: `sx < x_end <= w`, `y < h`, and the XRGB8888 pitch covers every visible
-                // pixel. `xxh64` only reads the supplied `(x_end-sx)*4` contiguous row bytes.
-                hash = unsafe { xxh64(vaddr.add(y * pitch + sx * 4), (x_end - sx) * 4, hash) };
+                // pixel, so this row slice lies inside the mapped framebuffer.
+                let row = unsafe {
+                    core::slice::from_raw_parts(vaddr.add(y * pitch + sx * 4), (x_end - sx) * 4)
+                };
+                // Chaining the previous hash in as the next seed fingerprints the whole tile
+                // without copying its rows into one contiguous buffer.
+                hash = xxhash::xxh64(row, hash);
                 y += 1;
             }
             hashes[ty * tiles_x + tx] = hash;

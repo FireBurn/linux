@@ -3892,6 +3892,65 @@ impl usb::Driver for VinoDriver {
     /// Stop asynchronous bring-up and unplug DRM before the USB interface loses its bound
     /// typestate. Generic driver teardown drops `VinoDriver` after this callback returns; taking
     /// the owned work handle here is about ordering, not compensating for missing drvdata cleanup.
+    /// Stop all USB I/O before the interface is suspended.
+    ///
+    /// Closing the window cancels the persistent queue URBs and waits for any in-flight transfer,
+    /// so no I/O is outstanding when this returns -- which is what the USB core requires and what
+    /// `IoWindow`'s contract promises.
+    fn suspend<'bound>(
+        _intf: &'bound usb::Interface<Core<'_>>,
+        data: Pin<&VinoBoundData<'bound>>,
+    ) -> Result {
+        if let Some(io) = data.io.as_ref() {
+            io.close();
+        }
+        Ok(())
+    }
+
+    /// I/O is permitted again after a suspend.
+    fn resume<'bound>(
+        _intf: &'bound usb::Interface<Core<'_>>,
+        data: Pin<&VinoBoundData<'bound>>,
+    ) -> Result {
+        if let Some(io) = data.io.as_ref() {
+            io.reopen();
+        }
+        Ok(())
+    }
+
+    /// The device was reset while suspended, so the dock has lost the whole CP session.
+    ///
+    /// Reopen the window -- transfers are permitted again -- but the control plane must be
+    /// re-established from scratch, which only a fresh bring-up does. Nothing re-arms it here yet.
+    fn reset_resume<'bound>(
+        intf: &'bound usb::Interface<Core<'_>>,
+        data: Pin<&VinoBoundData<'bound>>,
+    ) -> Result {
+        Self::resume(intf, data)
+    }
+
+    /// Stop all USB I/O before the device is reset.
+    fn pre_reset<'bound>(
+        _intf: &'bound usb::Interface<Core<'_>>,
+        data: Pin<&VinoBoundData<'bound>>,
+    ) -> Result {
+        if let Some(io) = data.io.as_ref() {
+            io.close();
+        }
+        Ok(())
+    }
+
+    /// I/O is permitted again after the reset.
+    fn post_reset<'bound>(
+        _intf: &'bound usb::Interface<Core<'_>>,
+        data: Pin<&VinoBoundData<'bound>>,
+    ) -> Result {
+        if let Some(io) = data.io.as_ref() {
+            io.reopen();
+        }
+        Ok(())
+    }
+
     fn disconnect<'bound>(
         intf: &'bound usb::Interface<Core<'_>>,
         data: Pin<&VinoBoundData<'bound>>,
