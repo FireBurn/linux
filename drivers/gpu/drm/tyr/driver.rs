@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 or MIT
 
+use core::marker::PhantomData;
+
 use kernel::{
     clk::{
         Clk,
@@ -189,6 +191,7 @@ impl drm::Driver for TyrDrmDriver {
     type File = TyrDrmFileData;
     type Object = drm::gem::shmem::Object<BoData>;
     type ParentDevice<Ctx: DeviceContext> = platform::Device<Ctx>;
+    type Kms = PhantomData<Self>;
 
     const INFO: drm::DriverInfo = INFO;
     const FEAT_RENDER: bool = true;
