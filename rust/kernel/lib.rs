@@ -117,6 +117,7 @@ pub mod processor;
 pub mod ptr;
 #[cfg(CONFIG_RUST_PWM_ABSTRACTIONS)]
 pub mod pwm;
+pub mod random;
 pub mod rbtree;
 pub mod regulator;
 pub mod revocable;
@@ -142,6 +143,7 @@ pub mod uaccess;
 pub mod usb;
 pub mod workqueue;
 pub mod xarray;
+pub mod xxhash;
 
 #[doc(hidden)]
 pub use bindings;

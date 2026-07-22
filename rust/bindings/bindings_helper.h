@@ -114,6 +114,7 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/xarray.h>
+#include <linux/xxhash.h>
 #include <trace/events/rust_sample.h>
 
 /*
