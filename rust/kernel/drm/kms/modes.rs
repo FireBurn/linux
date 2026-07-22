@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
+//!
+//! DRM display modes.
+//!
+//! C header: [`include/drm/drm_modes.h`](srctree/include/drm/drm_modes.h)
+
 use bindings;
 
-use crate::{prelude::*, types::Opaque};
+use crate::types::Opaque;
 
 /// DRM kernel-internal display mode structure.
 ///
@@ -72,5 +77,75 @@ impl DisplayMode {
     pub fn crtc_vtotal(&self) -> u16 {
         // SAFETY: Reading these fields is safe via our type invariants
         unsafe { (*self.as_raw()).crtc_vtotal }
+    }
+
+    /// Return the horizontal active pixels.
+    #[inline]
+    pub fn hdisplay(&self) -> u16 {
+        // SAFETY: Reading this field is safe via the type invariants.
+        unsafe { (*self.as_raw()).hdisplay }
+    }
+
+    /// Return the start of the horizontal sync pulse.
+    #[inline]
+    pub fn hsync_start(&self) -> u16 {
+        // SAFETY: Reading this field is safe via the type invariants.
+        unsafe { (*self.as_raw()).hsync_start }
+    }
+
+    /// Return the end of the horizontal sync pulse.
+    #[inline]
+    pub fn hsync_end(&self) -> u16 {
+        // SAFETY: Reading this field is safe via the type invariants.
+        unsafe { (*self.as_raw()).hsync_end }
+    }
+
+    /// Return the total horizontal pixels including blanking.
+    #[inline]
+    pub fn htotal(&self) -> u16 {
+        // SAFETY: Reading this field is safe via the type invariants.
+        unsafe { (*self.as_raw()).htotal }
+    }
+
+    /// Return the vertical active scanlines.
+    #[inline]
+    pub fn vdisplay(&self) -> u16 {
+        // SAFETY: Reading this field is safe via the type invariants.
+        unsafe { (*self.as_raw()).vdisplay }
+    }
+
+    /// Return the start of the vertical sync pulse.
+    #[inline]
+    pub fn vsync_start(&self) -> u16 {
+        // SAFETY: Reading this field is safe via the type invariants.
+        unsafe { (*self.as_raw()).vsync_start }
+    }
+
+    /// Return the end of the vertical sync pulse.
+    #[inline]
+    pub fn vsync_end(&self) -> u16 {
+        // SAFETY: Reading this field is safe via the type invariants.
+        unsafe { (*self.as_raw()).vsync_end }
+    }
+
+    /// Return the total vertical scanlines including blanking.
+    #[inline]
+    pub fn vtotal(&self) -> u16 {
+        // SAFETY: Reading this field is safe via the type invariants.
+        unsafe { (*self.as_raw()).vtotal }
+    }
+
+    /// Return the pixel clock in kHz.
+    #[inline]
+    pub fn clock(&self) -> i32 {
+        // SAFETY: Reading this field is safe via the type invariants.
+        unsafe { (*self.as_raw()).clock }
+    }
+
+    /// Return the refresh rate in Hz as computed by DRM.
+    #[inline]
+    pub fn vrefresh(&self) -> i32 {
+        // SAFETY: `drm_mode_vrefresh` only reads this valid display mode.
+        unsafe { bindings::drm_mode_vrefresh(self.as_raw()) }
     }
 }
