@@ -4,7 +4,7 @@
 //!
 //! C header: [`include/drm/drm_vblank.h`](srcfree/include/drm/drm_vblank.h)
 
-use super::{crtc::*, ModeObject, modes::*, Sealed};
+use super::{crtc::*, modes::*, ModeObject};
 use bindings;
 use core::{
     marker::*,
