@@ -1,31 +1,32 @@
 // SPDX-License-Identifier: GPL-2.0 OR MIT
 
-//! [`struct drm_atomic_state`] related bindings for rust.
+//! [`struct drm_atomic_commit`] related bindings for rust.
 //!
-//! [`struct drm_atomic_state`]: srctree/include/drm/drm_atomic.h
+//! [`struct drm_atomic_commit`]: srctree/include/drm/drm_atomic.h
 use super::{connector::*, crtc::*, plane::*, KmsDriver, ModeObject};
 use crate::{
     bindings,
     drm::device::Device,
     error::{from_err_ptr, to_result},
     prelude::*,
+    sync::aref::{ARef, AlwaysRefCounted},
     types::*,
 };
 use core::{cell::Cell, marker::*, mem::ManuallyDrop, ops::*, ptr::NonNull};
 
-/// The main wrapper around [`struct drm_atomic_state`].
+/// The main wrapper around [`struct drm_atomic_commit`].
 ///
 /// This type is usually embedded within another interface such as an [`AtomicStateMutator`].
 ///
 /// # Invariants
 ///
-/// - The data layout of this type is identical to [`struct drm_atomic_state`].
+/// - The data layout of this type is identical to [`struct drm_atomic_commit`].
 /// - `state` is initialized for as long as this type is exposed to users.
 ///
-/// [`struct drm_atomic_state`]: srctree/include/drm/drm_atomic.h
+/// [`struct drm_atomic_commit`]: srctree/include/drm/drm_atomic.h
 #[repr(transparent)]
 pub struct AtomicState<T: KmsDriver> {
-    pub(super) state: Opaque<bindings::drm_atomic_state>,
+    pub(super) state: Opaque<bindings::drm_atomic_commit>,
     _p: PhantomData<T>,
 }
 
@@ -34,18 +35,18 @@ impl<T: KmsDriver> AtomicState<T> {
     ///
     /// # Safety
     ///
-    /// `ptr` must point to a valid initialized instance of [`struct drm_atomic_state`].
+    /// `ptr` must point to a valid initialized instance of [`struct drm_atomic_commit`].
     ///
-    /// [`struct drm_atomic_state`]: srctree/include/drm/drm_atomic.h
+    /// [`struct drm_atomic_commit`]: srctree/include/drm/drm_atomic.h
     #[allow(dead_code)]
-    pub(super) unsafe fn from_raw<'a>(ptr: *const bindings::drm_atomic_state) -> &'a Self {
+    pub(super) unsafe fn from_raw<'a>(ptr: *const bindings::drm_atomic_commit) -> &'a Self {
         // SAFETY: Our data layout is identical
         // INVARIANT: Our safety contract upholds the guarantee that `state` is initialized for as
         // long as this type is exposed to users.
         unsafe { &*ptr.cast() }
     }
 
-    pub(crate) fn as_raw(&self) -> *mut bindings::drm_atomic_state {
+    pub(crate) fn as_raw(&self) -> *mut bindings::drm_atomic_commit {
         self.state.get()
     }
 
@@ -102,12 +103,12 @@ impl<T: KmsDriver> AtomicState<T> {
 unsafe impl<T: KmsDriver> AlwaysRefCounted for AtomicState<T> {
     fn inc_ref(&self) {
         // SAFETY: `state` is initialized for as long as this type is exposed to users
-        unsafe { bindings::drm_atomic_state_get(self.state.get()) }
+        unsafe { bindings::drm_atomic_commit_get(self.state.get()) }
     }
 
     unsafe fn dec_ref(obj: NonNull<Self>) {
         // SAFETY: `obj` contains a valid non-null pointer to an initialized `Self`.
-        unsafe { bindings::drm_atomic_state_put(obj.as_ptr().cast()) }
+        unsafe { bindings::drm_atomic_commit_put(obj.as_ptr().cast()) }
     }
 }
 
@@ -141,11 +142,11 @@ impl<T: KmsDriver> AtomicStateMutator<T> {
     ///
     /// # Safety
     ///
-    /// `ptr` must point to a valid `drm_atomic_state`
+    /// `ptr` must point to a valid `drm_atomic_commit`
     #[allow(dead_code)]
-    pub(super) unsafe fn new(ptr: NonNull<bindings::drm_atomic_state>) -> Self {
+    pub(super) unsafe fn new(ptr: NonNull<bindings::drm_atomic_commit>) -> Self {
         Self {
-            // SAFETY: The data layout of `AtomicState<T>` is identical to drm_atomic_state
+            // SAFETY: The data layout of `AtomicState<T>` is identical to drm_atomic_commit
             // We use `ManuallyDrop` because `AtomicStateMutator` is only ever provided to users in
             // the context of KMS callbacks. As such, skipping ref inc/dec for the atomic state is
             // convienent for our bindings.
@@ -156,7 +157,7 @@ impl<T: KmsDriver> AtomicStateMutator<T> {
         }
     }
 
-    pub(crate) fn as_raw(&self) -> *mut bindings::drm_atomic_state {
+    pub(crate) fn as_raw(&self) -> *mut bindings::drm_atomic_commit {
         self.state.as_raw()
     }
 
@@ -273,8 +274,8 @@ impl<T: KmsDriver> Drop for AtomicStateComposer<T> {
 impl<T: KmsDriver> AtomicStateComposer<T> {
     /// # Safety
     ///
-    /// The caller guarantees that `ptr` points to a valid instance of `drm_atomic_state`.
-    pub(crate) unsafe fn new(ptr: NonNull<bindings::drm_atomic_state>) -> Self {
+    /// The caller guarantees that `ptr` points to a valid instance of `drm_atomic_commit`.
+    pub(crate) unsafe fn new(ptr: NonNull<bindings::drm_atomic_commit>) -> Self {
         // SAFETY: see `AtomicStateMutator::from_raw()`
         Self(unsafe { AtomicStateMutator::new(ptr) })
     }
@@ -681,11 +682,11 @@ impl<'a, T: KmsDriver> AtomicCommitTail<'a, T> {
 
 // The actual raw C callback for custom atomic commit tail implementations
 pub(crate) unsafe extern "C" fn commit_tail_callback<T: KmsDriver>(
-    state: *mut bindings::drm_atomic_state,
+    state: *mut bindings::drm_atomic_commit,
 ) {
     // SAFETY:
     // - We're guaranteed by DRM that `state` always points to a valid instance of
-    //   `bindings::drm_atomic_state`
+    //   `bindings::drm_atomic_commit`
     // - This conversion is safe via the type invariants
     let state = unsafe { AtomicState::from_raw(state.cast_const()) };
 

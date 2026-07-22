@@ -94,6 +94,7 @@ pub trait DriverConnector: Send + Sync + Sized {
     /// The generated C vtable for this [`DriverConnector`] implementation
     const OPS: &'static DriverConnectorOps = &DriverConnectorOps {
         funcs: bindings::drm_connector_funcs {
+            atomic_create_state: None,
             dpms: None,
             atomic_get_property: None,
             atomic_set_property: None,
@@ -110,6 +111,7 @@ pub trait DriverConnector: Send + Sync + Sized {
             debugfs_init: None,
             oob_hotplug_event: None,
             atomic_duplicate_state: Some(atomic_duplicate_state_callback::<Self::State>),
+            color_format: None,
         },
         helper_funcs: bindings::drm_connector_helper_funcs {
             mode_valid: None,
