@@ -15,8 +15,11 @@ use crate::{
     drm::{device::Device, driver::Driver, private::Sealed},
     error::to_result,
     prelude::*,
-    sync::{Mutex, MutexGuard},
-    types::*,
+    sync::{
+        aref::{ARef, AlwaysRefCounted},
+        Mutex,
+        MutexGuard, //
+    },
 };
 use bindings;
 use core::{
@@ -215,14 +218,14 @@ pub trait KmsDriver: Driver {
     /// implementations.
     ///
     /// [`DriverConnector`]: connector::DriverConnector
-    type Connector: connector::DriverConnector;
+    type Connector: connector::DriverConnector<Driver = Self>;
 
     /// The driver's [`DriverPlane`] implementation.
     ///
     /// TODO: This will be unneeded in the future once we support multiple [`DriverPlane`]
     /// implementations.
     ///
-    type Plane: plane::DriverPlane;
+    type Plane: plane::DriverPlane<Driver = Self>;
 
     /// The driver's [`DriverCrtc`] implementation.
     ///
@@ -230,7 +233,7 @@ pub trait KmsDriver: Driver {
     /// implementations.
     ///
     /// [`DriverCrtc`]: crtc::DriverCrtc
-    type Crtc: crtc::DriverCrtc;
+    type Crtc: crtc::DriverCrtc<Driver = Self>;
 
     /// The driver's [`DriverEncoder`] implementation.
     ///
@@ -238,7 +241,7 @@ pub trait KmsDriver: Driver {
     /// implementations.
     ///
     /// [`DriverEncoder`]: encoder::DriverEncoder
-    type Encoder: encoder::DriverEncoder;
+    type Encoder: encoder::DriverEncoder<Driver = Self>;
 
     /// Return a [`ModeConfigInfo`] structure for this [`device::Device`].
     fn mode_config_info(
@@ -500,7 +503,7 @@ macro_rules! impl_aref_for_mode_object {
     (impl $( < $( $param:ident: $bound:ident ),+ > )? for $type:ty) => {
         // SAFETY: drm_mode_object_get()/put() ensure the type is ref-counted according to the
         // safety contract
-        unsafe impl $( < $( $param: $bound ),+ > )? kernel::types::AlwaysRefCounted for $type {
+        unsafe impl $( < $( $param: $bound ),+ > )? kernel::sync::aref::AlwaysRefCounted for $type {
             #[inline]
             fn inc_ref(&self) {
                 // SAFETY: We're guaranteed by the safety contract of `ModeObject` that
@@ -534,6 +537,7 @@ pub(super) use impl_aref_for_mode_object;
 ///
 /// `ModeObjectVtable::vtable()` must always return a valid pointer to the relevant mode object's
 /// vtable.
+#[allow(dead_code)]
 pub(crate) unsafe trait ModeObjectVtable {
     /// The type for the auto-generated vtable.
     type Vtable;
