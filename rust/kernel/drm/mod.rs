@@ -4,6 +4,7 @@
 
 pub mod device;
 pub mod driver;
+pub mod event;
 pub mod file;
 pub mod fourcc;
 pub mod gem;
