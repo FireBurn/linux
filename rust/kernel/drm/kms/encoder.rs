@@ -273,15 +273,35 @@ impl<T: DriverEncoder> UnregisteredEncoder<T> {
     /// A driver may use this from their [`KmsDriver::create_objects`] callback in order to
     /// construct new [`UnregisteredEncoder`] objects.
     ///
+    /// The returned encoder cannot outlive the device borrow:
+    ///
+    /// ```ignore,compile_fail
+    /// use kernel::{drm::kms::{encoder::{DriverEncoder, Type, UnregisteredEncoder},
+    ///                         UnregisteredKmsDevice},
+    ///              error::Result,
+    ///              str::CStr};
+    ///
+    /// fn reject_leaking_signature<T: DriverEncoder>() {
+    ///     let _: for<'a> fn(
+    ///         &'a UnregisteredKmsDevice<'a, T::Driver>,
+    ///         Type,
+    ///         u32,
+    ///         u32,
+    ///         Option<&CStr>,
+    ///         T::Args,
+    ///     ) -> Result<&'static UnregisteredEncoder<T>> = UnregisteredEncoder::<T>::new;
+    /// }
+    /// ```
+    ///
     /// [`KmsDriver::create_objects`]: kernel::drm::kms::KmsDriver::create_objects
-    pub fn new<'a, 'b: 'a>(
+    pub fn new<'a>(
         dev: &'a UnregisteredKmsDevice<'a, T::Driver>,
         type_: Type,
         possible_crtcs: u32,
         possible_clones: u32,
         name: Option<&CStr>,
         args: T::Args,
-    ) -> Result<&'b Self> {
+    ) -> Result<&'a Self> {
         let this: Pin<KBox<Encoder<T>>> = KBox::try_pin_init(
             try_pin_init!(Encoder {
                 encoder: Opaque::new(bindings::drm_encoder {
