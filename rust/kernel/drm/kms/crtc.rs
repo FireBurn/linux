@@ -14,6 +14,7 @@ use crate::{
     drm::device::Device,
     error::{from_result, to_result},
     prelude::*,
+    sync::aref::ARef,
     types::{NotThreadSafe, Opaque},
 };
 use core::{
@@ -303,6 +304,59 @@ impl<T: DriverCrtc> Crtc<T> {
 
     pub(crate) const fn has_vblank() -> bool {
         T::OPS.funcs.enable_vblank.is_some()
+    }
+
+    /// Returns an owned handle to this [`Crtc`].
+    ///
+    /// A `&Crtc<T>` is only valid for the callback that produced it. Drivers that must reach a
+    /// CRTC from a context DRM did not hand one to -- a timer callback driving a software vblank
+    /// clock, for instance -- can keep a [`CrtcRef`] instead of stashing a raw pointer.
+    pub fn to_owned_ref(&self) -> CrtcRef<T> {
+        CrtcRef {
+            dev: self.drm_dev().into(),
+            crtc: NonNull::from(self),
+        }
+    }
+}
+
+/// An owned handle to a [`Crtc`].
+///
+/// Mode objects are owned by their DRM device and live until it is freed, so holding an [`ARef`] to
+/// that device is enough to keep the CRTC valid. [`crtc`](CrtcRef::crtc) then hands back a usable
+/// reference from any context.
+///
+/// [`ARef`]: crate::sync::aref::ARef
+pub struct CrtcRef<T: DriverCrtc> {
+    /// Keeps the DRM device -- and with it every mode object it owns, including `crtc` -- alive.
+    dev: ARef<Device<T::Driver>>,
+    crtc: NonNull<Crtc<T>>,
+}
+
+// SAFETY: This is an owning handle to device state, not to anything thread-local, and the
+// `ARef` it holds is itself `Send`.
+unsafe impl<T: DriverCrtc> Send for CrtcRef<T> {}
+
+// SAFETY: The only shared access offered is `crtc()`, which yields the same `&Crtc<T>` that is
+// already freely shareable between threads.
+unsafe impl<T: DriverCrtc> Sync for CrtcRef<T> {}
+
+impl<T: DriverCrtc> CrtcRef<T> {
+    /// The [`Crtc`] this handle refers to.
+    pub fn crtc(&self) -> &Crtc<T> {
+        // SAFETY: `self.dev` holds a reference to the DRM device that owns this CRTC, and mode
+        // objects live until their device is freed, so the pointer is still valid.
+        unsafe { self.crtc.as_ref() }
+    }
+
+    /// The DRM device that owns the [`Crtc`].
+    pub fn drm_dev(&self) -> &Device<T::Driver> {
+        &self.dev
+    }
+}
+
+impl<T: DriverCrtc> Clone for CrtcRef<T> {
+    fn clone(&self) -> Self {
+        self.crtc().to_owned_ref()
     }
 }
 
