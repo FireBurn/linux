@@ -438,6 +438,27 @@ impl<T: DriverPlane> UnregisteredPlane<T> {
             )
         })
     }
+
+    /// Attaches the `FB_DAMAGE_CLIPS` property to this plane.
+    ///
+    /// Userspace can then hand the driver the list of rectangles that actually changed between two
+    /// framebuffers, instead of leaving it to infer damage from a buffer swap. Drivers that upload
+    /// their scanout over a slow link -- USB display adapters especially -- need this to send only
+    /// the changed regions.
+    ///
+    /// Without the property attached, a compositor cannot supply clips at all: unchanged commits
+    /// arrive with an empty list, which is indistinguishable from "no damage information".
+    ///
+    /// The clips are read back through
+    /// [`RawPlaneState::damage_clips`](crate::drm::kms::plane::RawPlaneState::damage_clips).
+    ///
+    /// Call this during [`KmsDriver::create_objects`](crate::drm::kms::KmsDriver::create_objects),
+    /// before the device is registered.
+    pub fn enable_fb_damage_clips(&self) {
+        // SAFETY: `as_raw()` is a valid, not-yet-registered plane; attaching a property before
+        // registration is exactly what this helper is for.
+        unsafe { bindings::drm_plane_enable_fb_damage_clips(self.as_raw()) }
+    }
 }
 
 /// A trait implemented by any type that acts as a [`struct drm_plane`] interface.
