@@ -359,6 +359,53 @@ impl<'a, T: VblankDriverCrtc> VblankRef<'a, T> {
 
         Ok(Self(crtc))
     }
+
+    /// Converts this reference into an [`OwnedVblankRef`], which is not tied to the borrow of the
+    /// [`Crtc`] it came from.
+    pub fn into_owned(self) -> OwnedVblankRef<T> {
+        let crtc = self.0;
+
+        // The new owner takes over the reference this guard was holding.
+        mem::forget(self);
+
+        OwnedVblankRef(crtc.to_owned_ref())
+    }
+}
+
+/// A vblank reference that owns a reference to its DRM device.
+///
+/// [`VblankRef`] borrows the [`Crtc`] it was taken from, so it cannot outlive the callback that
+/// created it. A driver whose vblank interval spans several callbacks -- typically one that enables
+/// vblanks in [`atomic_enable`] and releases them in [`atomic_disable`], or that drives a software
+/// vblank clock from a timer -- needs a reference it can store instead.
+///
+/// It wraps a [`CrtcRef`], which keeps the DRM device -- and so the CRTC -- alive, so [`crtc`]
+/// hands back a usable reference for as long as this object exists. Dropping it releases the
+/// vblank reference exactly once.
+///
+/// [`atomic_enable`]: DriverCrtc::atomic_enable
+/// [`atomic_disable`]: DriverCrtc::atomic_disable
+/// [`crtc`]: OwnedVblankRef::crtc
+pub struct OwnedVblankRef<T: VblankDriverCrtc>(CrtcRef<T>);
+
+impl<T: VblankDriverCrtc> OwnedVblankRef<T> {
+    /// The [`Crtc`] whose vblanks this reference is keeping enabled.
+    pub fn crtc(&self) -> &Crtc<T> {
+        self.0.crtc()
+    }
+
+    /// The DRM device that owns the [`Crtc`].
+    pub fn drm_dev(&self) -> &Device<T::Driver> {
+        self.0.drm_dev()
+    }
+}
+
+impl<T: VblankDriverCrtc> Drop for OwnedVblankRef<T> {
+    fn drop(&mut self) {
+        // SAFETY: `crtc()` returns a valid, initialized `drm_crtc`, and this type holds exactly
+        // one vblank reference -- taken by `VblankRef::new()` and transferred by `into_owned()`.
+        unsafe { bindings::drm_crtc_vblank_put(self.crtc().as_raw()) };
+    }
 }
 
 /// The base wrapper for [`drm_vblank_crtc`].
