@@ -186,6 +186,13 @@ pub trait BaseObject: IntoGEMObject {
         D: drm::Driver<Object = Self, File = F>,
         F: drm::file::DriverFile<Driver = D>,
     {
+        // The associated-type bounds prove a common driver type; separately reject another
+        // instance of that driver before passing the pair to the C API.
+        // SAFETY: `self.as_raw()` is a valid GEM object by the trait invariant.
+        if unsafe { (*self.as_raw()).dev } != file.device_raw() {
+            return Err(EINVAL);
+        }
+
         let mut handle: u32 = 0;
         // SAFETY: The arguments are all valid per the type invariants.
         to_result(unsafe {
