@@ -302,7 +302,7 @@ impl<T: DriverCrtc> UnregisteredCrtc<T> {
     /// construct new [`UnregisteredCrtc`] objects.
     ///
     /// [`KmsDriver::create_objects`]: kernel::drm::kms::KmsDriver::create_objects
-    pub fn new<'a, 'b: 'a, PrimaryData, CursorData>(
+    pub fn new<'a, PrimaryData, CursorData>(
         dev: &'a UnregisteredKmsDevice<'a, T::Driver>,
         primary: &'a UnregisteredPlane<PrimaryData>,
         cursor: Option<&'a UnregisteredPlane<CursorData>>,
