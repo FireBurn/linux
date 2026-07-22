@@ -677,7 +677,9 @@ impl IoWindow {
     /// [`close`]: IoWindow::close
     fn register_urb(&self, token: u64, urb: NonNull<bindings::urb>) -> Result {
         let mut state = self.state.lock();
-        Ok(state.urbs.push(UrbRegistration { token, urb }, GFP_KERNEL)?)
+        Ok(state
+            .urbs
+            .push(UrbRegistration { token, urb }, GFP_KERNEL)?)
     }
 
     /// Allocates a fresh queue token.

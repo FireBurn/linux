@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0
+config DRM_VINO
+	tristate "DisplayLink DL3 (Vino) open driver"
+	depends on USB
+	depends on DRM
+	depends on RUST
+	# RUST_DRM_GEM_SHMEM_HELPER depends on MMU; inherit that dependency here so the
+	# select below cannot generate an unmet-direct-dependency warning on nommu.
+	depends on MMU
+	select DRM_KMS_HELPER
+	select RUST_DRM_GEM_SHMEM_HELPER
+	select CRYPTO_LIB_RSA
+	help
+	  Open in-kernel Rust driver for DisplayLink DL3 USB docks (Dell
+	  Universal Dock D6000 and relatives).
+
+	  It binds the dock over USB, runs the HDCP 2.2 control plane, mode-set
+	  and the Vino codec, and registers a DRM/KMS sink that scans out to the
+	  dock's video endpoints.
+
+	  To compile this as a module, choose M here: the module is called vino.
+
+	  If unsure, say N.
