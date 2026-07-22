@@ -608,32 +608,6 @@ impl Ep84Drain {
 
 mod drm_sink;
 
-/// Synchronously cancel `work`, waiting for it to finish if it is already running.
-///
-/// The generic Rust workqueue bindings do not expose cancellation yet. Onur Ozkan's
-/// `SupportsCancel` series is posted but unmerged, and the v2 review rejected carrying a competing
-/// local `cancel_sync()` on every `WorkItemPointer`, so this driver calls the C helper directly
-/// until that API lands. Replace this with the accepted binding once it is merged.
-///
-/// `Work<T, ID>` is `#[repr(transparent)]` over `Opaque<work_struct>` (its only other field is a
-/// `PhantomData`), so the reference casts to the C type it wraps.
-///
-/// # Safety
-///
-/// `work` must be a live, initialized work item, and must remain live for the duration of the
-/// call -- normally by holding the pointer that owns it across the call.
-unsafe fn cancel_work_sync<T: ?Sized, const ID: u64>(work: &Work<T, ID>) -> bool {
-    // SAFETY: `Work` is a transparent wrapper of `Opaque<work_struct>`, and the caller guarantees
-    // the work item is live and initialized for the duration of the call.
-    unsafe {
-        bindings::cancel_work_sync(
-            (work as *const Work<T, ID>)
-                .cast::<bindings::work_struct>()
-                .cast_mut(),
-        )
-    }
-}
-
 /// The USB driver itself. Stateless: everything per-binding lives in [`VinoBoundData`].
 struct VinoDriver;
 
@@ -3974,16 +3948,16 @@ impl usb::Driver for VinoDriver {
 
         // Take the sole driver-owned bring-up handle. The queued work holds its own Arc until it
         // runs or is cancelled, while this local Arc keeps the embedded Work pinned and live
-        // throughout `cancel_work_sync` below.
+        // throughout the `cancel_sync` below.
         let bringup = data.bringup.lock().take();
 
-        // Flush the deferred bring-up before the interface is unbound: `cancel_work_sync`
-        // dequeues it if pending and blocks until it returns if already running, so no
-        // USB I/O races the unbind (see the `Interface::as_bound` contract in
-        // `BringUp::run`). Safe to call when the work already finished or never ran.
+        // Flush the deferred bring-up before the interface is unbound: `cancel_sync` dequeues it
+        // if pending and blocks until it returns if already running, so no USB I/O races the
+        // unbind. Safe when the work already finished or never ran -- it then simply reports that
+        // nothing was pending. The reclaimed `Arc<BringUp>` (returned only if the work was still
+        // queued) is dropped here.
         if let Some(work) = bringup.as_ref() {
-            // SAFETY: the local `bringup` Arc keeps the embedded work item live across the call.
-            unsafe { cancel_work_sync(&work.work) };
+            drop(work.work.cancel_sync());
         }
         // Stop every producer. The DRM device itself is unregistered by `Registration`'s `Drop`
         // when the bound data is released -- the accepted registration teardown already calls

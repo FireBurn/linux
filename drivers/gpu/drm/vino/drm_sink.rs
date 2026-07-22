@@ -409,9 +409,10 @@ impl VinoDrmData {
         *self.cmd_queue.lock() = KVec::new();
         *self.pending_scanout.lock() = [const { None }; HEADS];
         *self.strip_hashes.lock() = [const { None }; HEADS];
-        // SAFETY: `self` owns the embedded work item and is kept alive by the caller's reference
-        // for the duration of the call.
-        unsafe { super::cancel_work_sync(&self.cmd_work) };
+        // Cancel the queued drain and reclaim the `ARef<VinoDrmDevice>` the enqueue handed to
+        // the workqueue, if it was still pending. Dropping it here releases the self-reference
+        // that would otherwise keep this device alive until the work ran.
+        drop(self.cmd_work.cancel_sync());
 
         // A running callback may have taken a batch just before shutdown was published. It has
         // finished now; clear anything it left behind and tear the USB queues down while their
