@@ -5,7 +5,7 @@
 //! C header: [`include/drm/drm_encoder.h`](srctree/include/drm/drm_encoder.h)
 
 use super::{
-    KmsDriver, ModeObject, ModeObjectVtable, StaticModeObject, UnregisteredKmsDevice, Sealed
+    KmsDriver, ModeObject, ModeObjectVtable, Sealed, StaticModeObject, UnregisteredKmsDevice,
 };
 use crate::{
     alloc::KBox,
@@ -15,12 +15,7 @@ use crate::{
     types::{NotThreadSafe, Opaque},
 };
 use bindings;
-use core::{
-    marker::*,
-    mem,
-    ops::Deref,
-    ptr::null,
-};
+use core::{marker::*, mem, ops::Deref, ptr::null};
 use macros::paste;
 
 /// A macro for generating our type ID enumerator.

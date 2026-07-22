@@ -245,10 +245,7 @@ pub trait KmsDriver: Driver {
     type Encoder: encoder::DriverEncoder<Driver = Self>;
 
     /// Return a [`ModeConfigInfo`] structure for this [`device::Device`].
-    fn mode_config_info(
-        dev: &device::Device,
-        drm_data: &Self::Data,
-    ) -> Result<ModeConfigInfo>;
+    fn mode_config_info(dev: &device::Device, drm_data: &Self::Data) -> Result<ModeConfigInfo>;
 
     /// Create mode objects like [`crtc::Crtc`], [`plane::Plane`], etc. for this device
     fn create_objects(drm: &UnregisteredKmsDevice<'_, Self>) -> Result
@@ -359,6 +356,17 @@ impl<T: Driver> private::KmsImpl for PhantomData<T> {
 }
 
 impl<T: Driver> KmsImpl for PhantomData<T> {}
+
+impl<T: KmsDriver, C: crate::drm::device::DeviceContext> Device<T, C> {
+    /// Send a hotplug uevent to userspace, prompting it to re-probe connector state.
+    ///
+    /// This is useful for drivers which detect connector changes out of band, for example when a
+    /// dock supplies an EDID after bring-up.
+    pub fn hotplug_event(&self) {
+        // SAFETY: `self.as_raw()` is a live KMS-capable DRM device.
+        unsafe { bindings::drm_kms_helper_hotplug_event(self.as_raw()) };
+    }
+}
 
 /// Various device-wide information for a [`Device`] that is provided during initialization.
 #[derive(Copy, Clone)]

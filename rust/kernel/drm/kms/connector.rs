@@ -5,7 +5,7 @@
 //! C header: [`include/drm/drm_connector.h`](srctree/include/drm/drm_connector.h)
 
 use super::{
-    atomic::*, encoder::*, KmsDriver, ModeConfigGuard, ModeObject, ModeObjectVtable, Sealed
+    atomic::*, encoder::*, KmsDriver, ModeConfigGuard, ModeObject, ModeObjectVtable, Sealed,
 };
 use crate::{
     alloc::KBox,
@@ -586,6 +586,39 @@ impl<'a, T: DriverConnector> ConnectorGuard<'a, T> {
     pub fn set_preferred_mode(&self, (h_pref, w_pref): (u32, u32)) {
         // SAFETY: We hold the locks required to call this via our type invariants.
         unsafe { bindings::drm_set_preferred_mode(self.as_raw(), h_pref, w_pref) }
+    }
+
+    /// Parse an EDID, update the connector information, and add its advertised modes.
+    ///
+    /// Returns the number of modes added.
+    pub fn add_edid_modes(&self, edid: &[u8]) -> Result<i32> {
+        const EDID_BASE_BLOCK_LEN: usize = 128;
+
+        if edid.len() < EDID_BASE_BLOCK_LEN {
+            return Err(EINVAL);
+        }
+
+        // SAFETY: `edid` points to `edid.len()` initialized bytes, which the helper copies.
+        let drm_edid = unsafe { bindings::drm_edid_alloc(edid.as_ptr().cast(), edid.len()) };
+        if drm_edid.is_null() {
+            return Err(ENOMEM);
+        }
+
+        // SAFETY: The connector is live and the guard holds the mode-config lock. `drm_edid`
+        // points to an allocation returned by `drm_edid_alloc` above.
+        let ret = unsafe { bindings::drm_edid_connector_update(self.as_raw(), drm_edid) };
+        if let Err(err) = to_result(ret) {
+            // SAFETY: `drm_edid` was allocated above and has not been freed.
+            unsafe { bindings::drm_edid_free(drm_edid) };
+            return Err(err);
+        }
+
+        // SAFETY: The connector information was successfully updated from this EDID above.
+        let count = unsafe { bindings::drm_edid_connector_add_modes(self.as_raw()) };
+        // SAFETY: `drm_edid` was allocated above and is no longer needed.
+        unsafe { bindings::drm_edid_free(drm_edid) };
+
+        Ok(count)
     }
 }
 
