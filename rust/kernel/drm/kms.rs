@@ -77,7 +77,7 @@ pub(crate) mod private {
 /// generate said functions for any kind of type which the original mode object driver trait can be
 /// derived from. All conversions check the mode object's vtable. For example:
 ///
-/// ```compile_fail
+/// ```ignore
 /// impl<'a, T: DriverConnectorState> ConnectorState<T> {
 ///     impl_from_opaque_mode_obj! {
 ///         // | An optional lifetime and param-variables to declare for each function
