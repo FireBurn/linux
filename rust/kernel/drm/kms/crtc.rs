@@ -46,6 +46,7 @@ pub trait DriverCrtc: Send + Sync + Sized {
     /// The generated C vtable for this [`DriverCrtc`] implementation.
     const OPS: &'static DriverCrtcOps = &DriverCrtcOps {
         funcs: bindings::drm_crtc_funcs {
+            atomic_create_state: None,
             atomic_destroy_state: Some(atomic_destroy_state_callback::<Self::State>),
             atomic_duplicate_state: Some(atomic_duplicate_state_callback::<Self::State>),
             atomic_get_property: None,
@@ -107,8 +108,8 @@ pub trait DriverCrtc: Send + Sync + Sized {
             },
             mode_set_nofb: None,
             mode_set_base: None,
-            mode_set_base_atomic: None,
             get_scanout_position: None,
+            handle_vblank_timeout: None,
         },
     };
 
@@ -995,14 +996,14 @@ unsafe extern "C" fn crtc_reset_callback<T: DriverCrtcState>(crtc: *mut bindings
 
 unsafe extern "C" fn atomic_check_callback<T: DriverCrtc>(
     crtc: *mut bindings::drm_crtc,
-    state: *mut bindings::drm_atomic_state,
+    state: *mut bindings::drm_atomic_commit,
 ) -> i32 {
     // SAFETY:
     // - We're guaranteed `crtc` is of type `Crtc<T>` via type invariants.
     // - We're guaranteed by DRM that `crtc` is pointing to a valid initialized state.
     let crtc = unsafe { Crtc::from_raw(crtc) };
 
-    // SAFETY: DRM guarantees `state` points to a valid `drm_atomic_state`
+    // SAFETY: DRM guarantees `state` points to a valid `drm_atomic_commit`
     // We use a ManuallyDrop here to avoid AtomicStateComposer dropping an owned reference we never
     // acquired.
     let state =
@@ -1023,14 +1024,15 @@ unsafe extern "C" fn atomic_check_callback<T: DriverCrtc>(
 
 unsafe extern "C" fn atomic_begin_callback<T: DriverCrtc>(
     crtc: *mut bindings::drm_crtc,
-    state: *mut bindings::drm_atomic_state,
+    state: *mut bindings::drm_atomic_commit,
 ) {
     // SAFETY:
     // * We're guaranteed `crtc` is of type `Crtc<T>` via type invariants.
     // * We're guaranteed by DRM that `crtc` is pointing to a valid initialized state.
     let crtc = unsafe { Crtc::from_raw(crtc) };
 
-    // SAFETY: We're guaranteed by DRM that `state` points to a valid instance of `drm_atomic_state`
+    // SAFETY: DRM guarantees that `state` points to a valid
+    // `drm_atomic_commit`.
     let state = unsafe { AtomicStateMutator::new(NonNull::new_unchecked(state)) };
 
     // SAFETY:
@@ -1045,14 +1047,15 @@ unsafe extern "C" fn atomic_begin_callback<T: DriverCrtc>(
 
 unsafe extern "C" fn atomic_flush_callback<T: DriverCrtc>(
     crtc: *mut bindings::drm_crtc,
-    state: *mut bindings::drm_atomic_state,
+    state: *mut bindings::drm_atomic_commit,
 ) {
     // SAFETY:
     // - We're guaranteed `crtc` is of type `Crtc<T>` via type invariants.
     // - We're guaranteed by DRM that `crtc` is pointing to a valid initialized state.
     let crtc = unsafe { Crtc::from_raw(crtc) };
 
-    // SAFETY: We're guaranteed by DRM that `state` points to a valid instance of `drm_atomic_state`
+    // SAFETY: DRM guarantees that `state` points to a valid
+    // `drm_atomic_commit`.
     let state = unsafe { AtomicStateMutator::new(NonNull::new_unchecked(state)) };
 
     // SAFETY:
@@ -1067,7 +1070,7 @@ unsafe extern "C" fn atomic_flush_callback<T: DriverCrtc>(
 
 unsafe extern "C" fn atomic_enable_callback<T: DriverCrtc>(
     crtc: *mut bindings::drm_crtc,
-    state: *mut bindings::drm_atomic_state,
+    state: *mut bindings::drm_atomic_commit,
 ) {
     // SAFETY:
     // - We're guaranteed `crtc` is of type `Crtc<T>` via type invariants.
@@ -1089,7 +1092,7 @@ unsafe extern "C" fn atomic_enable_callback<T: DriverCrtc>(
 
 unsafe extern "C" fn atomic_disable_callback<T: DriverCrtc>(
     crtc: *mut bindings::drm_crtc,
-    state: *mut bindings::drm_atomic_state,
+    state: *mut bindings::drm_atomic_commit,
 ) {
     // SAFETY:
     // - We're guaranteed `crtc` points to a valid instance of `drm_crtc`
