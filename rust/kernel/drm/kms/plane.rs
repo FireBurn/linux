@@ -46,6 +46,7 @@ pub trait DriverPlane: Send + Sync + Sized {
     /// The generated C vtable for this [`DriverPlane`] implementation.
     const OPS: &'static DriverPlaneOps = &DriverPlaneOps {
         funcs: bindings::drm_plane_funcs {
+            atomic_create_state: None,
             update_plane: Some(bindings::drm_atomic_helper_update_plane),
             disable_plane: Some(bindings::drm_atomic_helper_disable_plane),
             destroy: Some(plane_destroy_callback::<Self>),
@@ -1048,14 +1049,14 @@ unsafe extern "C" fn plane_reset_callback<T: DriverPlane>(plane: *mut bindings::
 
 unsafe extern "C" fn atomic_update_callback<T: DriverPlane>(
     plane: *mut bindings::drm_plane,
-    state: *mut bindings::drm_atomic_state,
+    state: *mut bindings::drm_atomic_commit,
 ) {
     // SAFETY:
     // - We're guaranteed `plane` is of type `Plane<T>` via type invariants.
     // - We're guaranteed by DRM that `plane` is pointing to a valid initialized state.
     let plane = unsafe { Plane::from_raw(plane) };
 
-    // SAFETY: DRM guarantees `state` points to a valid `drm_atomic_state`
+    // SAFETY: DRM guarantees `state` points to a valid `drm_atomic_commit`
     let state = unsafe { AtomicStateMutator::new(NonNull::new_unchecked(state)) };
 
     // SAFETY:
@@ -1070,14 +1071,15 @@ unsafe extern "C" fn atomic_update_callback<T: DriverPlane>(
 
 unsafe extern "C" fn atomic_check_callback<T: DriverPlane>(
     plane: *mut bindings::drm_plane,
-    state: *mut bindings::drm_atomic_state,
+    state: *mut bindings::drm_atomic_commit,
 ) -> i32 {
     // SAFETY:
     // - We're guaranteed `plane` is of type `Plane<T>` via type invariants.
     // - We're guaranteed by DRM that `plane` is pointing to a valid initialized state.
     let plane = unsafe { Plane::from_raw(plane) };
 
-    // SAFETY: We're guaranteed by DRM that `state` points to a valid instance of `drm_atomic_state`
+    // SAFETY: DRM guarantees that `state` points to a valid
+    // `drm_atomic_commit`.
     // We use ManuallyDrop here since AtomicStateComposer would otherwise drop a owned reference to
     // the atomic state upon finishing this callback.
     let state = ManuallyDrop::new(unsafe {
