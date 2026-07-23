@@ -122,10 +122,17 @@ pub(crate) const VIDEO_EPS: [u8; HEADS] = [0x08, 0x0b];
 /// (no per-flip allocation); a compositor that reports more clips than this just gets a coarser
 /// (still correct) repaint.
 const MAX_DAMAGE_CLIPS: usize = 16;
-/// Minimum interval between frames for one head. DLM's captured video/status stream runs at about
-/// 60--75 Hz. Content-based strip comparison below makes normal deltas small enough to follow that
-/// cadence without repeatedly encoding multi-megabyte full frames.
-const FRAME_PERIOD_MS: i64 = 16;
+/// Minimum interval between frames for one head.
+///
+/// **Reverted 2026-07-23 from 16 ms (~60 Hz) to 140 ms**, the value in `drm` commit `a6f4c8b`
+/// ("Pixels :D"), the last build observed to light both panels. That build's note is explicit that
+/// DLM streams video continuously at about 7 fps (xHCI: 131 frames, ~3 MB each, over 18.5 s) and
+/// that vino had already been burnt twice at the extremes -- a full frame every flip floods the
+/// dock, one keyframe and then silence starves it into its ~6 s watchdog (the `38c41` tick now
+/// visible in the dock's firmware trace). 16 ms was introduced with the damage-delta work on the
+/// assumption small deltas make the higher rate safe; that assumption has never been tested on a
+/// lit panel. Raise it again only once pixels are back.
+const FRAME_PERIOD_MS: i64 = 140;
 type DamageRect = (usize, usize, usize, usize);
 type BoundInterface<'a> = super::UsbLink<'a>;
 
@@ -619,8 +626,17 @@ impl VinoDrmData {
     /// activation and fell back to its `38c41` idle tick (210x per capture, never once in DLM's).
     /// The polls are kept -- DLM does interleave status traffic here -- but not the stall.
     /// See `docs/BLOCKER.md`.
+    ///
+    /// **2026-07-23:** the readiness window now lives back at the end of
+    /// [`modeset_bracket_post`], where the known-lit `a6f4c8b` build had it, so this inline
+    /// pre-write copy is down to a token two polls. Do not restore 75x16ms *here* -- having it in
+    /// both places is what produced a 3.9 s bracket-to-first-frame gap against DLM's 140 ms.
     const PREWRITE_POLLS: u32 = 2;
     const PREWRITE_POLL_MS: u64 = 1;
+    /// Dock video-pipe readiness window at the end of the mode-set bracket (~1.2 s), as in the
+    /// known-lit `a6f4c8b` build.
+    const POST_MODESET_POLLS: u32 = 75;
+    const POST_MODESET_POLL_MS: u64 = 16;
     /// One `id=0x14 sub=0x000c` device-status poll — the same message the EDID readiness loop uses.
     fn poll_status(&self, dev: &BoundInterface<'_>) {
         let _ = self.send_cp(dev, 0x14, 0, |ctr| super::cp::device_query_req(ctr, 0x000c));
@@ -639,6 +655,11 @@ impl VinoDrmData {
     /// In both decrypted DLM captures the two markers of a pair go out back-to-back (~1 ms apart)
     /// and consecutive pairs are separated by tens of milliseconds of status/EDID traffic, so the
     /// poll belongs *between* pairs rather than inside one.
+    /// Currently unused: the brackets were reverted on 2026-07-23 to the known-lit `a6f4c8b`
+    /// shape, which is not expressible as clean `(2f, 2e)` pairs (it has an unpaired `2f(1)`).
+    /// Kept because it is the exact form the decrypted DLM captures decode to, and is what the
+    /// brackets should return to once a lit panel gives a baseline to A/B against.
+    #[allow(dead_code)]
     fn stream_marker_pairs(&self, dev: &BoundInterface<'_>, head: u8, pairs: &[(u8, u8)]) {
         for (i, &(state_2f, state_2e)) in pairs.iter().enumerate() {
             if i > 0 {
@@ -660,8 +681,16 @@ impl VinoDrmData {
     ///
     /// vino previously sent only the first of those four. A **wake** (the first mode-set since the
     /// CRTC was enabled) has no pre-half at all -- see [`modeset_bracket_post`].
+    /// **Reverted 2026-07-23 to the shape of `drm` commit `a6f4c8b` ("Pixels :D", 2026-07-22
+    /// 01:36) -- the last build observed to actually light both panels.** That build sent this
+    /// half unconditionally, for a wake and a mode change alike, as a single `2f(1) 2e(3)` pair
+    /// followed by one status poll. The four-pair form below it, and the wake/mode-change split in
+    /// [`modeset_bracket_post`], were derived from capture analysis *after* the panels had gone
+    /// dark; no build carrying them has ever lit a panel. Restoring the known-lit shape first, and
+    /// re-deriving from captures only once pixels are back, is the cheaper order.
     fn modeset_bracket_pre(&self, dev: &BoundInterface<'_>, head: u8) {
-        self.stream_marker_pairs(dev, head, &[(1, 3), (1, 0), (0, 0), (1, 3)]);
+        self.stream_marker(dev, head, 0x2f, 1);
+        self.stream_marker(dev, head, 0x2e, 3);
         self.poll_status(dev);
     }
 
@@ -684,12 +713,31 @@ impl VinoDrmData {
     ///
     /// vino previously sent one hybrid sequence for both cases, with an unpaired `2f:1` and no
     /// second `2e:3`, and never distinguished a wake from a mode change.
-    fn modeset_bracket_post(&self, dev: &BoundInterface<'_>, head: u8, wake: bool) {
+    /// **Reverted 2026-07-23 to `a6f4c8b`'s known-lit order** (capture record numbers n=7..36):
+    /// `poll 2f(1) 2e(0) poll 2f(1) poll 2e(0) 2f(0) 2e(0)`, then [`POST_MODESET_POLLS`] paced
+    /// polls. Note the deliberately **unpaired `2f(1)`** in the middle -- a later pass "corrected"
+    /// that to clean pairs and split wake from mode-change, and the panels have been dark ever
+    /// since. `wake` is retained for logging only; both cases send this one sequence, as the lit
+    /// build did.
+    ///
+    /// The trailing paced polls are the dock's video-pipe readiness window and belong HERE, at the
+    /// end of the bracket -- not inline before the first video write, where a later refactor moved
+    /// them (see [`PREWRITE_POLLS`]).
+    fn modeset_bracket_post(&self, dev: &BoundInterface<'_>, head: u8, _wake: bool) {
         self.poll_status(dev);
-        if wake {
-            self.stream_marker_pairs(dev, head, &[(1, 3), (1, 3), (1, 0), (1, 0), (0, 0)]);
-        } else {
-            self.stream_marker_pairs(dev, head, &[(1, 0), (0, 0), (1, 0), (0, 0)]);
+        self.stream_marker(dev, head, 0x2f, 1);
+        self.stream_marker(dev, head, 0x2e, 0);
+        self.poll_status(dev);
+        self.stream_marker(dev, head, 0x2f, 1);
+        self.poll_status(dev);
+        self.stream_marker(dev, head, 0x2e, 0);
+        self.stream_marker(dev, head, 0x2f, 0);
+        self.stream_marker(dev, head, 0x2e, 0);
+        // Paced polling, DLM-style: ~16 ms apart for ~75 iterations (~1.2 s) so the dock has time
+        // to make its video pipe ready before the first EP08 write.
+        for _ in 0..Self::POST_MODESET_POLLS {
+            self.poll_status(dev);
+            fsleep(Delta::from_millis(Self::POST_MODESET_POLL_MS as i64));
         }
     }
 
@@ -1037,13 +1085,11 @@ impl WorkItem for VinoDrmData {
                                 timing.vactive, timing.vblank, timing.vsync_front, timing.vsync_width,
                                 timing.refresh_hz, timing.pixel_clock_10khz, timing.field42
                             );
-                            // No mode is live on this head yet (fresh CRTC enable, or a re-enable
-                            // after `atomic_disable` zeroed it), so this is DLM's *wake* shape:
-                            // mode-set first, no pre-half, then the five-pair enable ramp.
+                            // `wake` (no mode live on this head yet) is now logging-only: the
+                            // known-lit `a6f4c8b` build sent the pre-half unconditionally, and the
+                            // wake/mode-change split that skipped it has never lit a panel.
                             let wake = data.modeset_active[head_i].load(Ordering::Acquire) == 0;
-                            if !wake {
-                                data.modeset_bracket_pre(dev, head);
-                            }
+                            data.modeset_bracket_pre(dev, head);
                             let r = data.send_cp(dev, 0x48, 0, |ctr| {
                                 super::cp::set_mode(ctr, head, &timing)
                             });
@@ -2195,12 +2241,10 @@ fn encode_and_send_wht(
         // cached timing matches the mode the compositor is actually flipping.
         if let Some(t) = cached {
             if timing_key(&t) == want && t.hactive as usize == w && t.vactive as usize == h {
-                // Same wake-vs-mode-change distinction as the worker's queued path.
+                // Logging-only, as in the worker's queued path: the pre-half is unconditional.
                 let wake =
                     data.modeset_active[head_i].load(core::sync::atomic::Ordering::Acquire) == 0;
-                if !wake {
-                    data.modeset_bracket_pre(dev, head);
-                }
+                data.modeset_bracket_pre(dev, head);
                 if data
                     .send_cp(dev, 0x48, 0, |ctr| super::cp::set_mode(ctr, head, &t))
                     .is_ok()
