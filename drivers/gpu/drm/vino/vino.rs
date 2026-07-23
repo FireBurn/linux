@@ -838,6 +838,7 @@ impl WorkItem for BringUp {
             const HEARTBEAT_PERIOD: Delta = Delta::from_secs(3);
             let mut next_heartbeat = Instant::<Monotonic>::now() + HEARTBEAT_PERIOD;
             let mut beats = 0u32;
+            let mut pushes = 0usize;
             KEEPALIVE_RUN.store(true, core::sync::atomic::Ordering::SeqCst);
             while KEEPALIVE_RUN.load(core::sync::atomic::Ordering::Relaxed) {
                 if data
@@ -860,11 +861,17 @@ impl WorkItem for BringUp {
                         next_heartbeat = now + HEARTBEAT_PERIOD; // fell far behind; resynchronise
                     }
                 }
+                // Unpaired drain: consume anything the dock pushed on its own initiative since the
+                // last cycle, rather than leaving it until the next write's paired read. This is
+                // what puts vino's EP84/EP02 submit ratio above 1.0, where every DLM cold plug
+                // sits (1.116-1.157). See `VinoDrmData::drain_cp_pushes`.
+                const MAX_UNPAIRED_DRAIN: usize = 4;
+                pushes += data.drain_cp_pushes(dev, MAX_UNPAIRED_DRAIN);
                 fsleep(Delta::from_millis(13));
             }
             dev_info!(
                 cdev,
-                "vino: CP keepalive finished ({sent} polls, {beats} heartbeats)\n"
+                "vino: CP keepalive finished ({sent} polls, {beats} heartbeats, {pushes} unprompted dock pushes)\n"
             );
         }
     }

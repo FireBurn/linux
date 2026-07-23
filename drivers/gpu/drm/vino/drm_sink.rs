@@ -915,6 +915,46 @@ impl VinoDrmData {
         Ok(())
     }
 
+    /// Consume the dock's *unprompted* EP84 pushes, i.e. reads that are not the reply to any of our
+    /// writes. Returns how many frames were drained.
+    ///
+    /// **Why (2026-07-23, corpus cadence survey).** The EP84-submits-per-EP02-submit ratio is a
+    /// stable signature: DLM on a cold plug runs **1.116-1.157**, vino ran **1.000**. DLM's surplus
+    /// is unpaired reads that consume what the dock sends on its own initiative -- the cert, the
+    /// `id=0x4c` and `id=0x78` capability blocks, `id=0x2 sub=0x86` heartbeats. vino read exactly
+    /// once per write, so anything the dock pushed *between* writes sat in its buffer until vino
+    /// happened to send something, and a dock with a bounded queue has no reason to keep offering
+    /// it. Raising the queue depth fixed how often a URB is *posted* (3-22% -> 99.9% of wall time)
+    /// but not this: every read was still paired.
+    ///
+    /// Bounded, and each read uses the short reply timeout, so an idle channel costs one timeout
+    /// and a chatty one cannot monopolise the caller.
+    pub(super) fn drain_cp_pushes(&self, dev: &BoundInterface<'_>, max: usize) -> usize {
+        let mut guard = self.cp_link.lock();
+        let Some(link) = (&mut *guard).as_mut() else {
+            return 0;
+        };
+        let Ok(mut reply) = KVec::from_elem(0u8, 4096, GFP_KERNEL) else {
+            return 0;
+        };
+        let mut n = 0;
+        while n < max {
+            let got = match link.ep84_q.as_mut() {
+                Some(q) => q.recv(dev.io(), &mut reply, super::cp_reply_timeout()),
+                None => dev
+                    .ctrl_recv(&mut reply, super::cp_reply_timeout(), GFP_KERNEL)
+                    .map(Some),
+            };
+            // `Ok(None)` is the queue's timeout: nothing pending, so the dock has nothing more to
+            // say right now. Any error is treated the same -- this is best-effort drainage.
+            match got {
+                Ok(Some(len)) if len > 0 => n += 1,
+                _ => break,
+            }
+        }
+        n
+    }
+
     /// Cache a head's downstream EDID (read during probe). Bring-up publishes all heads with one
     /// hotplug only after both presence and EDID state are complete; firing here exposed KWin to a
     /// transient no-EDID mode list (including synthetic 1920x1440) before the real EDID arrived.
