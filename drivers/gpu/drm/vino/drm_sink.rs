@@ -94,7 +94,13 @@ static CURSOR_FORMATS: [u32; 1] = [DRM_FORMAT_ARGB8888];
 /// by the connector `mode_valid` hook ([`VinoConnector::mode_valid`]).
 const MAX_HEAD_CLOCK_KHZ: i32 = 600_000;
 
-/// **Hardware experiment 2026-07-23 — set both to `false` to restore normal behaviour.**
+/// **Hardware experiment 2026-07-23 — RESULT: NEGATIVE, both left `false`.**
+///
+/// Ran on hardware as 1280x720@60 on both heads, 877,440-byte full frames, ~5 fps each
+/// (EP08 45.9 MB + EP0b 45.5 MB per 10 s), every URB status 0, dock firmware trace silent.
+/// **The panels still did not light.** So neither the damage-delta path nor the pixel rate
+/// is what keeps the dock from programming its downstream clock. Kept as switches because
+/// they are a cheap way to re-pin the head for future experiments.
 ///
 /// Hypothesis (user, from the one run where the panels did light): the working configuration was
 /// sending *whole* frames continuously, not damage-delta slices, and was visibly sluggish -- which
@@ -109,8 +115,8 @@ const MAX_HEAD_CLOCK_KHZ: i32 = 600_000;
 /// Together with `FRAME_PERIOD_MS` = 140 this reproduces the "full frames, ~7 fps, sluggish"
 /// shape. If the panels light, the delta path is implicated and the next step is finding what the
 /// dock requires before it will accept a partial update.
-const TEST_ONLY_720P60: bool = true;
-const TEST_FORCE_FULL_FRAMES: bool = true;
+const TEST_ONLY_720P60: bool = false;
+const TEST_FORCE_FULL_FRAMES: bool = false;
 
 /// **The single head-count knob** for the whole driver. Every per-head array/loop is sized by this
 /// (`connectors`, `gamma`, `video_keys`, the CP setup in `vino.rs` via `CP_SETUP_HEADS = HEADS`, the
