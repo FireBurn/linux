@@ -94,6 +94,24 @@ static CURSOR_FORMATS: [u32; 1] = [DRM_FORMAT_ARGB8888];
 /// by the connector `mode_valid` hook ([`VinoConnector::mode_valid`]).
 const MAX_HEAD_CLOCK_KHZ: i32 = 600_000;
 
+/// **Hardware experiment 2026-07-23 — set both to `false` to restore normal behaviour.**
+///
+/// Hypothesis (user, from the one run where the panels did light): the working configuration was
+/// sending *whole* frames continuously, not damage-delta slices, and was visibly sluggish -- which
+/// is what a low frame rate of full-frame updates looks like. Every "accepted but dark" run since
+/// has been sending small deltas after the first keyframe.
+///
+/// [`TEST_ONLY_720P60`] prunes the connector's mode list down to 1280x720@60, cutting the pixel
+/// rate ~4x versus 2560x1440@120 so a full frame every cycle is comfortably affordable.
+/// [`TEST_FORCE_FULL_FRAMES`] makes every scanout a full keyframe, so the dock is never asked to
+/// composite a partial update onto a frame it may never have displayed.
+///
+/// Together with `FRAME_PERIOD_MS` = 140 this reproduces the "full frames, ~7 fps, sluggish"
+/// shape. If the panels light, the delta path is implicated and the next step is finding what the
+/// dock requires before it will accept a partial update.
+const TEST_ONLY_720P60: bool = true;
+const TEST_FORCE_FULL_FRAMES: bool = true;
+
 /// **The single head-count knob** for the whole driver. Every per-head array/loop is sized by this
 /// (`connectors`, `gamma`, `video_keys`, the CP setup in `vino.rs` via `CP_SETUP_HEADS = HEADS`, the
 /// scanout keyframe/arm bitmasks). Which heads actually light up is decided at runtime by per-head
@@ -1192,7 +1210,9 @@ impl WorkItem for VinoDrmData {
                             data.keyframe_pending
                                 .fetch_or(1u32 << head, Ordering::Release);
                             next_head = (head + 1) % HEADS;
-                            pr_info!("vino: head {head} settle repaint (compositor idle after mode-set)\n");
+                            if !TEST_FORCE_FULL_FRAMES {
+                                pr_info!("vino: head {head} settle repaint (compositor idle after mode-set)\n");
+                            }
                             break;
                         }
                         let remaining = remaining.as_millis().max(1);
@@ -1947,7 +1967,13 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
     // Was this the mode-set's owed keyframe? Read before sending, since a successful send clears
     // the bit.
     let was_keyframe = data.keyframe_pending.load(Ordering::Acquire) & (1u32 << frame.head) != 0;
-    let settle_copy = was_keyframe.then(|| frame.clone());
+    // `TEST_FORCE_FULL_FRAMES` also needs a continuous *source* of frames. Normally a repaint is
+    // only re-armed after the mode-set's keyframe, so once the compositor goes idle -- which it
+    // does immediately when the panels are dark and nothing animates -- vino stops transmitting
+    // entirely (HW-observed: zero EP08 bytes after the first keyframe). DLM never goes silent; it
+    // streams full frames continuously at ~7 fps. Re-arm unconditionally so this experiment
+    // actually reproduces that.
+    let settle_copy = (was_keyframe || TEST_FORCE_FULL_FRAMES).then(|| frame.clone());
     match scanout_one(
         dev,
         data,
@@ -1970,8 +1996,15 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
             if let Some(mut copy) = settle_copy {
                 copy.clips[0] = (0, 0, copy.w, copy.h);
                 copy.nclips = 1;
+                // Continuous-refresh experiment repaints at the frame cadence, not the one-shot
+                // settle delay, so the dock sees an uninterrupted full-frame stream.
+                let delay = if TEST_FORCE_FULL_FRAMES {
+                    FRAME_PERIOD_MS
+                } else {
+                    SETTLE_REPAINT_MS
+                };
                 data.settle_repaint.lock()[head_i] =
-                    Some((Instant::<Monotonic>::now() + Delta::from_millis(SETTLE_REPAINT_MS), copy));
+                    Some((Instant::<Monotonic>::now() + Delta::from_millis(delay), copy));
             }
         }
         Err(e) => {
@@ -2287,7 +2320,9 @@ fn encode_and_send_wht(
         .load(core::sync::atomic::Ordering::Acquire)
         & kf_bit
         != 0;
-    let mut full = owes_keyframe || !identity;
+    // `TEST_FORCE_FULL_FRAMES`: never send a damage delta, so the dock always receives a complete
+    // frame rather than a partial update onto content it may never have displayed.
+    let mut full = owes_keyframe || !identity || TEST_FORCE_FULL_FRAMES;
     // Non-64x16-aligned modes (e.g. 1920x1080, 1080%16=8) are padded up to the next strip multiple
     // and encoded as full bands -- exactly DLM's shape (1080p pcap = 68 bands = 1088 rows for a 1080p
     // mode-set). The mode-set carries the real w/h, so the dock displays only that and ignores the
@@ -2731,6 +2766,15 @@ impl connector::DriverConnector for VinoConnector {
         // Hard single-link ceiling (~4K@60) first.
         if mode.clock() > MAX_HEAD_CLOCK_KHZ {
             return ModeStatus::ClockHigh;
+        }
+        // Experiment: pin the head to 1280x720@60 (see `TEST_ONLY_720P60`).
+        if TEST_ONLY_720P60 {
+            let is_720p60 = mode.hdisplay() == 1280
+                && mode.vdisplay() == 720
+                && (59..=61).contains(&mode.vrefresh());
+            if !is_720p60 {
+                return ModeStatus::Bad;
+            }
         }
         // Cross-head bandwidth: prune modes whose pixel rate exceeds THIS head's even share of the
         // dock's shared budget, so two heads can't each pass the per-head cap yet together overrun
