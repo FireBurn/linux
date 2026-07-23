@@ -595,10 +595,13 @@ impl VinoDrmData {
         wire_seq: u32,
         counter: u16,
     ) {
-        // DLM keeps one 4096-byte EP84 read posted before each runtime EP02 write. The bring-up
-        // reader has been dropped by the time this is called, so opening the persistent reader here
-        // preserves the measured depth of exactly one.
-        let ep84_q = match dev.ctrl_in_queue(1, 4096) {
+        // DLM keeps a 4096-byte EP84 read POSTED essentially all the time, not just around each
+        // runtime EP02 write: a corpus-wide cadence survey puts its read-outstanding duty cycle at
+        // 36-100% of wall time against vino's 3-22%. Its max-in-flight is 1, so this is about the
+        // read being continuously pending rather than about depth -- but a depth-1 queue drained
+        // synchronously leaves the endpoint un-posted between calls, which is exactly the gap.
+        // Match `super::EP84_QUEUE_DEPTH` so one URB stays posted while others are reaped.
+        let ep84_q = match dev.ctrl_in_queue(super::EP84_QUEUE_DEPTH, 4096) {
             Ok(q) => Some(q),
             Err(e) => {
                 pr_warn!("vino: persistent EP84 queue open failed ({e:?}); using sync fallback\n");

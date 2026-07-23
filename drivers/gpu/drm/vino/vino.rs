@@ -313,7 +313,16 @@ const EP84_BUF: usize = 4096;
 /// (A speculative bump to 16 -- "absorb a burst of cap-phase ACKs" -- was reverted: it contradicts
 /// the measured DLM cadence above, and with the cap-announce now PACED per frame the dock never
 /// bursts more ACKs than one always-posted reader drains.)
-const EP84_QUEUE_DEPTH: usize = 1;
+/// Depth of the persistent EP84 IN reader.
+///
+/// **Raised 1 -> 4 on 2026-07-23 from a cadence survey of the whole capture corpus**
+/// (`scripts/cadence-survey.py`). Depth alone was never the difference -- DLM's EP84 max-in-flight
+/// is also 1 -- but the DUTY CYCLE was: measuring what fraction of wall time an EP84 IN URB is
+/// actually outstanding gives DLM 36-100% (median ~80%) and vino 3-22%. DLM posts a read and
+/// leaves it pending for the whole ~16 ms cycle; vino posted one with an 8 ms timeout only around
+/// each send, so for most of the session the dock had NOWHERE to push an asynchronous event.
+/// With depth 4 one URB stays posted while the others are reaped and resubmitted.
+const EP84_QUEUE_DEPTH: usize = 4;
 
 /// USB transfer timeout used during bring-up.
 fn timeout() -> Delta {
