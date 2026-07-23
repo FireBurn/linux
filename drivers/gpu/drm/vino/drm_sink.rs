@@ -223,6 +223,39 @@ struct PendingScanout {
     h: usize,
 }
 
+impl Clone for PendingScanout {
+    fn clone(&self) -> Self {
+        Self {
+            head: self.head,
+            fb: self.fb.clone(),
+            rotation: self.rotation,
+            clips: self.clips,
+            nclips: self.nclips,
+            w: self.w,
+            h: self.h,
+        }
+    }
+}
+
+/// How long after a keyframe to repaint the same head once more.
+///
+/// **Why this exists (HW-observed 2026-07-22):** on a freshly enabled output the only frame either
+/// head ever received was 205,696/205,968 bytes -- the known ARM+all-black sizes -- and then *zero*
+/// video bytes for minutes. A Wayland compositor stops committing when nothing changes, so if the
+/// one keyframe a mode-set owes happens to catch a blank buffer, that blank image is what the panel
+/// keeps forever: there is no later flip to correct it. Damage deltas were proven to work in the
+/// same session (a window moving on the output produced immediate EP08 traffic), so this is
+/// specifically a *first* frame problem.
+///
+/// One extra full repaint of the head's newest known framebuffer, once, closes that hole for the
+/// cost of a single redundant keyframe per mode-set.
+const SETTLE_REPAINT_MS: i64 = 1200;
+
+/// Print the live CP session key/nonces to the kernel log at session publish so a usbmon capture
+/// of **vino's own** CP dialogue can be decrypted offline (`scripts/decrypt-dlm-cp.py`) and diffed
+/// against DLM's. Development aid only -- it puts a session key in `dmesg`.
+const CP_KEY_DEBUG: bool = true;
+
 /// DRM device-private data: the bound USB interface, engaged CP session, connector state, deferred
 /// scanout slots and per-head transport state.
 #[pin_data]
@@ -248,6 +281,34 @@ pub(super) struct VinoDrmData {
     /// milliseconds per frame and eventually produced multi-second pageflip timeouts.
     #[pin]
     pending_scanout: Mutex<[Option<PendingScanout>; HEADS]>,
+    /// A one-shot repaint of the head's newest known framebuffer, armed when a keyframe is sent and
+    /// due `SETTLE_REPAINT_MS` later. Cleared as soon as it is taken, or whenever a real flip
+    /// arrives (that flip already carries newer content, so the redundant repaint is pointless).
+    /// See [`SETTLE_REPAINT_MS`] for the hardware observation that motivates it.
+    #[pin]
+    settle_repaint: Mutex<[Option<(Instant<Monotonic>, PendingScanout)>; HEADS]>,
+    /// Count of primary-plane flips seen per head, purely diagnostic -- see `queue_scanout`.
+    flips: [core::sync::atomic::AtomicU64; HEADS],
+    /// Every started software vblank timer, with the handle whose drop is the full
+    /// `hrtimer_cancel`. Owned **here**, not on `VinoCrtc`, so `shutdown()` can stop the timers on
+    /// the one teardown path that is guaranteed to run before the module can be unloaded.
+    ///
+    /// **HW-confirmed panic, 2026-07-22 (pstore `Oops#2`/`Panic#3`):** the previous design let the
+    /// timer self-stop when `disable_vblank` cleared `enabled`, on the stated assumption that
+    /// `unplug()` -> `drm_atomic_helper_shutdown()` always reaches `disable_vblank` first. The
+    /// crash log falsifies that: the unload sequence logged the keepalive stopping, the deferred
+    /// work draining, both interfaces disconnecting and `usbcore: deregistering interface driver
+    /// vino` with **no** `KMS CRTC disable` line at all. `atomic_disable` never ran, so
+    /// `vblank_pinned` was never released, the DRM vblank refcount never reached zero,
+    /// `disable_vblank` was never called, and the timer kept re-arming itself straight through
+    /// `modprobe -r`. 17 ms after the deregister it fired into freed module text
+    /// (`RIP: 0xffffffffa002b2e1`, `Code: cc cc cc ...`, `<IRQ> __hrtimer_run_queues`,
+    /// `Modules linked in: usbmon [last unloaded: vino]`) -> fatal exception in interrupt -> reboot.
+    ///
+    /// A `SpinLock`, not a `Mutex`: `enable_vblank` runs under the DRM vblank locks with local
+    /// interrupts disabled and must not sleep.
+    #[pin]
+    vblank: SpinLock<[Option<(Arc<VblankTimer>, ArcHrTimerHandle<VblankTimer>)>; HEADS]>,
     /// The work item that drains `cmd_queue`. Embedded on the `drm::Device` (not `VinoDrmData`
     /// directly) per the safe KMS binding's `WorkItem`/`HasWork` blanket impls -- see
     /// `queue_cmd`'s doc comment for how it's enqueued.
@@ -371,6 +432,9 @@ impl VinoDrmData {
             cp_link <- new_mutex!(Option::<CpLink>::None),
             cmd_queue <- new_mutex!(KVec::new()),
             pending_scanout <- new_mutex!([const { None }; HEADS]),
+            settle_repaint <- new_mutex!([const { None }; HEADS]),
+            flips: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
+            vblank <- new_spinlock!([const { None }; HEADS]),
             cmd_work <- new_work!("vino::kms_cmd"),
             cached_edids <- new_mutex!([const { None }; HEADS]),
             heads_present: core::sync::atomic::AtomicU32::new(0),
@@ -406,8 +470,25 @@ impl VinoDrmData {
             mode.store(0, Ordering::Release);
         }
 
+        // Stop the software vblank clocks FIRST, and do it here rather than relying on the DRM
+        // core reaching `disable_vblank` -- see the `vblank` field for the crash that proves it
+        // does not always get there. Take the registry out from under the spinlock before
+        // dropping the handles: `ArcHrTimerHandle`'s drop is a full `hrtimer_cancel`, which waits
+        // for a running callback and therefore must not run in atomic context.
+        let timers = {
+            let mut slots = self.vblank.lock();
+            core::mem::replace(&mut *slots, [const { None }; HEADS])
+        };
+        // Clear `enabled` before cancelling so a callback racing the cancel returns `NoRestart`
+        // instead of re-arming behind it.
+        for (timer, _) in timers.iter().flatten() {
+            timer.enabled.store(false, Ordering::Relaxed);
+        }
+        drop(timers); // each handle's drop == hrtimer_cancel
+
         *self.cmd_queue.lock() = KVec::new();
         *self.pending_scanout.lock() = [const { None }; HEADS];
+        *self.settle_repaint.lock() = [const { None }; HEADS];
         *self.strip_hashes.lock() = [const { None }; HEADS];
         // Cancel the queued drain and reclaim the `ARef<VinoDrmDevice>` the enqueue handed to
         // the workqueue, if it was still pending. Dropping it here releases the self-reference
@@ -419,6 +500,7 @@ impl VinoDrmData {
         // parent interface is still in Bound context.
         *self.cmd_queue.lock() = KVec::new();
         *self.pending_scanout.lock() = [const { None }; HEADS];
+        *self.settle_repaint.lock() = [const { None }; HEADS];
         *self.strip_hashes.lock() = [const { None }; HEADS];
         *self.video_q.lock() = [const { None }; HEADS];
         *self.video_staging.lock() = [const { None }; HEADS];
@@ -492,6 +574,23 @@ impl VinoDrmData {
                 None
             }
         };
+        if CP_KEY_DEBUG {
+            // Dev-only: print the live CP session key and both direction nonces so a usbmon
+            // capture of vino's own session can be decrypted offline with
+            // `scripts/decrypt-dlm-cp.py` -- the same tool used on DLM. Without this the OUT/IN
+            // dialogue is opaque (the key never appears on the wire: it is the whitened SKE key
+            // vino generated itself), so a DLM-vs-vino dialogue diff, and the dock's own
+            // `sub=0x0c` firmware trace, are unreadable. Turn off before any non-development
+            // build. See `docs/BLOCKER.md` (dark-panel triage).
+            let mut riv_in = *riv;
+            riv_in[7] ^= 0x01;
+            pr_info!(
+                "vino: CPKEYS key={:02x?} riv_out={:02x?} riv_in={:02x?} wire_seq={wire_seq} ctr={counter}\n",
+                ks,
+                riv,
+                &riv_in
+            );
+        }
         *self.cp_link.lock() = Some(CpLink {
             ks: *ks,
             riv: *riv,
@@ -508,11 +607,20 @@ impl VinoDrmData {
         *self.video_keys.lock() = keys;
     }
 
-    /// DLM keeps polling device status for roughly 1.2 seconds immediately before the first video
-    /// presentation. Keep this readiness window adjacent to ARM+frame zero; moving it into the
-    /// asynchronous mode-set path lets it expire while waiting for KWin's first framebuffer.
-    const PREWRITE_POLLS: u32 = 75;
-    const PREWRITE_POLL_MS: u64 = 16;
+    /// Status polls issued immediately before the first video presentation of a mode generation.
+    ///
+    /// **Cut from 75x16ms (1.2 s) to 2 on 2026-07-23.** The 1.2 s window was read off DLM as a
+    /// "readiness wait", but a merged host/dock timeline of
+    /// `captures/dlm-wake-ab-20260722-150209/` (DLM lighting both panels) shows DLM does the
+    /// opposite: its stream-enable bracket runs 6.264-6.505 s and its **first EP08 video goes out
+    /// at 6.406 s -- during the bracket**, 140 ms after the first marker. The dock then programs
+    /// the downstream pixel clock at 7.278 s (`2990d`/`3f32a` in its firmware trace) and the panels
+    /// light. vino was taking 3.9 s from bracket to first frame, 28x DLM's gap; the dock gave up on
+    /// activation and fell back to its `38c41` idle tick (210x per capture, never once in DLM's).
+    /// The polls are kept -- DLM does interleave status traffic here -- but not the stall.
+    /// See `docs/BLOCKER.md`.
+    const PREWRITE_POLLS: u32 = 2;
+    const PREWRITE_POLL_MS: u64 = 1;
     /// One `id=0x14 sub=0x000c` device-status poll — the same message the EDID readiness loop uses.
     fn poll_status(&self, dev: &BoundInterface<'_>) {
         let _ = self.send_cp(dev, 0x14, 0, |ctr| super::cp::device_query_req(ctr, 0x000c));
@@ -526,26 +634,63 @@ impl VinoDrmData {
         });
     }
 
-    /// First half of the per-head stream-enable bracket used by the VINO run that presented on
-    /// both monitors. Status polls are part of the captured transaction, not delay substitutes.
-    fn modeset_bracket_pre(&self, dev: &BoundInterface<'_>, head: u8) {
-        for (sub, state) in [(0x2fu16, 1u8), (0x2e, 3)] {
-            self.stream_marker(dev, head, sub, state);
+    /// Emit a run of DLM's `(2f, 2e)` marker pairs for one head, polling between pairs.
+    ///
+    /// In both decrypted DLM captures the two markers of a pair go out back-to-back (~1 ms apart)
+    /// and consecutive pairs are separated by tens of milliseconds of status/EDID traffic, so the
+    /// poll belongs *between* pairs rather than inside one.
+    fn stream_marker_pairs(&self, dev: &BoundInterface<'_>, head: u8, pairs: &[(u8, u8)]) {
+        for (i, &(state_2f, state_2e)) in pairs.iter().enumerate() {
+            if i > 0 {
+                self.poll_status(dev);
+            }
+            self.stream_marker(dev, head, 0x2f, state_2f);
+            self.stream_marker(dev, head, 0x2e, state_2e);
         }
+    }
+
+    /// First half of the per-head stream-enable bracket, as `(2f state, 2e state)` pairs.
+    ///
+    /// **Corrected 2026-07-22** from `captures/max-cold-20260721-235609/cp-decrypted.json` (a real
+    /// DLM mode change on head 1), which sends four pairs before the `id=0x48` mode-set:
+    ///
+    /// ```text
+    /// (2f:1, 2e:3)  (2f:1, 2e:0)  (2f:0, 2e:0)  (2f:1, 2e:3)
+    /// ```
+    ///
+    /// vino previously sent only the first of those four. A **wake** (the first mode-set since the
+    /// CRTC was enabled) has no pre-half at all -- see [`modeset_bracket_post`].
+    fn modeset_bracket_pre(&self, dev: &BoundInterface<'_>, head: u8) {
+        self.stream_marker_pairs(dev, head, &[(1, 3), (1, 0), (0, 0), (1, 3)]);
         self.poll_status(dev);
     }
 
-    /// Second half of that captured per-head bracket.
-    fn modeset_bracket_post(&self, dev: &BoundInterface<'_>, head: u8) {
+    /// Second half of the per-head bracket. `wake` selects which of DLM's two distinct captured
+    /// sequences to send.
+    ///
+    /// A **wake** (`captures/dlm-wake-ab-20260722-150209/cp-decrypted.json`, the only decrypted
+    /// capture of DLM actually lighting the panels) sends the `id=0x48` mode-set for both heads
+    /// *first*, with no pre-half, and then five pairs per head -- note `2e:3` twice:
+    ///
+    /// ```text
+    /// (2f:1, 2e:3)  (2f:1, 2e:3)  (2f:1, 2e:0)  (2f:1, 2e:0)  (2f:0, 2e:0)
+    /// ```
+    ///
+    /// A **mode change** on an already-live head sends four pairs, ramping back down to `(0, 0)`:
+    ///
+    /// ```text
+    /// (2f:1, 2e:0)  (2f:0, 2e:0)  (2f:1, 2e:0)  (2f:0, 2e:0)
+    /// ```
+    ///
+    /// vino previously sent one hybrid sequence for both cases, with an unpaired `2f:1` and no
+    /// second `2e:3`, and never distinguished a wake from a mode change.
+    fn modeset_bracket_post(&self, dev: &BoundInterface<'_>, head: u8, wake: bool) {
         self.poll_status(dev);
-        self.stream_marker(dev, head, 0x2f, 1);
-        self.stream_marker(dev, head, 0x2e, 0);
-        self.poll_status(dev);
-        self.stream_marker(dev, head, 0x2f, 1);
-        self.poll_status(dev);
-        self.stream_marker(dev, head, 0x2e, 0);
-        self.stream_marker(dev, head, 0x2f, 0);
-        self.stream_marker(dev, head, 0x2e, 0);
+        if wake {
+            self.stream_marker_pairs(dev, head, &[(1, 3), (1, 3), (1, 0), (1, 0), (0, 0)]);
+        } else {
+            self.stream_marker_pairs(dev, head, &[(1, 0), (0, 0), (1, 0), (0, 0)]);
+        }
     }
 
     /// Build one head's **cold** video-arm burst (2560 B), matching the 4-way-confirmed cold-plug
@@ -797,6 +942,16 @@ impl VinoDrmData {
         if head >= HEADS {
             return;
         }
+        // A real flip carries newer content than any armed settle repaint of an older buffer.
+        self.settle_repaint.lock()[head] = None;
+        // Flip accounting. The failure this instruments is "the panel keeps the blank buffer
+        // forever": the distinguishing question is whether the compositor stopped flipping or
+        // whether its flips stopped reaching us, and only a count answers it. Logged at
+        // exponentially sparser points so a busy desktop costs nothing.
+        let n = self.flips[head].fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 || n.is_power_of_two() {
+            pr_info!("vino: head {head} primary-plane flip #{n}\n");
+        }
         let mut pending = self.pending_scanout.lock();
         if self.shutting_down.load(Ordering::Acquire) {
             return;
@@ -882,7 +1037,13 @@ impl WorkItem for VinoDrmData {
                                 timing.vactive, timing.vblank, timing.vsync_front, timing.vsync_width,
                                 timing.refresh_hz, timing.pixel_clock_10khz, timing.field42
                             );
-                            data.modeset_bracket_pre(dev, head);
+                            // No mode is live on this head yet (fresh CRTC enable, or a re-enable
+                            // after `atomic_disable` zeroed it), so this is DLM's *wake* shape:
+                            // mode-set first, no pre-half, then the five-pair enable ramp.
+                            let wake = data.modeset_active[head_i].load(Ordering::Acquire) == 0;
+                            if !wake {
+                                data.modeset_bracket_pre(dev, head);
+                            }
                             let r = data.send_cp(dev, 0x48, 0, |ctr| {
                                 super::cp::set_mode(ctr, head, &timing)
                             });
@@ -890,12 +1051,16 @@ impl WorkItem for VinoDrmData {
                                 && data.modeset_requested[head_i].load(Ordering::Acquire) == key
                             {
                                 data.modeset_active[head_i].store(key, Ordering::Release);
-                                data.modeset_bracket_post(dev, head);
+                                data.modeset_bracket_post(dev, head, wake);
                                 let bit = 1u32 << head;
                                 data.arm_prefix_pending.fetch_or(bit, Ordering::Release);
                                 data.keyframe_pending.fetch_or(bit, Ordering::Release);
                                 data.strip_hashes.lock()[head_i] = None;
-                                pr_info!("vino: sent captured per-head stream-enable bracket around mode-set\n");
+                                pr_info!(
+                                    "vino: sent DLM {} stream-enable bracket around head {} mode-set\n",
+                                    if wake { "wake" } else { "mode-change" },
+                                    head
+                                );
                             }
                             r
                         }
@@ -957,6 +1122,34 @@ impl WorkItem for VinoDrmData {
                             break;
                         }
                         let remaining = (FRAME_PERIOD_MS - elapsed_ms).max(1);
+                        wait_ms = Some(wait_ms.map_or(remaining, |old| old.min(remaining)));
+                    }
+                }
+                // Nothing flipped in. Fall back to the one-shot settle repaint if one is due, so a
+                // compositor that went idle straight after enabling the output still ends up with
+                // its real desktop on the panel rather than the buffer that happened to be current
+                // when the mode-set's keyframe went out.
+                if selected.is_none() {
+                    let mut settle = data.settle_repaint.lock();
+                    for offset in 0..HEADS {
+                        let head = (next_head + offset) % HEADS;
+                        if data.modeset_requested[head].load(Ordering::Acquire) == 0 {
+                            settle[head] = None;
+                            continue;
+                        }
+                        let Some((due, _)) = settle[head].as_ref() else {
+                            continue;
+                        };
+                        let remaining = *due - Instant::<Monotonic>::now();
+                        if remaining.as_millis() <= 0 {
+                            selected = settle[head].take().map(|(_, f)| f);
+                            data.keyframe_pending
+                                .fetch_or(1u32 << head, Ordering::Release);
+                            next_head = (head + 1) % HEADS;
+                            pr_info!("vino: head {head} settle repaint (compositor idle after mode-set)\n");
+                            break;
+                        }
+                        let remaining = remaining.as_millis().max(1);
                         wait_ms = Some(wait_ms.map_or(remaining, |old| old.min(remaining)));
                     }
                 }
@@ -1109,6 +1302,12 @@ impl KmsDriver for VinoDrmDriver {
                     is_cursor: true,
                 },
             )?;
+            // The cursor plane advertises ARGB8888, and any plane exposing an alpha format must
+            // also say how that alpha is blended -- `drm_mode_config_validate()` WARNs at
+            // registration otherwise, tainting the kernel `W` and making every later crash report
+            // harder to read. The dock composites the cursor itself from a premultiplied bitmap
+            // (`cp::cursor_image`), so premultiplied is the only mode offered.
+            cursor.create_blend_mode_property(1 << bindings::DRM_MODE_BLEND_PREMULTI)?;
             let crtc_obj = crtc::UnregisteredCrtc::<VinoCrtc>::new(
                 dev,
                 primary,
@@ -1173,10 +1372,17 @@ impl KmsDriver for VinoDrmDriver {
 /// module could then never unload either -- trading a crash for a permanent "module in use" leak.
 /// Comparing against `revdi`, which has no such pin and no leak, found the actual bug: `run()`
 /// never implemented the self-stop-on-disable behavior its own (stale, copied) doc comment
-/// claimed. Fixed to genuinely self-stop below, which resolves BOTH: the timer is provably
-/// non-armed within one frame interval of `disable_vblank` (called synchronously inside
-/// `unplug()`, always well before any subsequent `rmmod`), so nothing can ever unload the module
-/// while it's still ticking -- no pin needed, and no leak from one that can't reliably release.
+/// claimed. Fixed to genuinely self-stop below.
+///
+/// **2026-07-22 correction: self-stopping is necessary but NOT sufficient.** The paragraph above
+/// used to end by claiming the timer is "provably non-armed within one frame interval of
+/// `disable_vblank` (called synchronously inside `unplug()`, always well before any subsequent
+/// `rmmod`)". That premise is false, and it cost a machine reboot: on the observed unload
+/// `atomic_disable` never ran, so the vblank refcount never dropped to zero, so `disable_vblank`
+/// was never called and `enabled` stayed `true` -- the timer re-armed itself right through
+/// `modprobe -r` and fired into freed module text. Self-stop only helps once someone actually
+/// disables vblank. Teardown therefore no longer depends on it: the handle now lives in
+/// [`VinoDrmData::vblank`] and `VinoDrmData::shutdown()` cancels it unconditionally.
 #[pin_data]
 pub(super) struct VblankTimer {
     #[pin]
@@ -1234,12 +1440,6 @@ pub(super) struct VinoCrtc {
     head: u8,
     /// The software vblank source for this CRTC.
     vblank: Arc<VblankTimer>,
-    /// Sole owner of the started timer; dropping it (at CRTC teardown, whenever that turns out to
-    /// happen) is the only full `hrtimer_cancel` -- no custom `PinnedDrop` needed for this, since
-    /// `ArcHrTimerHandle`'s own field-drop already does the right thing (matches `revdi`'s
-    /// `EvdiCrtc`, which has no `PinnedDrop` either).
-    #[pin]
-    vblank_handle: SpinLock<Option<ArcHrTimerHandle<VblankTimer>>>,
     /// One driver-owned DRM vblank reference held for the whole active interval. A USB display has
     /// no hardware interrupt to bootstrap the compositor's first post-modeset presentation; if no
     /// initial page-flip event is attached, the DRM core never calls `enable_vblank`, the software
@@ -1270,7 +1470,6 @@ impl crtc::DriverCrtc for VinoCrtc {
         try_pin_init!(VinoCrtc {
             head: *head,
             vblank: Arc::pin_init(VblankTimer::new(), GFP_KERNEL)?,
-            vblank_handle <- new_spinlock!(None),
             vblank_pinned <- new_mutex!(None),
         })
     }
@@ -1381,6 +1580,7 @@ impl crtc::DriverCrtc for VinoCrtc {
         // Drop a framebuffer queued while this CRTC was active. Otherwise the deferred worker can
         // retry its old mode and paint after DPMS-off.
         data.pending_scanout.lock()[head as usize] = None;
+        data.settle_repaint.lock()[head as usize] = None;
         data.strip_hashes.lock()[head as usize] = None;
         pr_info!("vino: KMS CRTC disable -- head {head} display OFF (scanout stopped)\n");
     }
@@ -1424,17 +1624,30 @@ impl VblankSupport for VinoCrtc {
         data.vblank.crtc.populate(crtc.to_owned_ref());
         data.vblank.enabled.store(true, Ordering::Relaxed);
         let interval = data.vblank.interval_ns.load(Ordering::Relaxed);
-        let mut handle = data.vblank_handle.lock();
-        if handle.is_none() {
-            // First enable: start the timer, keeping the handle as the sole owner whose drop
-            // (at CRTC teardown) is the one full cancel.
-            *handle = Some(data.vblank.clone().start(Delta::from_nanos(interval)));
-        } else if let Some(h) = handle.as_ref() {
-            // Re-enable after `disable_vblank` let the timer die (NoRestart): re-queue it in
-            // place. `restart` removes and re-inserts a still-pending timer, so this is correct
-            // whether the final disabled tick has already fired or not, and it never blocks on the
-            // callback -- which matters because we are called under the vblank locks.
-            h.restart(Delta::from_nanos(interval));
+        // The started timer is registered on the DEVICE, so teardown can cancel it without
+        // depending on the DRM core calling `disable_vblank` -- see `VinoDrmData::vblank`.
+        let drm_data: &VinoDrmData = crtc.drm_dev();
+        let head = usize::from(data.head);
+        if head >= HEADS {
+            return Ok(());
+        }
+        let mut slots = drm_data.vblank.lock();
+        match &slots[head] {
+            None => {
+                // First enable: start the timer and keep the handle as its sole owner.
+                slots[head] = Some((
+                    data.vblank.clone(),
+                    data.vblank.clone().start(Delta::from_nanos(interval)),
+                ));
+            }
+            Some((_, h)) => {
+                // Re-enable after `disable_vblank` let the timer die (NoRestart): re-queue it in
+                // place. `restart` removes and re-inserts a still-pending timer, so this is
+                // correct whether the final disabled tick has already fired or not, and it never
+                // blocks on the callback -- which matters because we are called under the vblank
+                // locks with interrupts disabled.
+                h.restart(Delta::from_nanos(interval));
+            }
         }
         Ok(())
     }
@@ -1675,13 +1888,20 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
 
     let head_i = frame.head as usize;
     if data.modeset_requested[head_i].load(Ordering::Acquire) == 0 {
+        scanout_gate(frame.head, 6, "worker: head has no mode-set requested");
         return;
     }
     let requested_geometry_matches = data.last_timing.lock()[head_i]
         .is_some_and(|t| t.hactive as usize == frame.w && t.vactive as usize == frame.h);
     if !requested_geometry_matches {
-        return; // stale framebuffer from a different-size mode generation
+        // stale framebuffer from a different-size mode generation
+        scanout_gate(frame.head, 7, "worker: framebuffer size differs from the cached mode");
+        return;
     }
+    // Was this the mode-set's owed keyframe? Read before sending, since a successful send clears
+    // the bit.
+    let was_keyframe = data.keyframe_pending.load(Ordering::Acquire) & (1u32 << frame.head) != 0;
+    let settle_copy = was_keyframe.then(|| frame.clone());
     match scanout_one(
         dev,
         data,
@@ -1697,6 +1917,15 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
             data.scanout_skip.store(0, Relaxed);
             if n > 0 {
                 pr_info!("vino: scanout recovered after {n} failed frame(s)\n");
+            }
+            // Arm the one-shot settle repaint. A compositor that goes idle right after enabling an
+            // output would otherwise leave whatever it had drawn at keyframe time -- in the
+            // observed failure, an all-black buffer -- on the panel permanently.
+            if let Some(mut copy) = settle_copy {
+                copy.clips[0] = (0, 0, copy.w, copy.h);
+                copy.nclips = 1;
+                data.settle_repaint.lock()[head_i] =
+                    Some((Instant::<Monotonic>::now() + Delta::from_millis(SETTLE_REPAINT_MS), copy));
             }
         }
         Err(e) => {
@@ -1909,6 +2138,23 @@ fn changed_strip_rects(
     Ok(rects)
 }
 
+/// One bit per (gate, head): has this "returned Ok without writing anything" reason been reported?
+static SCANOUT_GATE_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Report, once per (gate, head), that a scanout attempt produced no wire traffic.
+///
+/// Every deferral gate in [`encode_and_send_wht`] returns `Ok(())` -- correctly, since a deferred
+/// frame is not a transport error. The side effect is that a head which defers *every* frame
+/// forever is indistinguishable from a healthy idle one: the panel stays dark, no error is logged,
+/// and the dock's own trace shows its stream starving. Naming the gate turns that silent state
+/// into a diagnosable one. One-shot per reason so a permanently-stuck head cannot spam the log.
+fn scanout_gate(head: u8, idx: u32, reason: &str) {
+    let bit = 1u32 << (idx * HEADS as u32 + head as u32);
+    if SCANOUT_GATE_SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        pr_info!("vino: scanout head={head} sent NOTHING -- deferred at gate: {reason}\n");
+    }
+}
+
 #[inline(never)]
 fn encode_and_send_wht(
     dev: &BoundInterface<'_>,
@@ -1930,12 +2176,14 @@ fn encode_and_send_wht(
     let head_i = head as usize;
     let want = data.modeset_requested[head_i].load(core::sync::atomic::Ordering::Acquire);
     if want == 0 {
+        scanout_gate(head, 0, "no mode-set requested (modeset_requested == 0)");
         return Ok(());
     }
     let cached = data.last_timing.lock()[head_i];
     if !cached.is_some_and(|t| {
         timing_key(&t) == want && t.hactive as usize == w && t.vactive as usize == h
     }) {
+        scanout_gate(head, 1, "cached timing does not match the requested mode generation");
         return Ok(());
     }
     if data.modeset_active[head_i].load(core::sync::atomic::Ordering::Acquire) != want {
@@ -1947,14 +2195,19 @@ fn encode_and_send_wht(
         // cached timing matches the mode the compositor is actually flipping.
         if let Some(t) = cached {
             if timing_key(&t) == want && t.hactive as usize == w && t.vactive as usize == h {
-                data.modeset_bracket_pre(dev, head);
+                // Same wake-vs-mode-change distinction as the worker's queued path.
+                let wake =
+                    data.modeset_active[head_i].load(core::sync::atomic::Ordering::Acquire) == 0;
+                if !wake {
+                    data.modeset_bracket_pre(dev, head);
+                }
                 if data
                     .send_cp(dev, 0x48, 0, |ctr| super::cp::set_mode(ctr, head, &t))
                     .is_ok()
                     && data.modeset_requested[head_i].load(Ordering::Acquire) == want
                 {
                     data.modeset_active[head_i].store(want, core::sync::atomic::Ordering::Release);
-                    data.modeset_bracket_post(dev, head);
+                    data.modeset_bracket_post(dev, head, wake);
                     data.arm_prefix_pending
                         .fetch_or(1u32 << head, core::sync::atomic::Ordering::Release);
                     data.keyframe_pending
@@ -1970,6 +2223,7 @@ fn encode_and_send_wht(
         // returning unconditionally here leaves that monitor configured but permanently dark.
         // If the retry did not land, keep deferring exactly as before.
         if data.modeset_active[head_i].load(core::sync::atomic::Ordering::Acquire) != want {
+            scanout_gate(head, 2, "mode-set not active and the inline re-send did not land");
             return Ok(());
         }
     }
@@ -2016,6 +2270,7 @@ fn encode_and_send_wht(
         content_hashes = Some(hashes);
     }
     if !full && content_damage.is_empty() {
+        scanout_gate(head, 3, "no keyframe owed and no strip content changed");
         return Ok(());
     }
     // Shared pixel sampler: output (dx,dy) -> gamma-corrected source RGB. Padding beyond the real
@@ -2047,12 +2302,14 @@ fn encode_and_send_wht(
     // A damage delta that touched no aligned strip = nothing to send this flip: skip the write
     // (no seq advance, no arm, keyframe obligation untouched). Full frames always have strips.
     if frames.is_empty() {
+        scanout_gate(head, 4, "encoder produced zero records");
         return Ok(());
     }
     if data.shutting_down.load(Ordering::Acquire)
         || data.modeset_requested[head_i].load(Ordering::Acquire) != want
         || data.modeset_active[head_i].load(Ordering::Acquire) != want
     {
+        scanout_gate(head, 5, "mode generation changed between encode and submit");
         return Ok(());
     }
     // Coalesce the whole frame into ONE contiguous bulk_send. DLM sends each frame as a single
