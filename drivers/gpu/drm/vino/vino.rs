@@ -819,6 +819,16 @@ impl WorkItem for BringUp {
                 "vino: starting continuous CP keepalive (~74/s, DLM cadence)\n"
             );
             let mut sent = 0u32;
+            // ★ 2026-07-22: the status poll is NOT the whole steady-state dialogue. Both decrypted
+            // DLM captures that cover a live session show `id=0x16 sub=0x75` going out every
+            // 3.000 s for as long as the stream is up (see `cp::heartbeat`). vino sent exactly one,
+            // from inside the EDID loop, and none afterwards -- the leading suspect for the dock
+            // accepting complete multi-megabyte video frames while the downstream panels never
+            // leave "no signal". Interleave it here on its own 3 s deadline; the poll cadence
+            // below is deliberately left untouched so this is a single-variable change.
+            const HEARTBEAT_PERIOD: Delta = Delta::from_secs(3);
+            let mut next_heartbeat = Instant::<Monotonic>::now() + HEARTBEAT_PERIOD;
+            let mut beats = 0u32;
             KEEPALIVE_RUN.store(true, core::sync::atomic::Ordering::SeqCst);
             while KEEPALIVE_RUN.load(core::sync::atomic::Ordering::Relaxed) {
                 if data
@@ -827,9 +837,26 @@ impl WorkItem for BringUp {
                 {
                     sent += 1;
                 }
+                // `Instant` implements neither `PartialOrd` nor `AddAssign` here, so compare via the
+                // `Delta` that subtracting two instants yields (negative until the deadline passes).
+                let now = Instant::<Monotonic>::now();
+                if (now - next_heartbeat).as_millis() >= 0 {
+                    if data.send_cp(dev, 0x16, 0, cp::heartbeat).is_ok() {
+                        beats += 1;
+                    }
+                    // Fixed cadence, not "3 s after the last one finished": a slow send must not
+                    // let the interval drift away from DLM's metronomic 3.000 s.
+                    next_heartbeat = next_heartbeat + HEARTBEAT_PERIOD;
+                    if (now - next_heartbeat).as_millis() > 0 {
+                        next_heartbeat = now + HEARTBEAT_PERIOD; // fell far behind; resynchronise
+                    }
+                }
                 fsleep(Delta::from_millis(13));
             }
-            dev_info!(cdev, "vino: CP keepalive finished ({sent} sent)\n");
+            dev_info!(
+                cdev,
+                "vino: CP keepalive finished ({sent} polls, {beats} heartbeats)\n"
+            );
         }
     }
 }
@@ -3062,11 +3089,12 @@ impl VinoDriver {
                         }
                         fsleep(EDID_STEP_DELAY);
                     }
-                    // The `id=0x16 sub=0x4b` kick (byte22 = head) starts/continues the head's
-                    // downstream DDC-EDID read; its effect shows in the next readiness probe.
-                    if let Ok(kick) = cp::edid_readiness_kick(cp_ctr, hu8) {
-                        edid_send!(0x16, kick, "get-EDID kick (id=0x16 sub=0x4b)");
-                    }
+                    // The `id=0x16 sub=0x4b` "kick" is NOT sent. A full message-type inventory of
+                    // both decrypted DLM captures (`scripts/cp-inventory.py`, 2026-07-23) shows DLM
+                    // never emits this type at all, in any session phase -- it was the single
+                    // remaining message vino sent that DLM does not, and `cp::edid_readiness_kick`'s
+                    // own doc records its payload as unverified. With it gone, vino's OUT message-
+                    // type set matches DLM's exactly (26/26). The builder is kept for provenance.
                     fsleep(EDID_STEP_DELAY);
                     if let Ok(req) = cp::get_edid_req(cp_ctr, hu8) {
                         edid_send!(0x15, req, "get-EDID fetch (id=0x15 sub=0x21)");
@@ -3098,13 +3126,22 @@ impl VinoDriver {
                         }
                     }
                 }
-                if edid_out.is_none() {
+                {
+                    // 2026-07-23: send the engage pair UNCONDITIONALLY. It used to be gated on
+                    // `edid_out.is_none()`, so on any run where the EDID arrived from the probe
+                    // alone -- which is every run now that the byte22 head selector is fixed --
+                    // vino never sent `id=0x16 sub=0x23` at all. A full message inventory of
+                    // `captures/dlm-wake-ab-20260722-150209` shows DLM sends it exactly twice on
+                    // every session, after the `0x15/0x20`+`0x15/0x21` probe pair has already
+                    // succeeded. See `scripts/cp-inventory.py` and `docs/BLOCKER.md`.
                     for _ in 0..2 {
                         if let Ok(engage) = cp::edid_engage_req(cp_ctr, hu8) {
                             edid_send!(0x16, engage, "get-EDID engage (id=0x16 sub=0x0023)");
                         }
                         fsleep(EDID_STEP_DELAY);
                     }
+                }
+                if edid_out.is_none() {
                     // Wall-clock ceiling on the readiness poll, independent of iteration count, so a
                     // deaf/NAKing dock never wedges module removal (each NAK'd send can block on its
                     // USB timeout; a pure iteration bound could still pin the work item for minutes).
@@ -3774,6 +3811,7 @@ impl usb::Driver for VinoDriver {
         >::new(
             intf,
             drm_sink::VinoDrmData::new(io.clone(), eps),
+            &THIS_MODULE,
         ) {
             // `create_objects()` (which builds the CRTC/plane/connector/encoder) runs
             // automatically inside `UnregisteredDevice::new` above -- there is no separate
@@ -4257,8 +4295,23 @@ mod tests {
         ];
         // body_len = 32B content + 16B Dl3Cmac = 48 (the content is 32B, corrected 2026-07-17
         // from the earlier 16B; see `cp::CP_SETUP_FINALIZE`).
-        const FINALIZE_FINGERPRINT: [(u16, usize); 5] =
-            [(0x08, 48), (0x09, 48), (0x08, 48), (0x08, 48), (0x09, 48)];
+        // One entry per `cp::CP_SETUP_FINALIZE` entry. The sixth (`id=0x16 sub=0x4c off22=1`,
+        // added 2026-07-19) was never added here, so this indexed `[i]` panicked with
+        // "index out of bounds: the len is 5 but the index is 5" on **every module load** --
+        // KUnit runs at init, so each load left the kernel tainted `D` with an Oops. Recovered
+        // from the pstore record of the 2026-07-22 crash. `id=0x16` frames are `(0x08, 48)`,
+        // `id=0x15` frames `(0x09, 48)`; the sixth is another `id=0x16`.
+        const FINALIZE_FINGERPRINT: [(u16, usize); 6] = [
+            (0x08, 48),
+            (0x09, 48),
+            (0x08, 48),
+            (0x08, 48),
+            (0x09, 48),
+            (0x08, 48),
+        ];
+        // Keep the fingerprint table and the burst table in lockstep: growing one without the
+        // other is exactly the defect above.
+        build_assert!(FINALIZE_FINGERPRINT.len() == cp::CP_SETUP_FINALIZE.len());
 
         let ks = [0x5au8; 16];
         let riv = [0x11u8; 8];
@@ -4317,18 +4370,26 @@ mod tests {
         // `/tmp/claude-.../scratchpad/decode_video_ep.py` for the derivation. Head 0's sub values
         // (table entries) are asserted directly; head 1's (+1 per entry) are asserted via
         // `video_arm_plain_frame`/`video_arm_plaintext_body`'s `h` parameter.
+        // **Corrected 2026-07-23** to the current HW-verified `cp::VIDEO_ARM_BURST`. This fingerprint
+        // was the pre-2026-07-19 table copy and drifted when the ARM burst was re-RE'd: #2/#3 became
+        // 16-byte sealed (not 32), #6/#7 became type-4 fixed-plaintext `(4, sub, 0x0004, 16)` (not
+        // type-2 `0x20/0x30`), and #8/#9 became the 1104-byte DRBG-derived sealed bodies. Boot KUnit
+        // logged `ASSERTION FAILED at vino.rs:...` (soft fail, kernel tainted) every load until this
+        // caught up. `build_assert!` below ties the two table lengths together so they cannot drift
+        // silently again.
         const FINGERPRINT_H0: [(u32, u16, u16, usize); 10] = [
             (2, 0x0008, 0x0000, 16),
             (2, 0x0018, 0x0000, 16),
-            (4, 0x0008, 0x000a, 32),
-            (4, 0x0018, 0x000a, 32),
+            (4, 0x0008, 0x000a, 16),
+            (4, 0x0018, 0x000a, 16),
             (2, 0x0000, 0x0000, 16),
             (2, 0x0010, 0x0000, 16),
-            (2, 0x0020, 0x0000, 16),
-            (2, 0x0030, 0x0000, 16),
-            (4, 0x0020, 0x0004, 16),
-            (4, 0x0030, 0x0004, 16),
+            (4, 0x0000, 0x0004, 16),
+            (4, 0x0010, 0x0004, 16),
+            (4, 0x0008, 0x000e, 1104),
+            (4, 0x0018, 0x000e, 1104),
         ];
+        build_assert!(FINGERPRINT_H0.len() == cp::VIDEO_ARM_BURST.len());
         let ks = [0x5au8; 16];
         let riv = [0x11u8; 8];
         for (i, &(wire_type, sub_base, aux, body_len)) in cp::VIDEO_ARM_BURST.iter().enumerate() {
