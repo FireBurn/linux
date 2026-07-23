@@ -3089,12 +3089,19 @@ impl VinoDriver {
                         }
                         fsleep(EDID_STEP_DELAY);
                     }
-                    // The `id=0x16 sub=0x4b` "kick" is NOT sent. A full message-type inventory of
-                    // both decrypted DLM captures (`scripts/cp-inventory.py`, 2026-07-23) shows DLM
-                    // never emits this type at all, in any session phase -- it was the single
-                    // remaining message vino sent that DLM does not, and `cp::edid_readiness_kick`'s
-                    // own doc records its payload as unverified. With it gone, vino's OUT message-
-                    // type set matches DLM's exactly (26/26). The builder is kept for provenance.
+                    // The `id=0x16 sub=0x4b` kick (byte22 = head) starts/continues the head's
+                    // downstream DDC-EDID read; its effect shows in the next readiness probe.
+                    //
+                    // Briefly removed on 2026-07-23 because a message inventory of the two WARM
+                    // DLM captures showed no `0x16/0x4b` -- but the warm captures were the wrong
+                    // reference. The decrypted COLD capture
+                    // (`captures/edid-cold-decrypt-20260719/`) has DLM sending it twice, once per
+                    // head, and its body already matches DLM byte-for-byte. Compare cold against
+                    // cold: a message class can be entirely absent from a warm re-engage and still
+                    // be mandatory on a cold plug.
+                    if let Ok(kick) = cp::edid_readiness_kick(cp_ctr, hu8) {
+                        edid_send!(0x16, kick, "get-EDID kick (id=0x16 sub=0x4b)");
+                    }
                     fsleep(EDID_STEP_DELAY);
                     if let Ok(req) = cp::get_edid_req(cp_ctr, hu8) {
                         edid_send!(0x15, req, "get-EDID fetch (id=0x15 sub=0x21)");
@@ -3224,6 +3231,16 @@ impl VinoDriver {
                         "no EDID"
                     }
                 );
+                // Post-EDID capability query, once per head, immediately after this head's EDID has
+                // landed -- DLM's cold position (see `cp::post_edid_query`). Absent from both warm
+                // captures, so it was invisible until the cold capture was inventoried.
+                if let Ok(q) = cp::post_edid_query(cp_ctr, hu8) {
+                    edid_send!(0x15, q, "post-EDID capability query (id=0x15 sub=0x53)");
+                }
+                // `edid_send!` folds the drain's readiness bit into `edid_ready`. This is the last
+                // statement of the per-head iteration and the next head re-derives it, so that
+                // update is deliberately not read again here.
+                let _ = edid_ready;
             }
 
             // Checkpoint (2026-07-16, post-lockup investigation): the last thing the previous

@@ -68,13 +68,44 @@ fn pad_to(out: &mut KVec<u8>, len: usize) -> Result {
     }
     Ok(())
 }
-/// OUT heartbeat (sec 6.1): `id=0x16 sub=0x75`, two AES blocks (`10 27` at block1+6).
+/// OUT session heartbeat: `id=0x16 sub=0x75`, two AES blocks.
+///
+/// **Corrected 2026-07-22** against the two decrypted DLM captures that contain one
+/// (`captures/dlm-wake-ab-20260722-150209/cp-decrypted.json`, 5 messages, and
+/// `captures/max-cold-20260721-235609/cp-decrypted.json`, 8 messages). All 13 are byte-identical
+/// in shape:
+///
+/// ```text
+/// 16 00 75 00 [ctr:2] 00 00   14x 00   e0 2e   [8-byte host-random token]
+/// ```
+///
+/// The 16-bit value at off22 is `0x2ee0` (12000) -- confirmed on every live heartbeat plaintext
+/// (2026-07-23 Frida trace), not the `0x2710` (10000) this built before.
+///
+/// **off24..32 is STALE SCRATCH-BUFFER MEMORY, settled 2026-07-23 by the same live method that
+/// settled the cold video-arm tail (`docs/VIDEO-ARM-RANDOM-FIELDS.md`).** Hooking DLM's mbedTLS
+/// CTR-DRBG output and its pre-encryption CP plaintext in one live session
+/// (`vino-re/frida/hook-cp-token.js`, capture `captures/cp-token-coldplug-20260723-*.ndjson`)
+/// showed: (1) **zero** CTR-DRBG draws within 200 ms of any of the captured heartbeats -- the only
+/// 8-byte draws in the whole session were the AKE session material during a DLM restart, none
+/// equal to a heartbeat tail; and (2) the tails **repeat** (counter 366 and 382 both
+/// `00000002257c5c6c`) and carry fragments of other CP messages (`0000000aa0003000` embeds the
+/// mode-set word `a0 00 30 00`; the `00000002/04/09/0a` leaders are the BE32 head/index fields of
+/// the CP setup/restatement burst). DLM assembles the 32-byte heartbeat in a recycled buffer,
+/// writes through off22 (`e0 2e`), and leaves off24..32 as whatever the previous message left. It
+/// is neither random nor derived; the dock ignores it (vino has had this field zero, `10 27` and
+/// CSPRNG-random accepted). We therefore emit zeros: deterministic, no RNG draw, and honest about
+/// the field being don't-care rather than dressing it up as a token.
+///
+/// DLM sends this every **3.000 s for the whole streaming session** (measured interval across
+/// both captures: 3.000-3.001 s), not just during bring-up. vino previously sent exactly one, from
+/// inside the EDID loop, and then went heartbeat-silent -- see `BringUp::run`'s keepalive.
 pub(super) fn heartbeat(counter: u16) -> Result<KVec<u8>> {
     let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
     header(&mut b, 0x16, 0x75, counter)?;
     pad_to(&mut b, 22)?; // block0 tail + block1[0..6]
-    b.extend_from_slice(&[0x10, 0x27], GFP_KERNEL)?; // block1[6..8]
-    pad_to(&mut b, 32)?;
+    b.extend_from_slice(&[0xe0, 0x2e], GFP_KERNEL)?; // off22: 0x2ee0 (live-confirmed)
+    pad_to(&mut b, 32)?; // off24..32: proven don't-care stale-buffer bytes -- emit zeros
     Ok(b)
 }
 /// Post-video-arm-burst "stream commit" (recovered 2026-07-17 by re-mining the SAME rr recording
@@ -179,6 +210,26 @@ pub(super) fn edid_engage_req(counter: u16, head: u8) -> Result<KVec<u8>> {
     pad_to(&mut b, 22)?;
     b.push(head, GFP_KERNEL)?;
     let mut tail = [0u8; 9];
+    rng::fill(&mut tail);
+    b.extend_from_slice(&tail, GFP_KERNEL)?;
+    Ok(b)
+}
+/// OUT `id=0x15 sub=0x0053` post-EDID capability query. **Found 2026-07-23** by inventorying the
+/// decrypted COLD capture (`captures/edid-cold-decrypt-20260719/`) rather than the warm ones --
+/// this type does not occur in either warm capture at all, which is why every previous comparison
+/// missed it. DLM sends it TWICE, late in the cold sequence (block-seq 1289 and 1293, after the
+/// real `id=0x194` EDID has arrived), with an index at off23 that runs 1 then 2 (read as
+/// `head + 1`, matching every other per-head selector's shape) and an 8-byte host-random tail.
+///
+/// The dock's reply is a structured `id=0x1c sub=0x53` carrying `07 10 10 00 01 00 01 00` at
+/// off24 in both cases -- a fixed capability/word block, not an echo, so this is a real query
+/// whose answer the dock has ready only once the downstream EDID read has completed.
+pub(super) fn post_edid_query(counter: u16, head: u8) -> Result<KVec<u8>> {
+    let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
+    header(&mut b, 0x15, 0x0053, counter)?;
+    pad_to(&mut b, 23)?;
+    b.push(head + 1, GFP_KERNEL)?; // off23: 1-based call/head index (DLM: 1 then 2)
+    let mut tail = [0u8; 8];
     rng::fill(&mut tail);
     b.extend_from_slice(&tail, GFP_KERNEL)?;
     Ok(b)
