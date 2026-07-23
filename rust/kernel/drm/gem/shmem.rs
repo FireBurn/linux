@@ -642,12 +642,18 @@ mod tests {
         const IOCTLS: &'static [drm::ioctl::DrmIoctlDescriptor] = &[];
     }
 
+    // These tests only ever build into the kernel image, so there is no module to pin. A null
+    // `file_operations::owner` is exactly what a built-in driver uses.
+    //
+    // SAFETY: `NULL` is the correct `THIS_MODULE` for built-in code.
+    static KUNIT_MODULE: ThisModule = unsafe { ThisModule::from_ptr(ptr::null_mut()) };
+
     fn create_drm_dev() -> Result<(faux::Registration, UnregisteredDevice<KunitDriver>)> {
         // Create a faux DRM device so we can test gem object creation.
         let data = try_pin_init!(KunitData {});
         let reg = faux::Registration::new(c"Kunit", None)?;
         let fdev = reg.as_ref();
-        let drm = UnregisteredDevice::new(fdev, data)?;
+        let drm = UnregisteredDevice::new(fdev, data, &KUNIT_MODULE)?;
 
         Ok((reg, drm))
     }

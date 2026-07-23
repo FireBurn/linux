@@ -72,7 +72,8 @@ impl platform::Driver for EvdiPlatformDriver {
         // pipeline (`KmsDriver::probe` runs inside `UnregisteredDevice::new`), then register it and
         // tie its lifetime to the bound platform device via devres. Failure fails the probe: a
         // bound platform device with no DRM card behind it would look loaded but do nothing.
-        let unregistered = drm::UnregisteredDevice::<EvdiDrmDriver>::new(pdev, EvdiDrmData::new())?;
+        let unregistered =
+            drm::UnregisteredDevice::<EvdiDrmDriver>::new(pdev, EvdiDrmData::new(), &THIS_MODULE)?;
         // SAFETY: The registration is stored in `BoundData` and is therefore dropped during the
         // platform driver's ordered unbind; it is never leaked or forgotten.
         let registration = unsafe { drm::Registration::new(pdev.as_ref(), unregistered, (), 0)? };

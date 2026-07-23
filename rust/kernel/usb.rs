@@ -117,12 +117,25 @@ impl<T: Driver> Adapter<T> {
 
         let dev: &device::Device<device::CoreInternal<'_>> = intf.as_ref();
 
+        // Take ownership of the driver data here rather than leaving it to the driver core's
+        // generic post-unbind teardown: `usb_unbind_interface()` calls `usb_set_intfdata(intf,
+        // NULL)` as soon as this callback returns, which is *before* `device_unbind_cleanup()`
+        // runs `post_unbind_rust`. The generic `drvdata_obtain()` therefore always finds NULL for
+        // USB and the driver data -- with everything it owns, such as a `drm::Registration` -- is
+        // leaked on every unbind.
+        //
         // SAFETY: `disconnect_callback` is only ever called after a successful call to
         // `probe_callback`, hence it's guaranteed that `Device::set_drvdata()` has been called
         // and stored a `Pin<KBox<T::Data<'_>>>`.
-        let data = unsafe { dev.drvdata_borrow::<T::Data<'_>>() };
+        let data = unsafe { dev.drvdata_obtain::<T::Data<'_>>() };
 
-        T::disconnect(intf, data);
+        if let Some(data) = data {
+            T::disconnect(intf, data.as_ref());
+
+            // Dropped only after `T::disconnect()` has returned, so a driver can rely on its
+            // owned resources still being alive for the whole of its disconnect handling.
+            drop(data);
+        }
     }
 
     /// Recovers the typed interface and driver data shared by every power-management and reset
