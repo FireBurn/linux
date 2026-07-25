@@ -388,6 +388,17 @@ pub(super) struct VinoDrmData {
     /// resetting once the separate continuous CP keepalive was present.
     #[pin]
     last_frame: SpinLock<[Option<Instant<Monotonic>>; HEADS]>,
+    /// ★ Cold-downstream training deadline per head (2026-07-25). On a mode-set the dock needs a
+    /// SUSTAINED video stream (~0.4 s of continuous frames) before it programs its downstream pixel
+    /// clock and lights the panel -- ONE keyframe is not enough on a COLD link. Proven by capturing
+    /// DLM activating a cold dock (`captures/dlm-coldplug-withmon-*`): its `2807a`/`2990d` fire ~0.4 s
+    /// AFTER a continuous EP08/EP0b stream begins. vino sent one keyframe then idled, so a cold link
+    /// never activated. Until this deadline, the idle settle-repaint resends at the fast frame
+    /// cadence (`FRAME_PERIOD_MS`) instead of the sparse `SETTLE_REPAINT_MS`, giving the cold link the
+    /// sustained stream; afterwards it backs off. Set on every mode-set; harmless on a warm link
+    /// (which activates on the first frame anyway).
+    #[pin]
+    sustain_until: SpinLock<[Option<Instant<Monotonic>>; HEADS]>,
     /// Logical WHT frame sequence per head. This used to live on `VinoPlane`; moving scanout to the
     /// device worker means the sequence belongs with the rest of the deferred transport state.
     #[pin]
@@ -475,6 +486,7 @@ impl VinoDrmData {
             modeset_active: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
             modeset_requested: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
             last_frame <- new_spinlock!([const { None }; HEADS]),
+            sustain_until <- new_spinlock!([const { None }; HEADS]),
             scanout_seq <- new_mutex!([0; HEADS]),
             video_q <- new_mutex!([const { None }; HEADS]),
             video_staging <- new_mutex!([const { None }; HEADS]),
@@ -660,9 +672,16 @@ impl VinoDrmData {
     /// both places is what produced a 3.9 s bracket-to-first-frame gap against DLM's 140 ms.
     const PREWRITE_POLLS: u32 = 2;
     const PREWRITE_POLL_MS: u64 = 1;
-    /// Dock video-pipe readiness window at the end of the mode-set bracket (~1.2 s), as in the
-    /// known-lit `a6f4c8b` build.
-    const POST_MODESET_POLLS: u32 = 75;
+    /// Short poll window after the mode-set bracket before the first video write.
+    /// ★ 2026-07-25: cut from 75 (~1.2 s) to 6 (~0.1 s) to match the DLM hotplug capture that lit a
+    /// cold monitor (`captures/dlm-hotplug-sequence-20260725-143903`): DLM sends its first EP0b video
+    /// only ~0.1 s after the mode-set (interleaved with the bracket), and the dock programs its
+    /// downstream pixel clock (`2990d`) ~20 ms later. vino waited ~1.2 s here BEFORE the first video,
+    /// so the video arrived long after the dock's post-modeset activation window -- a candidate reason
+    /// the clock never programmed. Ongoing dock polling is covered by the continuous keepalive, so
+    /// shortening this only moves the first frame earlier; DLM's own long readiness poll happens
+    /// AFTER its first video, not before.
+    const POST_MODESET_POLLS: u32 = 6;
     const POST_MODESET_POLL_MS: u64 = 16;
     /// One `id=0x14 sub=0x000c` device-status poll — the same message the EDID readiness loop uses.
     fn poll_status(&self, dev: &BoundInterface<'_>) {
@@ -751,13 +770,27 @@ impl VinoDrmData {
     /// end of the bracket -- not inline before the first video write, where a later refactor moved
     /// them (see [`PREWRITE_POLLS`]).
     fn modeset_bracket_post(&self, dev: &BoundInterface<'_>, head: u8, _wake: bool) {
+        // ★ 2026-07-25: matched byte-for-byte to `captures/dlm-hotplug-sequence-20260725-143903`
+        // (`analyze-mon-cp.py --around step2-plug-monitor1`) -- the FIRST capture that actually lit
+        // these monitors from cold. Right after the mode-set DLM sends the `2e` marker in **state 3**
+        // TWICE before ramping to 0, and the dock then programs its downstream pixel clock
+        // (`2990d`/`3f32a` in the dock firmware trace) and lights the panel. vino sent only `2e:0`
+        // (state 0) on a wake, and the clock never programmed -- panels dark. DLM's exact marker
+        // order (ctr 204..215): `2f:1 2e:3 2f:1 2e:3 2f:1 2e:0` then ~100 ms of status polls, then
+        // `2f:0 2e:0`. The earlier "no build carrying `2e:3` ever lit a panel" note was from *dark*
+        // builds analysed against a re-wake capture; this is grounded in a from-cold lighting.
         self.poll_status(dev);
         self.stream_marker(dev, head, 0x2f, 1);
-        self.stream_marker(dev, head, 0x2e, 0);
-        self.poll_status(dev);
+        self.stream_marker(dev, head, 0x2e, 3);
         self.stream_marker(dev, head, 0x2f, 1);
-        self.poll_status(dev);
+        self.stream_marker(dev, head, 0x2e, 3);
+        self.stream_marker(dev, head, 0x2f, 1);
         self.stream_marker(dev, head, 0x2e, 0);
+        // ~100 ms of paced status polls before the ramp-down pair, as DLM does (ctr 210->214 gap).
+        for _ in 0..6 {
+            self.poll_status(dev);
+            fsleep(Delta::from_millis(16));
+        }
         self.stream_marker(dev, head, 0x2f, 0);
         self.stream_marker(dev, head, 0x2e, 0);
         // Paced polling, DLM-style: ~16 ms apart for ~75 iterations (~1.2 s) so the dock has time
@@ -981,6 +1014,64 @@ impl VinoDrmData {
         let _ = dev;
     }
 
+    /// Stage 2 (runtime monitor removal): clear a head's connected state. `detect()` reports
+    /// Connected when `cached_edid || heads_present bit`, so a genuine disconnect must clear BOTH,
+    /// or a head that lost its monitor keeps advertising a phantom output from the stale EDID.
+    pub(super) fn set_disconnected(&self, head: usize) {
+        if head >= HEADS {
+            return;
+        }
+        self.heads_present
+            .fetch_and(!(1u32 << head), core::sync::atomic::Ordering::Release);
+        if let Some(slot) = self.cached_edids.lock().get_mut(head) {
+            *slot = None;
+        }
+    }
+
+    /// Stage 2 (runtime monitor hotplug): probe whether head `head` currently has a monitor.
+    ///
+    /// Sends the per-head EDID probe (`id=0x15 sub=0x20`, byte22 = head selector -- the same
+    /// selector that unblocked the whole EDID path) and decodes the dock's sealed `0x45` reply.
+    /// A present monitor routes the probe to the dock's trusted EDID/display-capability handler
+    /// (`id=0x44`/`id=0x194`/`id=0x78`); an empty port gets a bare generic `id=0x14` ack. Returns
+    /// `Some(true/false)` on a decodable reply, `None` if CP is down or no reply decoded (caller
+    /// treats `None` as "no change", and debounces `Some` transitions). Reuses the live session
+    /// `ks/riv/counter` exactly like `send_cp`, so it stays in CP lockstep.
+    pub(super) fn probe_head_present(&self, dev: &BoundInterface<'_>, head: u8) -> Option<bool> {
+        let mut guard = self.cp_link.lock();
+        let link = (&mut *guard).as_mut()?;
+        let msg = super::cp::get_edid_req_sub(link.counter, 0x0020, head).ok()?;
+        let frame =
+            super::cp::seal_interactive(&link.ks, &link.riv, 0x15, link.wire_seq, &msg).ok()?;
+        dev.ctrl_send(&frame, super::timeout(), GFP_KERNEL).ok()?;
+        link.wire_seq = link.wire_seq.wrapping_add(((msg.len() + 15) / 16) as u32);
+        link.counter = link.counter.wrapping_add(1);
+        let mut reply = KVec::from_elem(0u8, 4096, GFP_KERNEL).ok()?;
+        let got = match link.ep84_q.as_mut() {
+            Some(q) => match q.recv(dev.io(), &mut reply, super::cp_reply_timeout()) {
+                Ok(Some(n)) if n > 16 => n,
+                _ => return None,
+            },
+            None => match dev.ctrl_recv(&mut reply, super::cp_reply_timeout(), GFP_KERNEL) {
+                Ok(n) if n > 16 => n,
+                _ => return None,
+            },
+        };
+        let (id, _sub, _ctr) = super::cp::decode_in_lenient(&link.ks, &link.riv, &reply[..got])?;
+        Some(matches!(id, 0x44 | 0x194 | 0x78))
+    }
+
+    /// Whether head `head`'s presence bit is currently set (for the keepalive to seed its baseline
+    /// before watching for runtime connect/remove transitions).
+    pub(super) fn head_present(&self, head: usize) -> bool {
+        head < HEADS
+            && self
+                .heads_present
+                .load(core::sync::atomic::Ordering::Acquire)
+                & (1u32 << head)
+                != 0
+    }
+
     /// How many heads on this dock currently have a monitor attached (`present`), for splitting the
     /// shared pixel-rate budget. At least 1, so a lone head (or a momentary all-disconnected read
     /// racing `detect`) gets the whole budget rather than dividing by zero.
@@ -1164,6 +1255,11 @@ impl WorkItem for VinoDrmData {
                                 && data.modeset_requested[head_i].load(Ordering::Acquire) == key
                             {
                                 data.modeset_active[head_i].store(key, Ordering::Release);
+                                // Give the (possibly cold) downstream ~3 s of sustained video after
+                                // this mode-set so its link can train and the dock programs the pixel
+                                // clock -- see `sustain_until`.
+                                data.sustain_until.lock()[head_i] =
+                                    Some(Instant::<Monotonic>::now() + Delta::from_millis(3000));
                                 data.modeset_bracket_post(dev, head, wake);
                                 let bit = 1u32 << head;
                                 data.arm_prefix_pending.fetch_or(bit, Ordering::Release);
@@ -2045,9 +2141,14 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
             if let Some(mut copy) = settle_copy {
                 copy.clips[0] = (0, 0, copy.w, copy.h);
                 copy.nclips = 1;
-                // Continuous-refresh experiment repaints at the frame cadence, not the one-shot
-                // settle delay, so the dock sees an uninterrupted full-frame stream.
-                let delay = if TEST_FORCE_FULL_FRAMES {
+                // ★ Cold-link training: within the post-mode-set `sustain_until` window, repaint at
+                // the fast frame cadence so the dock sees the SUSTAINED continuous stream a cold
+                // downstream needs to train its link and program the pixel clock (see `sustain_until`
+                // and `captures/dlm-coldplug-withmon-*`). Outside the window (link already up), back
+                // off to the sparse one-shot settle so a static desktop is not refreshed forever.
+                let sustaining = data.sustain_until.lock()[head_i]
+                    .is_some_and(|until| (until - Instant::<Monotonic>::now()).as_millis() > 0);
+                let delay = if TEST_FORCE_FULL_FRAMES || sustaining {
                     FRAME_PERIOD_MS
                 } else {
                     SETTLE_REPAINT_MS
@@ -2508,7 +2609,14 @@ fn encode_and_send_wht(
     let frame_count = frames.len();
     let image_len: usize = frames.iter().take(frame_count).map(|f| f.len()).sum();
     let startup = arm.is_some();
-    let repeat_count = 1u32;
+    // ★ Double-buffer replay (2026-07-25, `docs/DLM-DAMAGE-TILING.md`): the dock is double-buffered,
+    // so a one-shot damage written to only one buffer FLICKERS/tears between the two on scanout.
+    // DLM was measured sending each damage EXACTLY TWICE (~100 ms apart, then idle) -- once per dock
+    // buffer -- via the damage harness. Send each DELTA twice too (the existing `repeat_count`
+    // re-sends with an advanced frame trailer), so both dock buffers get the change. Full keyframes
+    // are excluded: a mode-set keyframe is already followed by the continuous `sustain_until` stream
+    // that covers both buffers, and doubling a ~MB keyframe would waste bandwidth for no gain.
+    let repeat_count = if full { 1u32 } else { 2u32 };
     let first_wire_len = arm_len + image_len + super::video::wht::frame_trailer(head, seq0).len();
     pr_debug!(
         "vino: scanout head={} {} chunk(s) + {} B arm-prefix = {} B first write, {} presentation(s)\n",
@@ -2647,6 +2755,19 @@ fn encode_and_send_wht(
                 head,
                 wire_len
             );
+            // Post-burst "stream commit" (`id=0x16 sub=0x4c`; see `cp::stream_commit`'s doc comment
+            // and `project_post_burst_stream_commit_found_20260717` memory): DLM sends this twice
+            // per head on the MAIN EP02 channel right after that head's video-endpoint arm burst,
+            // before real video starts. In drm-v3 the arm burst is fused into the frame-zero EP08
+            // URB, so the closest wire-equivalent point is here, immediately after that URB is
+            // accepted. Dropped in the v3 rebase (defined in cp.rs, no call sites); restored to
+            // re-enable the dock's downstream display engine (`2807a`/`2990d` fork -- see BLOCKER.md).
+            for _ in 0..2 {
+                match data.send_cp(dev, 0x16, 0, |ctr| super::cp::stream_commit(ctr, head)) {
+                    Ok(()) => pr_info!("vino: stream-commit head={} ok\n", head),
+                    Err(e) => pr_info!("vino: stream-commit head={} failed ({e:?})\n", head),
+                }
+            }
         }
 
         if let Err(e) = data.send_cp(dev, 0x14, 0, |ctr| super::cp::device_query_req(ctr, 0x000c)) {

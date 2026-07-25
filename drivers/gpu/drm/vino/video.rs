@@ -1210,6 +1210,16 @@ pub(crate) mod wht {
     pub(crate) const STRIP_W: usize = STRIP_BLOCKS_X * DIM; // 64
     pub(crate) const STRIP_H: usize = 2 * DIM; // 16
 
+    /// DLM's damage MACRO-TILE: 256 px wide x 64 px tall = 4x4 = 16 strips. Reverse-engineered
+    /// 2026-07-25 (`docs/DLM-DAMAGE-TILING.md`, `scripts/dlm-damage-{probe,atomic}.c`): DLM quantises
+    /// ALL damage to this `(256,64)`-aligned grid and always re-sends every strip of a touched
+    /// macro-tile -- never a sub-macro-tile partial. A single-strip clip on the atomic
+    /// `FB_DAMAGE_CLIPS` path still produced the full 16-strip macro-tile. Sending fewer (per-strip)
+    /// leaves stale strips on the dock -> the on-screen torn "bad updates". So damage selection snaps
+    /// to this grid.
+    pub(crate) const MACRO_W: usize = 4 * STRIP_W; // 256
+    pub(crate) const MACRO_H: usize = 4 * STRIP_H; // 64
+
     /// Gather one 64x16 strip's 16 colour blocks from a pixel source. `px(x, y)` returns the
     /// 8-bit `(R, G, B)` at absolute frame coordinate `(x, y)`; `(ox, oy)` is the strip's
     /// top-left pixel. Each block's three planes are built in the codec's x64 fixed point via
@@ -1323,9 +1333,14 @@ pub(crate) mod wht {
         while sy < height {
             let mut sx = 0usize;
             while sx < width {
-                // Include this strip iff any damage clip overlaps its 64x16 tile.
+                // Include this strip iff any damage clip overlaps the 256x64 MACRO-TILE that contains
+                // it (DLM's damage granularity -- see MACRO_W/MACRO_H and docs/DLM-DAMAGE-TILING.md).
+                // DLM re-sends every strip of a touched macro-tile; matching that avoids the
+                // stale-strip torn updates a per-strip selection produced.
+                let mx = (sx / MACRO_W) * MACRO_W;
+                let my = (sy / MACRO_H) * MACRO_H;
                 let hit = clips.iter().any(|&(x0, y0, x1, y1)| {
-                    sx < x1 && x0 < sx + STRIP_W && sy < y1 && y0 < sy + STRIP_H
+                    mx < x1 && x0 < mx + MACRO_W && my < y1 && y0 < my + MACRO_H
                 });
                 if hit {
                     let blocks = colour_strip_blocks(sx, sy, &mut px)?;

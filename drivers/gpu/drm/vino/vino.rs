@@ -809,6 +809,36 @@ impl WorkItem for BringUp {
         BRINGUP_COMPLETE.store(true, core::sync::atomic::Ordering::SeqCst);
         {
             let drm_dev: &drm_sink::VinoDrmDevice = ddev;
+            // ★ Downstream readiness wait (2026-07-25, confirmed against the DLM hotplug capture
+            // `captures/dlm-hotplug-sequence-20260725-143903`, see docs/DLM-COLD-LIT-CHOREOGRAPHY.md):
+            // on a monitor/dock connect DLM reads EDID, ENGAGEs, then polls `id=0x14 sub=0x0c` for
+            // ~1.2 s while the dock brings the downstream LINK up -- its sealed `0x45` replies carry
+            // downstream-progress status and shrink from ~190 B to ~64 B as the link settles -- and
+            // ONLY THEN sends the mode-set. vino used to fire `hotplug_event()` (-> KWin mode-set)
+            // immediately after engage, so a COLD downstream was mode-set mid-training and never lit
+            // its panel; the WARM case worked only because the link was already up. Run the same
+            // readiness poll here, BEFORE notifying userspace, so KWin's mode-set lands on a
+            // downstream the dock has finished bringing up. Harmless on a warm plug (link already
+            // ready -> the poll just idles). Bounded, and breaks on `disconnect()` clearing
+            // KEEPALIVE_RUN, so `cancel_work_sync` can never hang unload for the full window.
+            if CP_ENGAGED.load(core::sync::atomic::Ordering::SeqCst) {
+                let data: &drm_sink::VinoDrmData = drm_dev;
+                KEEPALIVE_RUN.store(true, core::sync::atomic::Ordering::SeqCst);
+                let start = Instant::<Monotonic>::now();
+                let window = Delta::from_millis(1300);
+                let mut polls = 0u32;
+                while Instant::<Monotonic>::now() - start < window
+                    && KEEPALIVE_RUN.load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    let _ = data.send_cp(dev, 0x14, 0, |ctr| cp::device_query_req(ctr, 0x000c));
+                    polls += 1;
+                    fsleep(Delta::from_millis(15));
+                }
+                dev_info!(
+                    cdev,
+                    "vino: downstream readiness poll window done ({polls} polls, ~1300 ms) before hotplug\n"
+                );
+            }
             drm_dev.hotplug_event();
             dev_info!(
                 cdev,
@@ -839,6 +869,18 @@ impl WorkItem for BringUp {
             let mut next_heartbeat = Instant::<Monotonic>::now() + HEARTBEAT_PERIOD;
             let mut beats = 0u32;
             let mut pushes = 0usize;
+            // Stage 2: runtime monitor connect/remove. vino latched each head's presence ONCE at
+            // bring-up; a monitor plugged in or pulled out afterwards was never noticed. Re-probe
+            // each head on a slow cadence and reflect changes to its connector (with the same
+            // readiness wait on a fresh connect, and a full teardown on removal). Debounced so a
+            // single mis-decoded reply cannot flap a connector.
+            const PRESENCE_PERIOD: Delta = Delta::from_secs(2);
+            let mut next_presence = Instant::<Monotonic>::now() + PRESENCE_PERIOD;
+            let mut head_known = [false; VinoDriver::CP_SETUP_HEADS];
+            let mut head_debounce = [0u8; VinoDriver::CP_SETUP_HEADS];
+            for h in 0..VinoDriver::CP_SETUP_HEADS {
+                head_known[h] = data.head_present(h);
+            }
             KEEPALIVE_RUN.store(true, core::sync::atomic::Ordering::SeqCst);
             while KEEPALIVE_RUN.load(core::sync::atomic::Ordering::Relaxed) {
                 if data
@@ -867,6 +909,50 @@ impl WorkItem for BringUp {
                 // sits (1.116-1.157). See `VinoDrmData::drain_cp_pushes`.
                 const MAX_UNPAIRED_DRAIN: usize = 4;
                 pushes += data.drain_cp_pushes(dev, MAX_UNPAIRED_DRAIN);
+                // Stage 2: periodic per-head monitor presence re-check.
+                let now_p = Instant::<Monotonic>::now();
+                if (now_p - next_presence).as_millis() >= 0 {
+                    next_presence = now_p + PRESENCE_PERIOD;
+                    for h in 0..VinoDriver::CP_SETUP_HEADS {
+                        let Some(present) = data.probe_head_present(dev, h as u8) else {
+                            continue; // no decodable reply this cycle -> treat as no change
+                        };
+                        if present == head_known[h] {
+                            head_debounce[h] = 0;
+                            continue;
+                        }
+                        // Require two consecutive contrary reads before acting.
+                        head_debounce[h] = head_debounce[h].saturating_add(1);
+                        if head_debounce[h] < 2 {
+                            continue;
+                        }
+                        head_debounce[h] = 0;
+                        head_known[h] = present;
+                        if present {
+                            data.set_connected(drm_dev, h);
+                            dev_info!(
+                                cdev,
+                                "vino: head {h} monitor CONNECTED at runtime -- readiness wait + hotplug\n"
+                            );
+                            // Same downstream readiness wait as a fresh bring-up before notifying
+                            // userspace, so KWin's mode-set lands on a settled downstream link.
+                            let rs = Instant::<Monotonic>::now();
+                            while (Instant::<Monotonic>::now() - rs).as_millis() < 1300
+                                && KEEPALIVE_RUN.load(core::sync::atomic::Ordering::Relaxed)
+                            {
+                                let _ = data
+                                    .send_cp(dev, 0x14, 0, |ctr| cp::device_query_req(ctr, 0x000c));
+                                fsleep(Delta::from_millis(15));
+                            }
+                        } else {
+                            data.set_disconnected(h);
+                            dev_info!(cdev, "vino: head {h} monitor REMOVED at runtime -- hotplug\n");
+                        }
+                        drm_dev.hotplug_event();
+                        // Re-baseline the heartbeat/presence deadlines skipped during the wait.
+                        next_presence = Instant::<Monotonic>::now() + PRESENCE_PERIOD;
+                    }
+                }
                 fsleep(Delta::from_millis(13));
             }
             dev_info!(
