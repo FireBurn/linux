@@ -121,6 +121,36 @@ const MAX_HEAD_CLOCK_KHZ: i32 = 600_000;
 const TEST_ONLY_720P60: bool = false;
 const TEST_FORCE_FULL_FRAMES: bool = false;
 
+/// ★ Diagnostic (2026-07-26): is the compositor rewriting the framebuffer while vino reads it?
+///
+/// [`VinoCrtc::atomic_flush`] arms the page-flip event for the next software vblank (~8 ms at
+/// 120 Hz), but the deferred worker hashes and encodes that framebuffer 150 ms or more later.
+/// Nothing between those two points keeps the *storage* stable: [`PendingScanout::fb`] holds an
+/// `ARef<Framebuffer>`, which keeps the framebuffer object alive (so there is no use-after-free)
+/// but does not stop the client rendering into the underlying buffer -- buffer reuse is governed
+/// by flip completion, which vino has already signalled. If KWin recycles the buffer, the pixels
+/// vino encodes are not the pixels that were committed. That predicts every observed symptom of
+/// the drag artifacting: tearing within one frame (the hash pass and the encode pass read the
+/// buffer at different moments), stale strips that never refresh (a strip whose hash happened to
+/// match a recycled buffer's content is never sent), and worst-while-dragging.
+///
+/// With this on, [`encode_and_send_wht`] re-hashes every strip immediately after encoding and
+/// compares against the pass that selected the damage. A non-zero dirty count is direct proof: the
+/// content moved under us *within a single frame*, so it certainly moves across the much wider
+/// commit-to-read gap. Zero across a sustained window drag refutes the hypothesis and the artifact
+/// must be sought elsewhere.
+///
+/// Read-only, but it costs a second full-surface read per frame (~14.7 MB at 1440p), which widens
+/// the encoder's own window slightly -- so treat a small non-zero count as qualitative evidence of
+/// the race, not as a measurement of its natural rate. Diagnostic only; this is not the fix.
+///
+/// **Result (2026-07-26):** idle desktop `0/3600`, window drag up to `2838/3600` -- the race was
+/// real and is the cause of the drag artifacting. Fixed by [`ShadowSurface`]. Left switched off:
+/// now that the encoder reads vino's own private copy this can only ever report zero, so it costs
+/// ~1.8 ms per frame to confirm something the design already guarantees. Turn it back on if the
+/// snapshot path is ever changed, where it becomes a direct regression test again.
+const TEST_DETECT_BUFFER_RECYCLE: bool = false;
+
 /// **The single head-count knob** for the whole driver. Every per-head array/loop is sized by this
 /// (`connectors`, `gamma`, `video_keys`, the CP setup in `vino.rs` via `CP_SETUP_HEADS = HEADS`, the
 /// scanout keyframe/arm bitmasks). Which heads actually light up is decided at runtime by per-head
@@ -159,6 +189,24 @@ const MAX_DAMAGE_CLIPS: usize = 16;
 /// [`COLD_TRAINING_PRESENTATIONS`] replay below reuses one encoding to keep the endpoint busy during
 /// training, then returns to this normal cadence.
 const FRAME_PERIOD_MS: i64 = 140;
+
+/// How long the compositor must have been quiet before the worker will read a framebuffer directly
+/// instead of a [`ShadowSurface`].
+///
+/// Snapshots are only taken on a commit that is due under [`FRAME_PERIOD_MS`]. If KWin stops
+/// flipping right after a *non*-due commit -- a window that stops moving, an animation that ends --
+/// the newest image is framebuffer-backed and would otherwise never reach the panel. Reading it
+/// directly is safe precisely because the compositor is idle: the buffer-recycling race needs KWin
+/// to be actively rendering, which is also exactly when it keeps flipping and a snapshot lands
+/// within one frame period. Not airtight (KWin can wake mid-read), but the residual window applies
+/// only to a static desktop, where the next commit repairs it anyway.
+const SNAPSHOT_IDLE_MS: i64 = 60;
+
+/// How many consecutive frames must carry a strip after its content changes, so that every one of
+/// the dock's buffers receives it. Two is the theoretical minimum for a double-buffered sink; a
+/// window drag still left an occasional stale frame at two, so this carries one frame of margin
+/// for a presentation the dock drops or applies to the buffer it just used.
+const DAMAGE_REPEATS: u8 = 3;
 /// Absolute timing of the first pre-encoded activation carrier and bracket close relative to the
 /// mode-set submission.
 ///
@@ -337,6 +385,9 @@ struct PendingScanout {
     nclips: usize,
     w: usize,
     h: usize,
+    /// This flip's pixels were copied into [`VinoDrmData::shadow`] during the atomic commit, so the
+    /// worker must encode from there and never from `fb`. See [`ShadowSurface`].
+    from_shadow: bool,
 }
 
 impl Clone for PendingScanout {
@@ -349,8 +400,38 @@ impl Clone for PendingScanout {
             nclips: self.nclips,
             w: self.w,
             h: self.h,
+            // A clone outlives the shadow slot's contents (the next commit overwrites it), so a
+            // copy is always framebuffer-backed. Only the settle repaint clones, and it only ever
+            // runs against an idle compositor.
+            from_shadow: false,
         }
     }
+}
+
+/// ★ vino's private copy of one head's committed framebuffer (2026-07-26).
+///
+/// **The bug this exists to fix.** [`VinoCrtc::atomic_flush`] completes the page flip at the next
+/// software vblank (~8 ms), but the deferred worker did not read the pixels until 150 ms or more
+/// later. Completing the flip is a promise that vino is finished with the buffer, so KWin took it
+/// back and rendered the next ~17 frames into it while vino was still hashing and encoding from it.
+/// The result was that the pixels vino encoded were never the pixels KWin committed: torn content
+/// within a frame, stale strips that never refreshed, and visible ghosting while dragging a window.
+///
+/// `TEST_DETECT_BUFFER_RECYCLE` measured it directly on 2026-07-26: an idle desktop reported
+/// `0/3600` strips changing under the encoder, a window drag up to `2838/3600`.
+///
+/// **The fix.** Copy the pixels here, inside the atomic commit, while the compositor still owns the
+/// buffer and before the flip is completed. The worker then encodes from this private surface,
+/// which nothing else can write. The flip still completes immediately, so KWin keeps compositing at
+/// the panel's real refresh rate rather than being paced down to vino's USB throughput.
+///
+/// Stored compactly at `w * 4` stride (GEM dumb pitch is padded); the encoder takes the stride as a
+/// parameter, so every damage/rotation/gamma path works against this exactly as against a mapped
+/// framebuffer. The allocation is reused across frames and only reallocated when the mode changes.
+struct ShadowSurface {
+    w: usize,
+    h: usize,
+    pixels: KVVec<u8>,
 }
 
 /// How long after a keyframe to repaint the same head once more.
@@ -403,6 +484,27 @@ pub(super) struct VinoDrmData {
     /// See [`SETTLE_REPAINT_MS`] for the hardware observation that motivates it.
     #[pin]
     settle_repaint: Mutex<[Option<(Instant<Monotonic>, PendingScanout)>; HEADS]>,
+    /// Per-head private pixel copy taken during the atomic commit. See [`ShadowSurface`] for the
+    /// buffer-recycling bug this closes. The worker `take()`s the surface out of this slot for the
+    /// duration of an encode and puts it back afterwards, so a long encode never holds the lock
+    /// against the commit path.
+    #[pin]
+    shadow: Mutex<[Option<ShadowSurface>; HEADS]>,
+    /// Set while the worker has moved a head's [`ShadowSurface`] out of `shadow` for an encode.
+    /// The commit path must not allocate a replacement behind it: the worker puts the original back
+    /// when it finishes, which would discard any snapshot taken in the meantime, and at 120 Hz the
+    /// churn is a 14.7 MB allocation per flip.
+    shadow_busy: [AtomicBool; HEADS],
+    /// When each head's shadow was last refreshed. Snapshots are paced on their own clock rather
+    /// than on `last_frame`, which does not advance while the worker is mid-encode -- every commit
+    /// arriving during those ~150 ms would otherwise read as due.
+    #[pin]
+    last_snapshot: SpinLock<[Option<Instant<Monotonic>>; HEADS]>,
+    /// When the last primary-plane flip arrived, per head. Distinguishes "the compositor is
+    /// actively rendering" from "it has gone quiet", which is what makes the framebuffer-backed
+    /// fallback in the worker safe -- see [`SNAPSHOT_IDLE_MS`].
+    #[pin]
+    last_flip: SpinLock<[Option<Instant<Monotonic>>; HEADS]>,
     /// Count of primary-plane flips seen per head, purely diagnostic -- see `queue_scanout`.
     flips: [core::sync::atomic::AtomicU64; HEADS],
     /// Every started software vblank timer, with the handle whose drop is the full
@@ -448,6 +550,20 @@ pub(super) struct VinoDrmData {
     /// beyond what the dock may actually display.
     #[pin]
     strip_hashes: Mutex<[Option<StripHashState>; HEADS]>,
+    /// Per-strip retransmit debt: how many more frames must still include this strip.
+    ///
+    /// The dock is double-buffered and a presentation lands in only one of its buffers, so a strip
+    /// sent once repairs one buffer and leaves the other stale -- HW-observed 2026-07-26 first as
+    /// content left behind after a window moved, then as scanout alternating between a good frame
+    /// and a stale one. Sending each delta twice back-to-back does NOT fix it: both presentations
+    /// land in the same buffer.
+    ///
+    /// So instead of guessing the dock's buffer-swap rule, every strip whose content changes is
+    /// owed [`DAMAGE_REPEATS`] transmissions and is re-sent until that debt is paid, which covers
+    /// any swap pattern that gives each buffer a turn within that many frames. Sized like the strip
+    /// hash table and cleared with it.
+    #[pin]
+    dirty_ttl: Mutex<[Option<KVVec<u8>>; HEADS]>,
     /// Set once the dock engages the CP cipher (`wsub=0x45` acks > 0); EP08 scanout is gated on it.
     /// Per device, so a second connected dock does not share one dock's engagement state.
     cp_engaged: core::sync::atomic::AtomicBool,
@@ -565,6 +681,10 @@ impl VinoDrmData {
             cmd_queue <- new_mutex!(KVec::new()),
             pending_scanout <- new_mutex!([const { None }; HEADS]),
             settle_repaint <- new_mutex!([const { None }; HEADS]),
+            shadow <- new_mutex!([const { None }; HEADS]),
+            shadow_busy: [const { AtomicBool::new(false) }; HEADS],
+            last_snapshot <- new_spinlock!([const { None }; HEADS]),
+            last_flip <- new_spinlock!([const { None }; HEADS]),
             flips: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
             vblank <- new_spinlock!([const { None }; HEADS]),
             cmd_work <- new_work!("vino::kms_cmd"),
@@ -572,6 +692,7 @@ impl VinoDrmData {
             heads_present: core::sync::atomic::AtomicU32::new(0),
             gamma <- new_mutex!([None; HEADS]),
             strip_hashes <- new_mutex!([const { None }; HEADS]),
+            dirty_ttl <- new_mutex!([const { None }; HEADS]),
             cp_engaged: core::sync::atomic::AtomicBool::new(false),
             cp_timeline_exclusive: core::sync::atomic::AtomicBool::new(false),
             modeset_active: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
@@ -661,7 +782,9 @@ impl VinoDrmData {
         *self.cmd_queue.lock() = KVec::new();
         *self.pending_scanout.lock() = [const { None }; HEADS];
         *self.settle_repaint.lock() = [const { None }; HEADS];
+        *self.shadow.lock() = [const { None }; HEADS];
         *self.strip_hashes.lock() = [const { None }; HEADS];
+        *self.dirty_ttl.lock() = [const { None }; HEADS];
         // Cancel the queued drain and reclaim the `ARef<VinoDrmDevice>` the enqueue handed to
         // the workqueue, if it was still pending. Dropping it here releases the self-reference
         // that would otherwise keep this device alive until the work ran.
@@ -673,7 +796,9 @@ impl VinoDrmData {
         *self.cmd_queue.lock() = KVec::new();
         *self.pending_scanout.lock() = [const { None }; HEADS];
         *self.settle_repaint.lock() = [const { None }; HEADS];
+        *self.shadow.lock() = [const { None }; HEADS];
         *self.strip_hashes.lock() = [const { None }; HEADS];
+        *self.dirty_ttl.lock() = [const { None }; HEADS];
         *self.video_q.lock() = [const { None }; HEADS];
         *self.video_staging.lock() = [const { None }; HEADS];
         *self.cp_link.lock() = None;
@@ -706,6 +831,7 @@ impl VinoDrmData {
         };
         if changed {
             self.strip_hashes.lock()[head] = None;
+            self.dirty_ttl.lock()[head] = None;
             self.keyframe_pending
                 .fetch_or(1u32 << head, Ordering::Release);
         }
@@ -1263,6 +1389,7 @@ impl VinoDrmData {
             self.arm_prefix_pending.fetch_or(bit, Ordering::Release);
             self.keyframe_pending.fetch_or(bit, Ordering::Release);
             self.strip_hashes.lock()[head] = None;
+            self.dirty_ttl.lock()[head] = None;
             sent |= bit;
         }
 
@@ -1729,11 +1856,60 @@ impl VinoDrmData {
         if n == 1 || n.is_power_of_two() {
             pr_info!("vino: head {head} primary-plane flip #{n}\n");
         }
+        self.last_flip.lock()[head] = Some(Instant::<Monotonic>::now());
+
+        // ★ Take vino's private copy of the pixels HERE (2026-07-26), inside the atomic commit,
+        // while the compositor still owns this buffer and before `atomic_flush` completes the flip.
+        // Everything downstream then reads [`ShadowSurface`] instead of a buffer KWin is free to
+        // recycle -- see that type for the measured bug.
+        //
+        // Only on a commit that is actually due under the cadence limiter: the copy costs a full
+        // surface read, which is affordable at ~7 fps and is not at 120 Hz. A non-due flip is left
+        // framebuffer-backed exactly as before and is normally superseded by the next due commit;
+        // `SNAPSHOT_IDLE_MS` covers the case where the compositor stops flipping instead.
+        let owes_keyframe = self.keyframe_pending.load(Ordering::Acquire) & (1u32 << head) != 0;
+        let since_snapshot_ms = self.last_snapshot.lock()[head]
+            .map_or(i64::MAX, |t| t.elapsed().as_millis());
+        // Pace on the last SNAPSHOT, not the last send: `last_frame` stands still for the ~150 ms
+        // the worker spends encoding, so every commit in that window would read as due and copy the
+        // surface again. And never snapshot while the worker holds it -- it puts the original back
+        // when it finishes, so anything written in the meantime is discarded anyway.
+        if (owes_keyframe || since_snapshot_ms >= FRAME_PERIOD_MS)
+            && !self.shadow_busy[head].load(Ordering::Acquire)
+        {
+            let mut shadow = self.shadow.lock();
+            match snapshot_to_shadow(&mut shadow[head], &frame.fb, frame.w, frame.h) {
+                Ok(()) => {
+                    frame.from_shadow = true;
+                    self.last_snapshot.lock()[head] = Some(Instant::<Monotonic>::now());
+                }
+                Err(e) => {
+                    if n == 1 || n.is_power_of_two() {
+                        pr_info!(
+                            "vino: head {head} shadow snapshot failed ({e:?}); \
+                             falling back to the live framebuffer\n"
+                        );
+                    }
+                }
+            }
+        }
+
         let mut pending = self.pending_scanout.lock();
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
         if let Some(old) = pending[head].take() {
+            // Never let an un-snapshotted flip evict a snapshotted one. The compositor flips at
+            // refresh rate while snapshots are paced at `FRAME_PERIOD_MS`, so a replacement rule
+            // would destroy each coherent frame ~8 ms after it was taken and the worker would never
+            // see one: HW-observed as "drag quickly and the window does not paint at all, drag
+            // slowly and it does". Keeping `old` costs at most one cadence period of staleness,
+            // and this flip's pixels are picked up by the next snapshot.
+            if old.from_shadow && !frame.from_shadow {
+                pending[head] = Some(old);
+                let _ = workqueue::system().enqueue(ARef::from(dev));
+                return;
+            }
             if old.w != frame.w || old.h != frame.h || old.rotation != frame.rotation {
                 // Damage coordinates are not comparable across a geometry transform. A mode-set
                 // already owes a keyframe, but keep this conservative for a rotation-only commit.
@@ -1888,6 +2064,7 @@ impl WorkItem for VinoDrmData {
                                 data.arm_prefix_pending.fetch_or(bit, Ordering::Release);
                                 data.keyframe_pending.fetch_or(bit, Ordering::Release);
                                 data.strip_hashes.lock()[head_i] = None;
+                                data.dirty_ttl.lock()[head_i] = None;
                                 data.modeset_bracket_post_open(dev, head, mode_anchor);
                                 let prompt_started = prompt.as_ref().is_some_and(|frames| {
                                     match data.submit_prompt_training(
@@ -1991,6 +2168,19 @@ impl WorkItem for VinoDrmData {
                             data.keyframe_pending.load(Ordering::Acquire) & (1u32 << head) != 0;
                         let elapsed_ms = data.last_frame.lock()[head]
                             .map_or(FRAME_PERIOD_MS, |t| t.elapsed().as_millis());
+                        // A framebuffer-backed frame may only be read once the compositor has gone
+                        // quiet; while it is actively rendering, encoding from its live buffer is
+                        // precisely the drag-artifacting bug (see `ShadowSurface`). Busy heads
+                        // always get a snapshot on their next due commit, so waiting costs at most
+                        // one frame period.
+                        let coherent = pending[head].as_ref().is_some_and(|f| f.from_shadow);
+                        let quiet_ms = data.last_flip.lock()[head]
+                            .map_or(i64::MAX, |t| t.elapsed().as_millis());
+                        if !coherent && quiet_ms < SNAPSHOT_IDLE_MS {
+                            let remaining = (SNAPSHOT_IDLE_MS - quiet_ms).max(1);
+                            wait_ms = Some(wait_ms.map_or(remaining, |old| old.min(remaining)));
+                            continue;
+                        }
                         if owes_keyframe || elapsed_ms >= FRAME_PERIOD_MS {
                             selected = pending[head].take();
                             // A busy compositor continuously replaces `settle_repaint` via
@@ -2511,8 +2701,11 @@ impl crtc::DriverCrtc for VinoCrtc {
         // retry its old mode and paint after DPMS-off.
         data.pending_scanout.lock()[head as usize] = None;
         data.settle_repaint.lock()[head as usize] = None;
+        // Release the ~14.7 MB private copy; a re-enable owes a keyframe and re-snapshots.
+        data.shadow.lock()[head as usize] = None;
         data.sustain_until.lock()[head as usize] = None;
         data.strip_hashes.lock()[head as usize] = None;
+        data.dirty_ttl.lock()[head as usize] = None;
         pr_info!("vino: KMS CRTC disable -- head {head} display OFF (scanout stopped)\n");
     }
 
@@ -2814,6 +3007,8 @@ impl plane::DriverPlane for VinoPlane {
                 nclips,
                 w,
                 h,
+                // `queue_scanout` decides whether this commit is due for a snapshot.
+                from_shadow: false,
             },
         );
     }
@@ -2846,16 +3041,59 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
     // streams full frames continuously at ~7 fps. Re-arm unconditionally so this experiment
     // actually reproduces that.
     let settle_copy = (was_keyframe || TEST_FORCE_FULL_FRAMES).then(|| frame.clone());
-    match scanout_one(
-        dev,
-        data,
-        frame.head,
-        &frame.fb,
-        frame.rotation,
-        &frame.clips[..frame.nclips],
-        frame.w,
-        frame.h,
-    ) {
+    // Encode from vino's private copy when the commit path took one. The surface is moved out of
+    // its slot for the duration so the multi-hundred-millisecond encode never holds the lock
+    // against an atomic commit, then returned for the next snapshot to reuse the allocation.
+    let result = if frame.from_shadow {
+        data.shadow_busy[head_i].store(true, Ordering::Release);
+        let taken = data.shadow.lock()[head_i].take();
+        match taken {
+            Some(shadow) if shadow.w == frame.w && shadow.h == frame.h => {
+                // Make the fix observable: a head whose frames are all coherent reports a snapshot
+                // count that keeps pace with its frame count. A head silently falling back to the
+                // live framebuffer would stop advancing here.
+                let ns = SHADOW_FRAMES[head_i].fetch_add(1, Relaxed) + 1;
+                if ns == 1 || ns % 64 == 0 {
+                    pr_info!("vino: head {head_i} encoded {ns} frame(s) from the shadow copy\n");
+                }
+                let r = encode_and_send(
+                    dev,
+                    data,
+                    frame.head,
+                    shadow.pixels.as_ptr(),
+                    shadow.w * 4,
+                    frame.rotation,
+                    &frame.clips[..frame.nclips],
+                    frame.w,
+                    frame.h,
+                );
+                data.shadow.lock()[head_i] = Some(shadow);
+                data.shadow_busy[head_i].store(false, Ordering::Release);
+                r
+            }
+            // Geometry moved under us, or the slot was empty. Drop the frame rather than fall back
+            // to the live framebuffer: a mode change already owes a keyframe, and the next commit
+            // takes a correctly sized snapshot.
+            other => {
+                data.shadow.lock()[head_i] = other.filter(|s| s.w == frame.w && s.h == frame.h);
+                data.shadow_busy[head_i].store(false, Ordering::Release);
+                scanout_gate(frame.head, 8, "worker: shadow snapshot missing or wrong geometry");
+                return;
+            }
+        }
+    } else {
+        scanout_one(
+            dev,
+            data,
+            frame.head,
+            &frame.fb,
+            frame.rotation,
+            &frame.clips[..frame.nclips],
+            frame.w,
+            frame.h,
+        )
+    };
+    match result {
         Ok(()) => {
             let n = data.scanout_fails.swap(0, Relaxed);
             data.scanout_skip.store(0, Relaxed);
@@ -3040,6 +3278,109 @@ fn framebuffer_strip_hashes(
     Ok(hashes)
 }
 
+/// Per-head frame counter for the phase-timing log in [`encode_and_send_wht`].
+static PHASE_N: [core::sync::atomic::AtomicU64; HEADS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; HEADS];
+
+/// Per-head count of frames encoded from a [`ShadowSurface`] rather than the compositor's buffer.
+static SHADOW_FRAMES: [core::sync::atomic::AtomicU64; HEADS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; HEADS];
+
+/// Per-head [`TEST_DETECT_BUFFER_RECYCLE`] tallies: frames checked, frames whose content moved
+/// under the encoder, and the total number of strips that differed.
+static RECYCLE_CHECKED: [core::sync::atomic::AtomicU64; HEADS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; HEADS];
+static RECYCLE_DIRTY_FRAMES: [core::sync::atomic::AtomicU64; HEADS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; HEADS];
+static RECYCLE_DIRTY_STRIPS: [core::sync::atomic::AtomicU64; HEADS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; HEADS];
+
+/// Re-hash the source framebuffer after encoding and report how many strips changed since the pass
+/// that selected this frame's damage. See [`TEST_DETECT_BUFFER_RECYCLE`] for what a non-zero result
+/// proves. Never fails the frame: a diagnostic must not be able to break scanout, so an allocation
+/// failure or a geometry mismatch is simply skipped.
+#[inline(never)]
+fn recheck_buffer_stability(
+    head: u8,
+    vaddr: *const u8,
+    pitch: usize,
+    w: usize,
+    h: usize,
+    w_pad: usize,
+    h_pad: usize,
+    before: &[u64],
+) {
+    let Ok(after) = framebuffer_strip_hashes(vaddr, pitch, w, h, w_pad, h_pad) else {
+        return;
+    };
+    if after.len() != before.len() {
+        return;
+    }
+    let dirty = before
+        .iter()
+        .zip(after.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    let head_i = head as usize;
+    let n = RECYCLE_CHECKED[head_i].fetch_add(1, Ordering::Relaxed) + 1;
+    if dirty > 0 {
+        RECYCLE_DIRTY_FRAMES[head_i].fetch_add(1, Ordering::Relaxed);
+        RECYCLE_DIRTY_STRIPS[head_i].fetch_add(dirty as u64, Ordering::Relaxed);
+    }
+    // The first few frames unconditionally, then a periodic summary: enough to see the effect
+    // start without flooding dmesg over a multi-minute drag probe.
+    if n <= 8 || n % 32 == 0 {
+        pr_info!(
+            "vino: recycle-check head={head} frame={n} dirty={dirty}/{} strips (cumulative: {} dirty frames, {} dirty strips)\n",
+            before.len(),
+            RECYCLE_DIRTY_FRAMES[head_i].load(Ordering::Relaxed),
+            RECYCLE_DIRTY_STRIPS[head_i].load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// Copy a committed framebuffer into this head's [`ShadowSurface`], reusing the existing allocation
+/// whenever the geometry is unchanged.
+///
+/// Runs in the atomic commit path, so it is deliberately a straight row-by-row copy with no
+/// per-pixel work: everything else (hashing, damage selection, rotation, gamma, the codec) stays in
+/// the worker and now reads this private surface instead of the compositor's live buffer. Copying
+/// the whole surface rather than only the changed strips keeps the shadow trivially coherent --
+/// there is no second hash bookkeeping that could drift out of step with what was actually sent.
+#[inline(never)]
+fn snapshot_to_shadow(
+    slot: &mut Option<ShadowSurface>,
+    fb: &kms::framebuffer::Framebuffer<VinoDrmDriver>,
+    w: usize,
+    h: usize,
+) -> Result {
+    if w == 0 || h == 0 {
+        return Err(EINVAL);
+    }
+    let row = w.checked_mul(4).ok_or(EINVAL)?;
+    let need = row.checked_mul(h).ok_or(EINVAL)?;
+    // Map the compositor's pages; the guard unmaps on drop, including on the early returns below.
+    let vmap = fb.vmap::<VinoObject>()?;
+    // GEM dumb buffers pad the pitch, so the source stride is not necessarily `w * 4`.
+    let pitch = vmap.pitch();
+    let view = vmap.view();
+    let src = view.as_ptr().cast::<u8>();
+
+    if !matches!(slot, Some(s) if s.w == w && s.h == h) {
+        let mut pixels: KVVec<u8> = KVVec::new();
+        pixels.resize(need, 0, GFP_KERNEL)?;
+        *slot = Some(ShadowSurface { w, h, pixels });
+    }
+    let shadow = slot.as_mut().ok_or(kernel::error::code::ENOMEM)?;
+    for y in 0..h {
+        // SAFETY: `y < h` and the XRGB8888 pitch covers every visible pixel of the validated
+        // mapping, so this row lies inside the mapped framebuffer (`pitch * h` bytes).
+        let s = unsafe { core::slice::from_raw_parts(src.add(y * pitch), row) };
+        shadow.pixels[y * row..y * row + row].copy_from_slice(s);
+    }
+    Ok(())
+}
+
 /// Convert changed strip hashes into a compact set of already tile-aligned damage rectangles.
 /// Horizontal runs are joined, then equal runs on adjacent bands are extended vertically. A very
 /// fragmented frame falls back to one full-output rectangle rather than growing an unbounded
@@ -3177,6 +3518,7 @@ fn encode_and_send_wht(
                     data.keyframe_pending
                         .fetch_or(1u32 << head, core::sync::atomic::Ordering::Release);
                     data.strip_hashes.lock()[head_i] = None;
+                    data.dirty_ttl.lock()[head_i] = None;
                     data.modeset_bracket_post_open(dev, head, mode_anchor);
                     let prompt_started = prompt.as_ref().is_some_and(|frames| {
                         match data.submit_prompt_training(
@@ -3258,6 +3600,7 @@ fn encode_and_send_wht(
     // shown). See `docs/VIDEO-TODO.md`.
     let w_pad = (w + super::video::wht::STRIP_W - 1) & !(super::video::wht::STRIP_W - 1);
     let h_pad = (h + super::video::wht::STRIP_H - 1) & !(super::video::wht::STRIP_H - 1);
+    let t_start = Instant::<Monotonic>::now();
     let mut content_hashes: Option<KVVec<u64>> = None;
     let mut content_damage: KVec<DamageRect> = KVec::new();
     if identity {
@@ -3266,7 +3609,29 @@ fn encode_and_send_wht(
             let previous = data.strip_hashes.lock();
             if let Some(state) = &previous[head_i] {
                 if state.w_pad == w_pad && state.h_pad == h_pad {
-                    content_damage = changed_strip_rects(&state.hashes, &hashes, w_pad, h_pad)?;
+                    // Charge every strip whose content moved with a fresh debt, then select every
+                    // strip that still owes a transmission -- including ones that changed on an
+                    // earlier frame and have not yet reached both dock buffers. See `dirty_ttl`.
+                    let mut ttl = data.dirty_ttl.lock();
+                    if !ttl[head_i].as_ref().is_some_and(|t| t.len() == hashes.len()) {
+                        let mut fresh: KVVec<u8> = KVVec::new();
+                        fresh.resize(hashes.len(), 0, GFP_KERNEL)?;
+                        ttl[head_i] = Some(fresh);
+                    }
+                    let debt = ttl[head_i].as_mut().ok_or(kernel::error::code::ENOMEM)?;
+                    for i in 0..hashes.len() {
+                        if state.hashes[i] != hashes[i] {
+                            debt[i] = DAMAGE_REPEATS;
+                        }
+                    }
+                    // Reuse the hash differ: mark an owed strip by handing it a baseline value that
+                    // cannot match, and an unowed one its own value.
+                    let mut baseline: KVVec<u64> = KVVec::new();
+                    baseline.resize(hashes.len(), 0, GFP_KERNEL)?;
+                    for i in 0..hashes.len() {
+                        baseline[i] = if debt[i] > 0 { !hashes[i] } else { hashes[i] };
+                    }
+                    content_damage = changed_strip_rects(&baseline, &hashes, w_pad, h_pad)?;
                 } else {
                     full = true;
                 }
@@ -3276,6 +3641,7 @@ fn encode_and_send_wht(
         }
         content_hashes = Some(hashes);
     }
+    let t_hashed = Instant::<Monotonic>::now();
     if !full && content_damage.is_empty() {
         scanout_gate(head, 3, "no keyframe owed and no strip content changed");
         return Ok(());
@@ -3306,6 +3672,14 @@ fn encode_and_send_wht(
     } else {
         super::video::wht::colour_frame_ep08_damage(w_pad, h_pad, seq0, head, &content_damage, px)?
     };
+    let t_encoded = Instant::<Monotonic>::now();
+    // Did the source move while `px` was sampling it? See `TEST_DETECT_BUFFER_RECYCLE`.
+    if TEST_DETECT_BUFFER_RECYCLE {
+        if let Some(before) = content_hashes.as_ref() {
+            recheck_buffer_stability(head, vaddr, pitch, w, h, w_pad, h_pad, before);
+        }
+    }
+    let t_checked = Instant::<Monotonic>::now();
     // A damage delta that touched no aligned strip = nothing to send this flip: skip the write
     // (no seq advance, no arm, keyframe obligation untouched). Full frames always have strips.
     if frames.is_empty() {
@@ -3409,7 +3783,14 @@ fn encode_and_send_wht(
     let repeat_count = if training {
         COLD_TRAINING_PRESENTATIONS
     } else if full {
-        1
+        // A full keyframe must reach BOTH dock buffers, for exactly the reason a delta must
+        // (2026-07-26). Sent once, it lands in one buffer only; the other keeps whatever it held,
+        // and subsequent deltas -- which are correctly sent twice -- only ever repair the regions
+        // they touch. Everything else stays stale in that second buffer forever, and scanout
+        // alternating between the two shows it as content left behind after a window moves away.
+        // The keyframe is the one frame that resynchronises both buffers, so it cannot be the one
+        // frame that is presented once.
+        2
     } else {
         2
     };
@@ -3583,11 +3964,48 @@ fn encode_and_send_wht(
         // reaps the old completion when a slot is reused, so transport errors still surface after
         // the ring wraps without introducing a per-frame pipeline bubble.
     }
+    // ★ Where does a frame's time actually go? The scanout cadence sits at 150-180 ms per frame,
+    // and the cause was never measured -- raising the cadence limiter alone changed nothing. Break
+    // it into the four real phases so the expensive one is a fact rather than a suspicion. The
+    // codec runs scalar (kernel code cannot touch SIMD registers without `kernel_fpu_begin()`), so
+    // `encode` carrying the bulk would point at the transform; `hash` carrying it would point at
+    // the full-surface rescan that ignores FB_DAMAGE_CLIPS.
+    {
+        let n = PHASE_N[head_i].fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n % 32 == 0 {
+            pr_info!(
+                "vino: phase head={head} n={n} hash={}us encode={}us recheck={}us wire={}us \
+                 total={}us full={} bytes={} x{}\n",
+                (t_hashed - t_start).as_micros_ceil(),
+                (t_encoded - t_hashed).as_micros_ceil(),
+                (t_checked - t_encoded).as_micros_ceil(),
+                (Instant::<Monotonic>::now() - t_checked).as_micros_ceil(),
+                (Instant::<Monotonic>::now() - t_start).as_micros_ceil(),
+                full,
+                image_len,
+                repeat_count
+            );
+        }
+    }
     // Publish the new codec sequence only after every URB for this frame was submitted. A stale
     // generation or transport failure above leaves the old sequence intact for the next keyframe.
     data.scanout_seq.lock()[head_i] = next_seq.wrapping_add(repeat_count - 1);
     // The USB path accepted the complete image. Publish its content shadow only now; every early
     // return and transport error above deliberately leaves the previous dock-visible state intact.
+    // The frame reached the dock, so every strip it carried has paid one transmission. A full
+    // keyframe is presented twice and rewrites the whole surface, so it clears the ledger outright.
+    {
+        let mut ttl = data.dirty_ttl.lock();
+        if let Some(debt) = ttl[head_i].as_mut() {
+            if full {
+                debt.fill(0);
+            } else {
+                for d in debt.iter_mut() {
+                    *d = d.saturating_sub(1);
+                }
+            }
+        }
+    }
     data.strip_hashes.lock()[head_i] = content_hashes.map(|hashes| StripHashState {
         w_pad,
         h_pad,

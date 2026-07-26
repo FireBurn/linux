@@ -1347,6 +1347,9 @@ pub(crate) mod wht {
         frame_records(&strips, head)
     }
 
+    /// Call counter for the per-strip encode breakdown logged by the damage encoder.
+    static ENCODE_LOG_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
     /// Damage-aware variant of [`colour_frame_ep08`]: encodes **only** the 64x16 strips that
     /// intersect a client damage rectangle, producing a *partial* frame (the dock updates the tiles
     /// it receives at their self-encoded positions and keeps the rest -- how DLM does partial
@@ -1375,6 +1378,7 @@ pub(crate) mod wht {
             return Err(kernel::error::code::EINVAL);
         }
         let mut strips: KVec<KVec<u8>> = KVec::new();
+        let (mut blocks_us, mut packs_us, mut nstrips) = (0i64, 0i64, 0usize);
         let mut sy = 0usize;
         while sy < height {
             let mut sx = 0usize;
@@ -1389,14 +1393,33 @@ pub(crate) mod wht {
                     mx < x1 && x0 < mx + MACRO_W && my < y1 && y0 < my + MACRO_H
                 });
                 if hit {
+                    let t0 = Instant::<Monotonic>::now();
                     let blocks = colour_strip_blocks(sx, sy, &mut px)?;
+                    let t1 = Instant::<Monotonic>::now();
                     strips.push(colour_strip(&blocks, sx as u16, sy as u16)?, GFP_KERNEL)?;
+                    let t2 = Instant::<Monotonic>::now();
+                    blocks_us += (t1 - t0).as_micros_ceil();
+                    packs_us += (t2 - t1).as_micros_ceil();
+                    nstrips += 1;
                 }
                 sx += STRIP_W;
             }
             sy += STRIP_H;
         }
-        Ok((frame_records(&strips, head)?, seq0.wrapping_add(1)))
+        let t3 = Instant::<Monotonic>::now();
+        let records = frame_records(&strips, head)?;
+        // ★ Is the encode cost in the per-strip work (which parallelises across CPUs, since strips
+        // are independent) or in the serial framing? This split is what decides whether threading
+        // is the right lever -- see the phase log in `drm_sink.rs`.
+        let n = ENCODE_LOG_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 2 || n % 32 == 0 {
+            pr_info!(
+                "vino: encode strips={nstrips} blocks(transform+quant)={blocks_us}us \
+                 pack(vlc)={packs_us}us records={}us\n",
+                (Instant::<Monotonic>::now() - t3).as_micros_ceil()
+            );
+        }
+        Ok((records, seq0.wrapping_add(1)))
     }
 
     /// A strip's `y` (the EP08 record bands group strips by row). Reads the `y` field the strip
