@@ -199,17 +199,35 @@ fn random_tail_msg(id: u16, sub: u16, counter: u16) -> Result<KVec<u8>> {
 /// DLM sends this TWICE (ictr 48, 49), back-to-back, right after the SECOND placeholder fetch
 /// and immediately before it starts the long [`device_query_req`]`(.., 0x000c)` status-poll run
 /// that precedes the real EDID becoming available -- a message class vino never sent before this.
-/// Same 32-byte shape as [`get_edid_req`] (host-random tail); the dock's reply is a plain generic
-/// ack (`id=0x14 sub=0x0023`, no payload), so like the tail bytes, the dock's ack does not depend
-/// on content -- what matters is that the message is sent at all, at this point in the sequence.
+/// Same 32-byte shape as [`get_edid_req`] (host-random tail), but the head selector is TWO bytes,
+/// not one -- see below. The dock's CP reply is a plain generic ack (`id=0x14 sub=0x0023`, no
+/// payload) whether or not the message is well-formed, which is exactly why the malformed version
+/// survived so long: the ack says nothing.
+///
+/// **byte23 corrected 2026-07-26.** The dock's own firmware trace (`scripts/dock-trace-live.py`)
+/// shows this message's handler as `388cf`, and DLM's cold plug continues
+/// `388cf / 27525 <h> <h> / 2a887 <h> <h> / 3a7b3 <h> 0 0` -- the downstream sink enable. vino got
+/// `388cf / 30c5a <byte23>` instead: a bad-parameter reject that echoes the offending byte. vino
+/// filled byte23 with the random tail, so the dock never enabled the downstream sink, its
+/// `2bf21 <h>` state machine ran 0 -> 2 -> **4** instead of 0 -> 2 -> **3**, and `2807a` (hence the
+/// pixel clock `2990d`) never fired on a link vino had to train itself. A warm handback from a lit
+/// DLM hid the bug: DLM had already run the successful engage.
+///
+/// DLM cold capture, the only two `id=0x16 sub=0x23` messages in the session:
+/// ```text
+/// head 0: ...  off22 = 00  off23 = 00   then dock: 275250 0 0 / 2a8870 0 0
+/// head 1: ...  off22 = 01  off23 = 01   then dock: 275251 1 1 / 2a8871 1 1
+/// ```
+/// The dock echoes both bytes as the two arguments of `27525`/`2a887`, so both are the head.
 pub(super) fn edid_engage_req(counter: u16, head: u8) -> Result<KVec<u8>> {
-    // byte22 = head selector (same 0/1 flag as the id=0x15 probe/fetch -- DLM alternates it 0,1 to
-    // engage each head's downstream DDC read); byte23.. host-random.
+    // byte22 AND byte23 = head selector (the dock reads both; a random byte23 is rejected with
+    // `30c5a <byte23>` and the downstream sink is never enabled); byte24.. host-random.
     let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
     header(&mut b, 0x16, 0x0023, counter)?;
     pad_to(&mut b, 22)?;
     b.push(head, GFP_KERNEL)?;
-    let mut tail = [0u8; 9];
+    b.push(head, GFP_KERNEL)?;
+    let mut tail = [0u8; 8];
     rng::fill(&mut tail);
     b.extend_from_slice(&tail, GFP_KERNEL)?;
     Ok(b)
@@ -218,8 +236,14 @@ pub(super) fn edid_engage_req(counter: u16, head: u8) -> Result<KVec<u8>> {
 /// decrypted COLD capture (`captures/edid-cold-decrypt-20260719/`) rather than the warm ones --
 /// this type does not occur in either warm capture at all, which is why every previous comparison
 /// missed it. DLM sends it TWICE, late in the cold sequence (block-seq 1289 and 1293, after the
-/// real `id=0x194` EDID has arrived), with an index at off23 that runs 1 then 2 (read as
-/// `head + 1`, matching every other per-head selector's shape) and an 8-byte host-random tail.
+/// real `id=0x194` EDID has arrived), with an index that runs 1 then 2 (read as `head + 1`,
+/// matching every other per-head selector's shape) and a host-random tail.
+///
+/// **Offset corrected 2026-07-26:** the index sits at **off22**, the same slot every other per-head
+/// selector uses -- not off23. The original reading came from a hand-counted hex dump; re-derived
+/// from `captures/dlm-coldplug-withmon-160457` with a decoder, DLM's two messages are
+/// `..off22=01, off23=d9(random)..` and `..off22=02, off23=2d(random)..`. vino was sending
+/// `off22=00, off23=head+1`, i.e. the index one byte late and a zero where the selector belongs.
 ///
 /// The dock's reply is a structured `id=0x1c sub=0x53` carrying `07 10 10 00 01 00 01 00` at
 /// off24 in both cases -- a fixed capability/word block, not an echo, so this is a real query
@@ -227,9 +251,9 @@ pub(super) fn edid_engage_req(counter: u16, head: u8) -> Result<KVec<u8>> {
 pub(super) fn post_edid_query(counter: u16, head: u8) -> Result<KVec<u8>> {
     let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
     header(&mut b, 0x15, 0x0053, counter)?;
-    pad_to(&mut b, 23)?;
-    b.push(head + 1, GFP_KERNEL)?; // off23: 1-based call/head index (DLM: 1 then 2)
-    let mut tail = [0u8; 8];
+    pad_to(&mut b, 22)?;
+    b.push(head + 1, GFP_KERNEL)?; // off22: 1-based call/head index (DLM: 1 then 2)
+    let mut tail = [0u8; 9];
     rng::fill(&mut tail);
     b.extend_from_slice(&tail, GFP_KERNEL)?;
     Ok(b)
