@@ -941,8 +941,14 @@ impl WorkItem for BringUp {
                             data.set_connected(drm_dev, h);
                             dev_info!(
                                 cdev,
-                                "vino: head {h} monitor CONNECTED at runtime -- readiness wait + hotplug\n"
+                                "vino: head {h} monitor CONNECTED at runtime -- re-engage + readiness wait + hotplug\n"
                             );
+                            // Re-enable the dock's downstream sink for this head before anything
+                            // else. The monitor's removal tore down the sink state that the EDID
+                            // engage (`id=0x16 sub=0x23`) establishes, and without re-running it the
+                            // dock accepts the replug's mode-set and every video byte while leaving
+                            // the panel dark -- see `VinoDrmData::reengage_head`.
+                            data.reengage_head(dev, h as u8);
                             // Same downstream readiness wait as a fresh bring-up before notifying
                             // userspace, so KWin's mode-set lands on a settled downstream link.
                             let rs = Instant::<Monotonic>::now();

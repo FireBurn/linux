@@ -1569,6 +1569,36 @@ impl VinoDrmData {
         }
     }
 
+    /// Re-run head `head`'s EDID probe/fetch/**engage** sequence on the live CP link.
+    ///
+    /// **Why a runtime monitor replug needs this (2026-07-26).** The dock enables a head's
+    /// downstream sink from the EDID *engage* (`id=0x16 sub=0x23`); its firmware trace answers that
+    /// message with `27525 <h> <h>` / `2a887 <h> <h>`, and only after that does it reach `2807a` and
+    /// start the pixel clock `2990d`. Unplugging the monitor tears that sink state down. vino used to
+    /// handle the replug by setting the presence bit, polling readiness and firing a hotplug event --
+    /// KWin then re-enabled the CRTC and vino re-sent the mode-set and video, all of which the dock
+    /// accepted while leaving the panel dark, because nothing had re-enabled its sink. A *dock*
+    /// replug recovered only because full bring-up re-runs the engage.
+    ///
+    /// So repeat bring-up's per-head sequence -- probe, kick, fetch, engage, post-EDID query -- at
+    /// bring-up's measured spacing. Every message is fire-and-forget: the dock's CP reply to each is
+    /// a contentless generic ack, so there is nothing to wait for here (that property is exactly what
+    /// hid the off23 bug for a month). Errors are ignored; a dropped message just leaves the head
+    /// dark as before, and the next presence cycle tries again.
+    pub(super) fn reengage_head(&self, dev: &BoundInterface<'_>, head: u8) {
+        let step = |id: u16, build: &dyn Fn(u16) -> Result<KVec<u8>>, gap_ms: i64| {
+            let _ = self.send_cp(dev, id, 0, |ctr| build(ctr));
+            fsleep(Delta::from_millis(gap_ms));
+        };
+        step(0x15, &|c| super::cp::get_edid_req_sub(c, 0x0020, head), 117);
+        step(0x15, &|c| super::cp::get_edid_req_sub(c, 0x0020, head), 115);
+        step(0x16, &|c| super::cp::edid_readiness_kick(c, head), 107);
+        step(0x15, &|c| super::cp::get_edid_req(c, head), 11);
+        step(0x16, &|c| super::cp::edid_engage_req(c, head), 118);
+        step(0x16, &|c| super::cp::edid_engage_req(c, head), 107);
+        step(0x15, &|c| super::cp::post_edid_query(c, head), 11);
+    }
+
     /// Stage 2 (runtime monitor hotplug): probe whether head `head` currently has a monitor.
     ///
     /// Sends the per-head EDID probe (`id=0x15 sub=0x20`, byte22 = head selector -- the same
