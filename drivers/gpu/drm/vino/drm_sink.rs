@@ -175,6 +175,60 @@ const PROMPT_CLOSE_2E_MS: i64 = 125;
 const PROMPT_KEEPALIVE_QUIESCE_MS: i64 = 40;
 const PROMPT_TRAINING_OPEN_MS: i64 = 0;
 const PROMPT_TRAINING_TAIL_MS: i64 = 400;
+/// Absolute millisecond offsets from the **head-0** mode-set for the dual-head cold wake, decoded
+/// from `captures/dlm-coldplug-withmon-160457` — the only capture in the corpus that provably
+/// lights *both* panels of this dock from a physical cold plug.
+///
+/// Every earlier paced attempt used `dlm-hotplug-sequence-20260725-143903`, a **one-monitor**
+/// lifecycle capture whose whole activation fits in 125 ms. The two references disagree by an
+/// order of magnitude, and only this one covers the case we are trying to fix. Decoded with
+/// `scripts/analyze-mon-cp.py --around dlm-started --full`; the offsets below are that listing
+/// verbatim, relative to `+1.822 OUT 0x48/0x22 MODESET`.
+///
+/// Two properties of this schedule had never been reproduced:
+///
+///  * **EP02 goes completely silent from +29 ms to +1016 ms** — not even a status poll. vino has
+///    always polled at ~66/s without interruption, so the dock has never seen this window.
+///  * **DLM re-probes and re-fetches head 1's EDID in the middle of the bracket** (+1033/+1059).
+///    The dock's firmware trace answers those with `2fab9`/`3e54c`/`30297`, three events that
+///    appear in the lit trace and in no vino trace, immediately before it programs the clock.
+mod cold {
+    pub(super) const H1_MODE: i64 = 29;
+    /// End of the silent window. Nothing may be sent on EP02 between `H1_MODE` and here.
+    pub(super) const QUIET_END: i64 = 1016;
+    pub(super) const H0_VIDEO: i64 = 1159;
+    pub(super) const H1_VIDEO: i64 = 1233;
+    /// `(offset_ms, head, sub, state)` stream markers. `sub` 0x2f/0x2e as on the wire.
+    pub(super) const MARKERS: &[(i64, u8, u16, u8)] = &[
+        (17, 0, 0x2f, 1),
+        (21, 0, 0x2e, 3),
+        (1016, 0, 0x2f, 1),
+        (1021, 1, 0x2f, 1),
+        (1023, 0, 0x2e, 3),
+        (1029, 1, 0x2e, 3),
+        (1056, 0, 0x2f, 1),
+        (1057, 1, 0x2f, 1),
+        (1064, 0, 0x2e, 0),
+        (1124, 1, 0x2e, 3),
+        (1132, 1, 0x2f, 1),
+        (1135, 1, 0x2e, 0),
+        (1195, 0, 0x2f, 0),
+        (1208, 0, 0x2e, 0),
+        (1220, 1, 0x2f, 1),
+        (1225, 1, 0x2e, 0),
+        (1295, 1, 0x2f, 0),
+        (1298, 1, 0x2e, 0),
+    ];
+    /// `id=0x14 sub=0x0c` status polls.
+    pub(super) const POLLS: &[i64] = &[5, 26, 1019, 1130, 1192, 1204, 1222, 1235, 1253, 1270, 1287, 1304];
+    /// `(offset_ms, head, is_fetch)` — `false` is the `0x15/0x20` probe, `true` the `0x15/0x21`
+    /// fetch.
+    pub(super) const EDID: &[(i64, u8, bool)] = &[(1033, 1, false), (1059, 1, true)];
+    /// Keep both carriers alternating for this long after the last close marker. DLM's trace
+    /// programs the head-0 clock 377 ms after its first video bytes and head 1's 589 ms after
+    /// its own, so the stream must outlive the bracket by a comfortable margin.
+    pub(super) const CARRIER_TAIL_MS: i64 = 800;
+}
 /// Number of back-to-back presentations of one already-encoded full frame while a newly-mode-set
 /// downstream is training.
 ///
@@ -1025,6 +1079,13 @@ impl VinoDrmData {
     /// to run a complete mode/marker/440-ms-carrier transaction for head 0 before sending head 1's
     /// mode-set; the measured gap was 595 ms and the same dock remained dark until DLM took over.
     ///
+    /// The schedule is now a literal replay of the cold capture's decoded timeline (see the
+    /// [`cold`] module). Batching the two heads was necessary but not sufficient: the batched
+    /// build compressed DLM's 1.3-second choreography into 27 ms and the dock's firmware trace
+    /// still took the idle branch. The dock is given the same event *ordering* it always was —
+    /// what changes here is that it also gets DLM's silent window and its mid-bracket EDID
+    /// re-read.
+    ///
     /// This is deliberately only the *dual wake* path. A single-head hotplug or an already-live
     /// mode change keeps using the per-head, absolute timeline below, which was derived from the
     /// detailed one-monitor lifecycle capture.
@@ -1077,12 +1138,65 @@ impl VinoDrmData {
             return;
         }
 
+        // One clock for the whole transaction. Every event below is scheduled against this
+        // anchor, so a slow send makes the next event catch up instead of pushing the rest of the
+        // schedule out -- the failure mode that invalidated the first paced hardware A/B.
         self.begin_cp_timeline();
+        let anchor = Instant::<Monotonic>::now();
         let mut sent = 0u32;
+        let mut started = 0u32;
 
-        // Prime each head exactly where DLM does: mode, status, first (1,3) stream pair, status;
-        // only then move to the next head. This keeps the modes close together while still
-        // preserving the marker pair seen between DLM's two mode-sets.
+        // Two cursors walk the sorted schedules; `run_cp_until` drains everything due at or
+        // before a given offset. That keeps markers, polls and EDID reads correctly interleaved
+        // without writing the merge out by hand.
+        let mut mi = 0usize;
+        let mut pi = 0usize;
+        let mut ei = 0usize;
+
+        macro_rules! cp_until {
+            ($limit:expr) => {{
+                let limit: i64 = $limit;
+                loop {
+                    let nm = cold::MARKERS.get(mi).map(|m| m.0);
+                    let np = cold::POLLS.get(pi).copied();
+                    let ne = cold::EDID.get(ei).map(|e| e.0);
+                    let next = [nm, np, ne]
+                        .into_iter()
+                        .flatten()
+                        .filter(|&o| o <= limit)
+                        .min();
+                    let Some(off) = next else { break };
+                    Self::wait_mode_offset(anchor, off);
+                    if nm == Some(off) {
+                        let (_, head, sub, state) = cold::MARKERS[mi];
+                        if sent & (1u32 << head) != 0 {
+                            self.stream_marker(dev, head, sub, state);
+                        }
+                        mi += 1;
+                    } else if np == Some(off) {
+                        self.poll_status(dev);
+                        pi += 1;
+                    } else {
+                        let (_, head, fetch) = cold::EDID[ei];
+                        // Re-read the sink's EDID exactly where DLM does. The reply is
+                        // deliberately discarded: this is the dock-side DDC transaction the lit
+                        // trace answers with `2fab9`/`3e54c`/`30297`, not a source of new modes,
+                        // and re-parsing it here would risk a hotplug in the middle of a
+                        // mode-set.
+                        let _ = self.send_cp(dev, 0x15, 0, |ctr| {
+                            if fetch {
+                                super::cp::get_edid_req(ctr, head)
+                            } else {
+                                super::cp::get_edid_req_sub(ctr, 0x0020, head)
+                            }
+                        });
+                        ei += 1;
+                    }
+                }
+            }};
+        }
+
+        // Both mode-sets go out first, 29 ms apart, before any video.
         for head in 0..HEADS {
             let bit = 1u32 << head;
             if valid & bit == 0 {
@@ -1091,6 +1205,10 @@ impl VinoDrmData {
             let Some(timing) = timings[head] else {
                 continue;
             };
+            if head == 1 {
+                cp_until!(cold::H1_MODE - 1);
+                Self::wait_mode_offset(anchor, cold::H1_MODE);
+            }
             let mode_ok = self
                 .send_cp(dev, 0x48, 0, |ctr| {
                     super::cp::set_mode(ctr, head as u8, &timing)
@@ -1106,41 +1224,26 @@ impl VinoDrmData {
             self.keyframe_pending.fetch_or(bit, Ordering::Release);
             self.strip_hashes.lock()[head] = None;
             sent |= bit;
-
-            self.poll_status(dev);
-            self.stream_marker(dev, head as u8, 0x2f, 1);
-            self.stream_marker(dev, head as u8, 0x2e, 3);
-            self.poll_status(dev);
         }
 
-        // The remaining wake bracket is dock-wide and interleaved by marker position. DLM's
-        // decrypted cold wake contains a second (1,3), two (1,0) pairs, then (0,0), with video
-        // beginning before the final close. Emitting one marker position for every live head
-        // avoids serialising a whole head behind the other.
-        for &(sub, state) in &[
-            (0x2f, 1),
-            (0x2e, 3),
-            (0x2f, 1),
-            (0x2e, 0),
-            (0x2f, 1),
-            (0x2e, 0),
-        ] {
-            for head in 0..HEADS {
-                if sent & (1u32 << head) != 0 {
-                    self.stream_marker(dev, head as u8, sub, state);
-                }
-            }
-        }
-        self.poll_status(dev);
+        // *** The silent window. *** Nothing goes out on EP02 between the head-1 mode-set and
+        // +1016 ms. The background keepalive is already excluded, and this loop simply has no
+        // scheduled events in the interval, so the dock sees the ~1 s of quiet that every lit
+        // capture contains and no vino run ever has.
+        Self::wait_mode_offset(anchor, cold::QUIET_END);
 
-        // Start both endpoints while the bracket is open. ARM is consumed only by this first
-        // presentation; later rounds reuse the already-encoded image with a fresh frame trailer.
-        let mut started = 0u32;
-        for head in 0..HEADS {
+        // Bracket, status polls and the mid-bracket EDID re-read, up to the first video.
+        cp_until!(cold::H0_VIDEO - 1);
+
+        for (head, at) in [(0usize, cold::H0_VIDEO), (1usize, cold::H1_VIDEO)] {
+            cp_until!(at - 1);
+            Self::wait_mode_offset(anchor, at);
             let bit = 1u32 << head;
             if sent & bit == 0 {
                 continue;
             }
+            // Exactly one ARM+carrier presentation, so the closing markers that DLM sends 33 ms
+            // later are not pushed out behind a blocking multi-frame submission.
             if prompts[head].as_ref().is_some_and(|frames| {
                 self.submit_prompt_training(
                     dev,
@@ -1156,31 +1259,17 @@ impl VinoDrmData {
             }
         }
 
-        for &(sub, state) in &[(0x2f, 0), (0x2e, 0)] {
-            for head in 0..HEADS {
-                if sent & (1u32 << head) != 0 {
-                    self.stream_marker(dev, head as u8, sub, state);
-                }
-            }
-        }
+        // Remaining polls and the closing markers.
+        cp_until!(i64::MAX);
         self.end_cp_timeline();
 
-        // Alternate the remaining presentations across endpoints. The old implementation kept
-        // head 1 completely idle for head 0's ~440-ms tail; DLM starts the two endpoints only
-        // 49--74 ms apart and then keeps both queues busy.
-        //
-        // Use elapsed time here, not the normal path's eight-presentation count. A 3-MiB desktop
-        // keyframe naturally makes eight presentations span about 0.4 s, but this deliberately
-        // tiny 203-KiB carrier filled both queues so efficiently that eight alternating frames
-        // finished in only 76 ms. The hardware trace then had a 322--647 ms no-video hole while
-        // the real desktops encoded, and (unlike DLM) never emitted the downstream-clock
-        // `2807a`/`2990d` events. Keep alternating until the captured activation interval itself
-        // has elapsed, irrespective of carrier size or USB speed.
+        // Keep both endpoints busy well past the close. DLM programs the head-0 clock 377 ms
+        // after its first video bytes and head 1's 589 ms after its own, so the carrier has to
+        // outlive the bracket rather than stopping with it.
         let tail_started = Instant::<Monotonic>::now();
-        loop {
+        while (Instant::<Monotonic>::now() - tail_started).as_millis() < cold::CARRIER_TAIL_MS {
             for head in 0..HEADS {
-                let bit = 1u32 << head;
-                if started & bit == 0 {
+                if started & (1u32 << head) == 0 {
                     continue;
                 }
                 if let Some(frames) = prompts[head].as_ref() {
@@ -1199,14 +1288,10 @@ impl VinoDrmData {
                     }
                 }
             }
-            if (Instant::<Monotonic>::now() - tail_started).as_millis()
-                >= PROMPT_TRAINING_TAIL_MS
-            {
-                break;
-            }
         }
         pr_info!(
-            "vino: DLM-style dual wake complete (mode/started masks 0x{:x}/0x{:x})\n",
+            "vino: DLM cold-replay dual wake complete after {} ms (mode/started masks 0x{:x}/0x{:x})\n",
+            (Instant::<Monotonic>::now() - anchor).as_millis(),
             sent,
             started
         );
