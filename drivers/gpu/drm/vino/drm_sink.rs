@@ -512,6 +512,29 @@ struct ShadowSurface {
 /// cost of a single redundant keyframe per mode-set.
 const SETTLE_REPAINT_MS: i64 = 1200;
 
+/// How many settle repaints one keyframe obligation is worth -- i.e. **how vino goes quiet at idle**.
+///
+/// **The bug this closes (measured 2026-07-26 23:00).** The settle repaint above re-armed itself
+/// forever. It is taken as a *keyframe*, and the send path armed a fresh settle repaint whenever the
+/// frame it just sent was a keyframe -- so keyframe → settle repaint → keyframe → settle repaint,
+/// one full ~3.19 MB frame per head every [`SETTLE_REPAINT_MS`], on a completely static desktop, for
+/// as long as the output stayed enabled. That is ~2.7 MB/s per head of pure waste, and it is exactly
+/// the last unexplained behavioural gap against DLM: `scripts/mon-ep-rates.py` over
+/// `captures/dlm-180hz-cp-20260726-2300/wire.mon` measured DLM sending **exactly 0 bytes** on both
+/// video endpoints across three consecutive 10 s idle buckets, where vino ran continuous repaints.
+///
+/// The repaint's documented job is to fix the *first* frame after a mode-set, when the compositor
+/// may have gone idle holding a blank buffer. That is a one-shot job, so it gets a one-shot budget,
+/// charged per keyframe obligation and refilled by the next mode-set or output enable. Nothing else
+/// changes: a real flip always re-arms nothing (it carries newer content), and *debt* repaints are
+/// unaffected -- they already terminate by construction and only cost the strips actually owed.
+///
+/// ⚠ **Cold-link training is deliberately exempt.** Inside the `sustain_until` window the repaint
+/// fires at [`FRAME_PERIOD_MS`] and does **not** consume budget: a cold downstream needs a sustained
+/// continuous stream to train its link and start its pixel clock, which is the thing that took a
+/// month to find. That window is time-bounded, so exempting it cannot reintroduce the idle stream.
+const SETTLE_REPAINTS: u32 = 1;
+
 /// Print the live CP session key/nonces to the kernel log at session publish so a usbmon capture
 /// of **vino's own** CP dialogue can be decrypted offline (`scripts/decrypt-dlm-cp.py`) and diffed
 /// against DLM's. Development aid only -- it puts a session key in `dmesg`.
@@ -785,6 +808,8 @@ pub(super) struct VinoDrmData {
     /// NAKing throttles its healthy neighbour's flips and mixes their failure counts into one
     /// log line. Independent workers need independent backoff.
     scanout_skip: [core::sync::atomic::AtomicU64; HEADS],
+    /// Settle repaints this head may still arm. See [`SETTLE_REPAINTS`].
+    settle_budget: [core::sync::atomic::AtomicU32; HEADS],
     /// Per-head video key delivered in the bring-up CP setup's `id=0x32` message (decoded dump:
     /// `captures/rr-out-sequence-20260716/cp-dialogue-decoded.txt`). ITS CRYPTOGRAPHIC ROLE IN
     /// EP08 IS NOT YET REVERSE-ENGINEERED -- only the wire slot it belongs in is proven, not
@@ -841,6 +866,7 @@ impl VinoDrmData {
             video_inflight: core::array::from_fn(|_| core::sync::atomic::AtomicBool::new(false)),
             scanout_fails: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
             scanout_skip: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
+            settle_budget: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
             video_keys <- new_mutex!([[0u8; 32]; HEADS]),
         })
     }
@@ -973,8 +999,7 @@ impl VinoDrmData {
         if changed {
             self.strip_hashes.lock()[head] = None;
             self.dirty_ttl.lock()[head] = None;
-            self.keyframe_pending
-                .fetch_or(1u32 << head, Ordering::Release);
+            self.owe_keyframe(head);
         }
     }
 
@@ -1529,7 +1554,7 @@ impl VinoDrmData {
             self.sustain_until.lock()[head] =
                 Some(Instant::<Monotonic>::now() + Delta::from_millis(3000));
             self.arm_prefix_pending.fetch_or(bit, Ordering::Release);
-            self.keyframe_pending.fetch_or(bit, Ordering::Release);
+            self.owe_keyframe(head);
             self.strip_hashes.lock()[head] = None;
             self.dirty_ttl.lock()[head] = None;
             sent |= bit;
@@ -2171,6 +2196,18 @@ impl VinoDrmData {
         }
     }
 
+    /// Record that `head` owes a full keyframe, and refill its settle-repaint budget.
+    ///
+    /// Every *genuine* obligation goes through here -- a mode-set, an output enable, a gamma change.
+    /// The two places that re-raise the bit without a new obligation (cold-training sustain, and a
+    /// settle repaint promoting itself) deliberately do **not**, because refilling there is precisely
+    /// the unbounded idle keyframe loop [`SETTLE_REPAINTS`] describes.
+    fn owe_keyframe(&self, head: usize) {
+        self.keyframe_pending
+            .fetch_or(1u32 << head, Ordering::Release);
+        self.settle_budget[head].store(SETTLE_REPAINTS, Ordering::Relaxed);
+    }
+
     /// Choose what `head` should transmit next: `(frame, wait_ms)`. A frame means encode and send it
     /// now; a `wait_ms` means nothing is due yet but something will be in that many milliseconds;
     /// neither means this head is idle and its worker can exit.
@@ -2459,7 +2496,7 @@ impl WorkItem for VinoDrmData {
                                     Some(Instant::<Monotonic>::now() + Delta::from_millis(3000));
                                 let bit = 1u32 << head;
                                 data.arm_prefix_pending.fetch_or(bit, Ordering::Release);
-                                data.keyframe_pending.fetch_or(bit, Ordering::Release);
+                                data.owe_keyframe(head_i);
                                 data.strip_hashes.lock()[head_i] = None;
                                 data.dirty_ttl.lock()[head_i] = None;
                                 data.modeset_bracket_post_open(dev, head, mode_anchor);
@@ -3044,6 +3081,8 @@ impl crtc::DriverCrtc for VinoCrtc {
         // retry its old mode and paint after DPMS-off.
         data.pending_scanout.lock()[head as usize] = None;
         data.settle_repaint.lock()[head as usize] = None;
+        // Spend nothing on a head that is off; the re-enable's mode-set refills it.
+        data.settle_budget[head as usize].store(0, Ordering::Relaxed);
         // Release the ~14.7 MB private copy; a re-enable owes a keyframe and re-snapshots.
         data.shadow.lock()[head as usize] = [const { None }; SHADOW_SLOTS];
         data.sustain_until.lock()[head as usize] = None;
@@ -3519,16 +3558,27 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, mut frame: 
                 // off to the sparse one-shot settle so a static desktop is not refreshed forever.
                 let sustaining = data.sustain_until.lock()[head_i]
                     .is_some_and(|until| (until - Instant::<Monotonic>::now()).as_millis() > 0);
-                let delay = if TEST_FORCE_FULL_FRAMES || sustaining {
-                    FRAME_PERIOD_MS
-                } else {
-                    SETTLE_REPAINT_MS
-                };
-                data.settle_repaint.lock()[head_i] = Some((
-                    Instant::<Monotonic>::now() + Delta::from_millis(delay),
-                    copy,
-                    true,
-                ));
+                // Training and the force-full-frames test knob repaint at the fast cadence and are
+                // exempt from the budget; everything else charges one settle repaint against this
+                // head's keyframe obligation and stops when it runs out. See `SETTLE_REPAINTS` for
+                // the unbounded keyframe loop that made a static desktop stream ~2.7 MB/s per head.
+                let unbudgeted = TEST_FORCE_FULL_FRAMES || sustaining;
+                let charged = unbudgeted
+                    || data.settle_budget[head_i]
+                        .fetch_update(Relaxed, Relaxed, |b| b.checked_sub(1))
+                        .is_ok();
+                if charged {
+                    let delay = if unbudgeted {
+                        FRAME_PERIOD_MS
+                    } else {
+                        SETTLE_REPAINT_MS
+                    };
+                    data.settle_repaint.lock()[head_i] = Some((
+                        Instant::<Monotonic>::now() + Delta::from_millis(delay),
+                        copy,
+                        true,
+                    ));
+                }
             } else {
                 // ★ Stranded retransmit debt (HW-observed 2026-07-26). `dirty_ttl` is only paid
                 // down by frames that actually go out, and a repaint is otherwise re-armed ONLY
@@ -4368,8 +4418,7 @@ fn encode_and_send_wht(
                         Some(Instant::<Monotonic>::now() + Delta::from_millis(3000));
                     data.arm_prefix_pending
                         .fetch_or(1u32 << head, core::sync::atomic::Ordering::Release);
-                    data.keyframe_pending
-                        .fetch_or(1u32 << head, core::sync::atomic::Ordering::Release);
+                    data.owe_keyframe(head_i);
                     data.strip_hashes.lock()[head_i] = None;
                     data.dirty_ttl.lock()[head_i] = None;
                     data.modeset_bracket_post_open(dev, head, mode_anchor);
