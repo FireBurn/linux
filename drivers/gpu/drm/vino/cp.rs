@@ -380,9 +380,20 @@ pub(super) struct Timing {
     /// clock. It now writes the high byte to off72 (see [`set_mode`]) and refuses to encode a clock
     /// that does not fit 24 bits. See `docs/HIGH-REFRESH.md`.
     pub pixel_clock_10khz: u32,
-    /// DisplayID field at off42 -- partly decoded (0x0604 for 4K, 0x0600 for the
-    /// 2560x1440 sample in sec 8.6.4); high byte 0x06 constant, low byte mode-varying.
+    /// DisplayID field at off42 -- **undecoded, mode-dependent, filled from [`mode_words`]**.
+    ///
+    /// Measured across the DLM corpus it tracks the *resolution* and not the refresh rate:
+    /// 1080p ⇒ `0x0400` at both 60 and 120 Hz, 1440p ⇒ `0x0600`. `docs/VIDEO.md` reads it instead as
+    /// the DP link-bandwidth tier (1024 = HBR, 1536 = HBR2), which fits the same data; see
+    /// [`mode_words`], where the two readings diverge and what to do about it.
+    /// Constructors set it from [`mode_words`]; do not hardcode it.
     pub field42: u16,
+    /// The undecoded mode-dependent word at off66 -- also filled from [`mode_words`].
+    ///
+    /// Unlike [`Self::field42`] this is **not** a function of resolution alone: at 1080p it is
+    /// `0x2810` at 60 Hz and `0x083f` at 120 Hz. See [`mode_words`] for the measured corpus and for
+    /// why that matters to the pending 1920x1080@165 experiment.
+    pub off66: u16,
 }
 impl Timing {
     /// 3840x2160@60 (CVT-RB) -- the mode the non-HDCP dongle advertises, kept as a
@@ -398,8 +409,78 @@ impl Timing {
         vsync_width: 5,
         refresh_hz: 60,
         pixel_clock_10khz: 0xd040,
+        // The golden 4K@60 capture is the non-HDCP *dongle*, not the D6000, and its off66 is not
+        // legible in the archived transcript -- so this keeps the `0x0800` vino has always sent for
+        // it. `mode_words` deliberately does not claim a 3840x2160 entry for the same reason.
         field42: 0x0604,
+        off66: 0x0800,
     };
+}
+/// The two undecoded mode-dependent words of the set-mode message, `off42` and `off66`, as
+/// **measured** from decrypted DLM `id=0x48 sub=0x22` traffic.
+///
+/// | DLM mode | off42 | off66 | source |
+/// |---|---|---|---|
+/// | 1920x1080@60 | `0x0400` | `0x2810` | `captures/max-cold-20260721-235609` ctr=244 |
+/// | 1920x1080@120 | `0x0400` | `0x083f` | `captures/dlm-180hz-cp-20260726-2300` ctr=929/1072 |
+/// | 2560x1440@120 | `0x0600` | `0x0800` | `dlm-180hz` ctr=999/1143, `max-cold` ctr=318 |
+///
+/// Six DLM messages over three modes and both heads; `off68` is `0x0200` and `off72` is `0` in every
+/// one of them, and off44 is the refresh rate in every one of them (60/120 tracking the derived rate
+/// exactly), which is why those three are not parameterised here.
+///
+/// ⚠ **off42 tracks the resolution; off66 does NOT.** At 1080p, off66 changes with *refresh*
+/// (`0x2810` at 60, `0x083f` at 120) while off42 stays `0x0400`.
+/// `captures/dlm-180hz-cp-20260726-2300/SUMMARY.md` concluded both were resolution-dependent and
+/// eliminated off66 as a dark-panel suspect, but that capture contained only 120 Hz samples of
+/// 1080p; the 1080p**60** message above refutes it. So off66 is **not** eliminated, and vino's
+/// long-standing hardcoded `0x0800` was a 1440p value being sent for every 1080p mode too.
+///
+/// ⚠ Do not add a 2560x1440@59.95 row from `captures/vino-prompt-timing-20260725-2339` -- that
+/// message is **vino's own** CP output, so it merely echoes the hardcoded values back. Only DLM
+/// traffic is evidence here. Consequently 1440p is sampled at exactly one refresh, and off66 is
+/// **not** known to be refresh-independent there either.
+///
+/// For a mode with no exact measurement this falls back to the nearest measured refresh at the same
+/// resolution, else to `0x0600`/`0x0800` (the 1440p120 pair vino has always sent, and the pair
+/// proven to light both panels). `exact` reports which happened so the caller can say so out loud:
+/// the pending 1920x1080@165 discriminator has **no** measured off66, and a dark result there must
+/// not be read as "the dock caps refresh" while an unproven word is on the wire.
+///
+/// ★ **The A/B to run before blaming the dock at 1080p165.** `docs/VIDEO.md` reads off42 not as a
+/// resolution tag but as the **DP link-bandwidth tier** required by the mode (`0x0400` = 1024 = HBR,
+/// `0x0600` = 1536 = HBR2). That model fits all four captures *better*, because it explains why the
+/// value tracks resolution: at 24 bpp, 1080p60 (3.56 Gbps) and 1080p120 (7.13 Gbps) both fit 4-lane
+/// HBR's ~8.6 Gbps, while 1440p120 (11.95 Gbps) and 4K60 (12.79 Gbps) both need HBR2. The two models
+/// agree on every mode ever captured and disagree **exactly** on 1920x1080@165: ~381 MHz CVT-RB is
+/// 9.14 Gbps, which is above 4-lane HBR, so the tier model wants `0x0600` where the table gives
+/// `0x0400`. The corpus cannot settle it -- the real threshold is only bounded to (7.13, 11.95) Gbps.
+/// So if 1080p165 comes up dark, **retry it with `0x0400` → `0x0600` here before concluding anything
+/// about the dock's refresh ceiling.**
+pub(super) fn mode_words(hactive: u16, vactive: u16, refresh_hz: u16) -> (u16, u16, bool) {
+    // (hactive, vactive, refresh, off42, off66) -- DLM captures only; see the table above.
+    const MEASURED: &[(u16, u16, u16, u16, u16)] = &[
+        (1920, 1080, 60, 0x0400, 0x2810),
+        (1920, 1080, 120, 0x0400, 0x083f),
+        (2560, 1440, 120, 0x0600, 0x0800),
+    ];
+    let mut best: Option<(u16, u16, u16)> = None; // (off42, off66, |refresh delta|)
+    for &(hact, vact, refresh, off42, off66) in MEASURED {
+        if hact != hactive || vact != vactive {
+            continue;
+        }
+        if refresh == refresh_hz {
+            return (off42, off66, true);
+        }
+        let delta = refresh.abs_diff(refresh_hz);
+        if best.is_none_or(|(_, _, d)| delta < d) {
+            best = Some((off42, off66, delta));
+        }
+    }
+    match best {
+        Some((off42, off66, _)) => (off42, off66, false),
+        None => (0x0600, 0x0800, false),
+    }
 }
 /// Set-mode (`id=0x48 sub=0x22`): an 80-byte inner message carrying the target head and a
 /// DisplayID-Type-I u16 timing record.
@@ -411,10 +492,16 @@ impl Timing {
 /// off22 head; off23 generation=2; off24..25 zero; off26 begins the LE u16
 /// record `hactive,hblank,hsync_front,hsync_width,vactive,vblank,vsync_front,
 /// vsync_width,field42,refresh,flags(0x4000)`; off48/off58/off60 carry observed constants; off66 is
-/// an undecoded mode-dependent word (the `0x0800` fallback below matches the live 1440p120 target);
-/// off70 is the pixel clock (10 kHz units). DLM 3.4.26 writes `0x0200` at off68 in fresh live mode
-/// changes. Vino writes the observed value too; a USB ACK alone was not evidence that zero was
-/// equivalent because the panel still remained dark.
+/// an undecoded mode-dependent word (see [`mode_words`], which supplies it and off42 from the
+/// measured corpus); off70 is the pixel clock (10 kHz units). DLM 3.4.26 writes `0x0200` at off68 in
+/// fresh live mode changes. Vino writes the observed value too; a USB ACK alone was not evidence
+/// that zero was equivalent because the panel still remained dark.
+///
+/// off44 is the **refresh rate**, confirmed against four modes (60/120 tracking the derived rate
+/// exactly). `captures/dlm-180hz-cp-20260726-2300/SUMMARY.md` records it as "120 (constant, NOT
+/// refresh)"; that capture happened to contain only 120 Hz modes. The 1080p**60** message in
+/// `captures/max-cold-20260721-235609` carries 60 there, so it is refresh and vino is right to
+/// write it.
 pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
     let mut b = KVec::with_capacity(80, GFP_KERNEL)?;
     header(&mut b, 0x48, 0x22, counter)?;
@@ -442,7 +529,7 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
     b.extend_from_slice(&0x0080u16.to_le_bytes(), GFP_KERNEL)?; // off58 (observed const)
     b.extend_from_slice(&0x00ffu16.to_le_bytes(), GFP_KERNEL)?; // off60 (observed const)
     pad_to(&mut b, 66)?;
-    b.extend_from_slice(&0x0800u16.to_le_bytes(), GFP_KERNEL)?; // off66: captured 1440p120 value
+    b.extend_from_slice(&t.off66.to_le_bytes(), GFP_KERNEL)?; // off66: see `mode_words`
     b.extend_from_slice(&0x0200u16.to_le_bytes(), GFP_KERNEL)?; // off68: DLM 3.4.26 constant
     // off70..72 pixel clock. The low u16 at off70 is proven byte-exact against every capture; off72
     // is the DisplayID Type-I 24-bit clock's high byte ON A HYPOTHESIS -- it is zero for every mode
@@ -534,9 +621,8 @@ fn edid_valid(edid: &[u8]) -> bool {
         && edid[..128].iter().fold(0u8, |a, &b| a.wrapping_add(b)) == 0
 }
 /// Parse one 18-byte EDID detailed timing descriptor into a [`Timing`], or `None` if it
-/// is too short or not a timing (pixel clock 0 marks a monitor descriptor). `field42`
-/// is left at the sec 8.6.4 default (`0x0600`) -- its low byte is mode-varying and not fully
-/// decoded, so the live mode-set substitution leaves the captured value in place.
+/// is too short or not a timing (pixel clock 0 marks a monitor descriptor). The two undecoded
+/// mode-dependent words come from [`mode_words`].
 fn parse_dtd(d: &[u8]) -> Option<Timing> {
     if d.len() < 18 {
         return None;
@@ -561,6 +647,7 @@ fn parse_dtd(d: &[u8]) -> Option<Timing> {
     } else {
         0
     };
+    let (field42, off66, _) = mode_words(hactive, vactive, refresh_hz);
     Some(Timing {
         hactive,
         hblank,
@@ -572,7 +659,8 @@ fn parse_dtd(d: &[u8]) -> Option<Timing> {
         vsync_width,
         refresh_hz,
         pixel_clock_10khz: u32::from(pclk),
-        field42: 0x0600,
+        field42,
+        off66,
     })
 }
 /// Extract the monitor's **preferred** detailed timing from an EDID for the live mode-set
@@ -616,10 +704,14 @@ pub(super) fn timing_from_edid(edid: &[u8]) -> Option<Timing> {
 }
 /// Overwrite the geometry + clock fields of an in-place set-mode inner message
 /// (`id=0x48 sub=0x22`) with `t` (CP-HANDSHAKE.md sec 4e). Offsets mirror [`set_mode`]:
-/// the LE u16 timing record at off26 and the pixel clock at off70. `field42` (off42),
-/// the undecoded mode word at off66 and the encrypted trailer are intentionally **left as captured**;
-/// only the EDID-derived values change, so the wire length (hence `wire_seq`) is
-/// unchanged. No-op if `plain` is too short.
+/// the LE u16 timing record at off26 and the pixel clock at off70. The encrypted trailer is
+/// intentionally left as captured; only the EDID-derived values change, so the wire length (hence
+/// `wire_seq`) is unchanged. No-op if `plain` is too short.
+///
+/// off42/off66 are patched too, from [`mode_words`]: this rewrites a captured message's *geometry*,
+/// and both of those words are mode-dependent, so leaving them at the captured mode's values
+/// contradicts the new timing. (This path currently has no callers -- the live mode-set builds a
+/// fresh message with [`set_mode`] -- but a stale-word bug here would be invisible if it gained one.)
 pub(super) fn apply_edid_timing(plain: &mut [u8], t: &Timing) {
     if plain.len() < 73 {
         return;
@@ -636,7 +728,9 @@ pub(super) fn apply_edid_timing(plain: &mut [u8], t: &Timing) {
     put(plain, 36, t.vblank);
     put(plain, 38, t.vsync_front);
     put(plain, 40, t.vsync_width);
+    put(plain, 42, t.field42);
     put(plain, 44, t.refresh_hz);
+    put(plain, 66, t.off66);
     put(plain, 70, t.pixel_clock_10khz as u16);
     plain[72] = (t.pixel_clock_10khz >> 16) as u8; // see `set_mode`: 24-bit clock hypothesis
 }
@@ -647,13 +741,25 @@ pub(super) fn apply_edid_timing(plain: &mut [u8], t: &Timing) {
 /// `drm_display_mode` lands here verbatim -- no re-parsing of EDID offsets. The blanking
 /// fields map straight across (CVT/DMT/DisplayID all use the same front-porch/sync model),
 /// and the refresh rate comes from DRM's own `drm_mode_vrefresh` helper rather than a
-/// hand-rolled divide. `field42` keeps the sec 8.6.4 default (its low byte is mode-varying and
-/// not fully decoded); the dock tolerates the high byte `0x06`.
+/// hand-rolled divide. The two undecoded mode-dependent words come from [`mode_words`], which also
+/// says whether the mode was actually measured -- a mode that was not gets one log line, because a
+/// dark panel on a mode carrying an unproven off66 is not evidence about the dock.
 ///
 /// SAFETY: `mode` must point to a valid `drm_display_mode` for the duration of the call.
 pub(super) fn timing_from_drm_mode(mode: &kernel::drm::kms::modes::DisplayMode) -> Timing {
     let refresh = mode.vrefresh() as u16;
     let sub = |a: u16, b: u16| a.saturating_sub(b);
+    let (field42, off66, exact) = mode_words(mode.hdisplay(), mode.vdisplay(), refresh);
+    if !exact {
+        pr_info!(
+            "vino: {}x{}@{} has no measured set-mode mode-words; sending off42=0x{:04x} off66=0x{:04x} (UNPROVEN)\n",
+            mode.hdisplay(),
+            mode.vdisplay(),
+            refresh,
+            field42,
+            off66
+        );
+    }
     Timing {
         hactive: mode.hdisplay(),
         hblank: sub(mode.htotal(), mode.hdisplay()),
@@ -678,7 +784,8 @@ pub(super) fn timing_from_drm_mode(mode: &kernel::drm::kms::modes::DisplayMode) 
                 k
             }
         },
-        field42: 0x0600,
+        field42,
+        off66,
     }
 }
 /// Decode the inner header of a dock->host CP frame: returns `(id, sub, ictr)` from

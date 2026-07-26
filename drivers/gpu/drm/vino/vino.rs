@@ -4813,6 +4813,86 @@ mod tests {
         Ok(())
     }
 
+    /// The whole set-mode message vino builds, byte-checked against every **DLM** `id=0x48 sub=0x22`
+    /// plaintext in the corpus (`cp::mode_words` lists the captures).
+    ///
+    /// Two of the fields here were got wrong by reading only the 2026-07-26 23:00 capture, which
+    /// happened to contain nothing but 120 Hz modes:
+    ///
+    /// * **off66 is not a function of resolution.** At 1080p it is `0x2810` at 60 Hz and `0x083f` at
+    ///   120 Hz. vino sent the 1440p `0x0800` for every mode, so every 1080p mode-set carried a wrong
+    ///   word -- and off66 is therefore **not** eliminated as a suspect for the dark panel above
+    ///   120 Hz, contrary to that capture's summary.
+    /// * **off44 is the refresh rate**, not the constant 120 the same summary recorded. The 1080p60
+    ///   message pins it at 60. vino already wrote refresh; this stops anyone "fixing" it to 120.
+    #[test]
+    fn set_mode_matches_every_dlm_capture() -> Result {
+        // (hact, htotal, hsync_start, hsync_end, vact, vtotal, vsync_start, vsync_end, clock kHz,
+        //  refresh, off42, off66)
+        let cases: [(u16, u16, u16, u16, u16, u16, u16, u16, i32, u16, u16, u16); 3] = [
+            // max-cold-20260721-235609 ctr=244: 1920x1080@60, 148.50 MHz.
+            (1920, 2200, 2008, 2052, 1080, 1125, 1084, 1089, 148_500, 60, 0x0400, 0x2810),
+            // dlm-180hz-cp-20260726-2300 ctr=929 (head 1) and ctr=1072 (head 0): 1080p120, 297 MHz.
+            (1920, 2200, 2008, 2052, 1080, 1125, 1084, 1089, 297_000, 120, 0x0400, 0x083f),
+            // dlm-180hz ctr=999/1143 and max-cold ctr=318: 2560x1440@120, 497.75 MHz, vtotal 1525.
+            (2560, 2720, 2608, 2640, 1440, 1525, 1443, 1448, 497_750, 120, 0x0600, 0x0800),
+        ];
+        for (hact, htotal, hss, hse, vact, vtotal, vss, vse, clock, refresh, off42, off66) in cases {
+            let mut m = bindings::drm_display_mode::default();
+            m.clock = clock;
+            m.hdisplay = hact;
+            m.hsync_start = hss;
+            m.hsync_end = hse;
+            m.htotal = htotal;
+            m.vdisplay = vact;
+            m.vsync_start = vss;
+            m.vsync_end = vse;
+            m.vtotal = vtotal;
+            // SAFETY: as in `timing_from_drm_mode_1080p60` -- `m` is a fully-initialised local
+            // `drm_display_mode` and `DisplayMode` is a `#[repr(transparent)]` wrapper over it.
+            let t = unsafe {
+                cp::timing_from_drm_mode(
+                    &*(&raw const m).cast::<kernel::drm::kms::modes::DisplayMode>(),
+                )
+            };
+            let w = cp::set_mode(7, 1, &t)?;
+            assert_eq!(w.len(), 80);
+            let u16_at = |off: usize| u16::from_le_bytes([w[off], w[off + 1]]);
+            assert_eq!(u16_at(26), hact); // hactive
+            assert_eq!(u16_at(28), htotal - hact); // hblank
+            assert_eq!(u16_at(30), hss - hact); // hsync front porch
+            assert_eq!(u16_at(32), hse - hss); // hsync width
+            assert_eq!(u16_at(34), vact); // vactive
+            assert_eq!(u16_at(36), vtotal - vact); // vblank
+            assert_eq!(u16_at(38), vss - vact); // vsync front porch
+            assert_eq!(u16_at(40), vse - vss); // vsync width
+            assert_eq!(u16_at(42), off42); // the resolution-dependent word
+            assert_eq!(u16_at(44), refresh); // off44 is REFRESH, not a constant 120
+            assert_eq!(u16_at(66), off66); // the timing-dependent word
+            assert_eq!(u16_at(68), 0x0200); // constant across all six DLM messages
+            assert_eq!(u16_at(70), (clock as u32 / 10) as u16); // pixel clock / 10 kHz
+            assert_eq!(w[72], 0); // no DLM capture ever needed the high byte
+        }
+        Ok(())
+    }
+
+    /// A mode with no measured mode-words falls back within its own resolution and reports that it
+    /// is a guess. This is what keeps the pending 1920x1080@165 discriminator honest: the fallback
+    /// picks 1080p's nearest measured refresh rather than a 1440p word, and `exact == false` makes
+    /// `timing_from_drm_mode` log that off66 is unproven -- so a dark panel there cannot be read as
+    /// "the dock caps refresh" without accounting for it.
+    #[test]
+    fn mode_words_fall_back_within_the_resolution() {
+        assert_eq!(cp::mode_words(1920, 1080, 60), (0x0400, 0x2810, true));
+        assert_eq!(cp::mode_words(2560, 1440, 120), (0x0600, 0x0800, true));
+        // 165 Hz: same resolution, nearest measured refresh is 120 -- not the 1440p word.
+        assert_eq!(cp::mode_words(1920, 1080, 165), (0x0400, 0x083f, false));
+        // 1440p is sampled at one refresh only, so every other 1440p rate is that row, inexact.
+        assert_eq!(cp::mode_words(2560, 1440, 60), (0x0600, 0x0800, false));
+        // An unmeasured resolution keeps the pair vino has always sent.
+        assert_eq!(cp::mode_words(3840, 2160, 60), (0x0600, 0x0800, false));
+    }
+
     #[test]
     fn rotation_pixel_mapping() {
         use bindings::{

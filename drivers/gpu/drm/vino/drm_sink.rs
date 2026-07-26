@@ -1419,7 +1419,7 @@ impl VinoDrmData {
                 continue;
             }
             pr_info!(
-                "vino: DUAL-WAKE timing head={} h={}+{} fp={} sw={} v={}+{} fp={} sw={} refresh={} pclk10k={} field42=0x{:04x}\n",
+                "vino: DUAL-WAKE timing head={} h={}+{} fp={} sw={} v={}+{} fp={} sw={} refresh={} pclk10k={} field42=0x{:04x} off66=0x{:04x}\n",
                 head,
                 timing.hactive,
                 timing.hblank,
@@ -1431,7 +1431,8 @@ impl VinoDrmData {
                 timing.vsync_width,
                 timing.refresh_hz,
                 timing.pixel_clock_10khz,
-                timing.field42
+                timing.field42,
+                timing.off66
             );
             let w_pad = (timing.hactive as usize + super::video::wht::STRIP_W - 1)
                 & !(super::video::wht::STRIP_W - 1);
@@ -2408,10 +2409,10 @@ impl WorkItem for VinoDrmData {
                             Ok(()) // superseded or disabled while queued
                         } else {
                             pr_info!(
-                                "vino: MODESET timing h={}+{} fp={} sw={} v={}+{} fp={} sw={} refresh={} pclk10k={} field42=0x{:04x}\n",
+                                "vino: MODESET timing h={}+{} fp={} sw={} v={}+{} fp={} sw={} refresh={} pclk10k={} field42=0x{:04x} off66=0x{:04x}\n",
                                 timing.hactive, timing.hblank, timing.hsync_front, timing.hsync_width,
                                 timing.vactive, timing.vblank, timing.vsync_front, timing.vsync_width,
-                                timing.refresh_hz, timing.pixel_clock_10khz, timing.field42
+                                timing.refresh_hz, timing.pixel_clock_10khz, timing.field42, timing.off66
                             );
                             let wake = data.modeset_active[head_i].load(Ordering::Acquire) == 0;
                             // Pre-encode a tiny, valid activation carrier BEFORE starting the
