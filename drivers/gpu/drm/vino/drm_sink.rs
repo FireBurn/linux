@@ -3710,14 +3710,13 @@ impl connector::DriverConnector for VinoConnector {
         if mode.clock() > MAX_HEAD_CLOCK_KHZ {
             return ModeStatus::ClockHigh;
         }
-        // The D6000's dock-wide wake is not symmetric even when both downstream panels advertise
-        // 1440p120. Every capture in which DLM actually lights this two-monitor setup programs
-        // head 0 at 120 Hz and head 1 at 60 Hz; allowing KWin to select 120 Hz on both heads leaves
-        // the same dock in the pre-activation `3fa43` state. Keep the second engine at DLM's
-        // hardware-proven rate until the shared dual-120 activation sequence is understood.
-        if connector.head == 1 && mode.vrefresh() > 60 {
-            return ModeStatus::Bad;
-        }
+        // Head 1 was clamped to 60 Hz here on 2026-07-25 because "allowing KWin to select 120 Hz on
+        // both heads leaves the dock in the pre-activation `3fa43` state". That was a
+        // misattribution: the dock stayed pre-activation because vino's EDID engage
+        // (`id=0x16 sub=0x23`) carried a random byte in off23 and was rejected, so the downstream
+        // sink was never enabled -- not because of the refresh rate. With that fixed both heads
+        // reach `2807a`/`2990d` at 1440p120, and the cross-head budget below is the only rate limit
+        // that belongs here.
         // Experiment: pin the head to 1280x720@60 (see `TEST_ONLY_720P60`).
         if TEST_ONLY_720P60 {
             let is_720p60 = mode.hdisplay() == 1280
