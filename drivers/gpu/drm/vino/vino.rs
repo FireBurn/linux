@@ -632,8 +632,10 @@ struct VinoBoundData<'bound> {
     /// interfaces, which never issue a transfer.
     io: Option<Arc<usb::IoWindow>>,
     /// The registered DRM card, dropped on unbind. `None` when DRM registration failed, or on the
-    /// idle non-control interfaces.
-    _registration: Option<drm::Registration<'bound, drm_sink::VinoDrmDriver>>,
+    /// idle non-control interfaces. Also `disconnect()`'s handle on the DRM device data, so
+    /// `shutdown()` runs whenever a card exists -- it must not be reached through `bringup`, which
+    /// is additionally `None` if the work item could not be allocated.
+    registration: Option<drm::Registration<'bound, drm_sink::VinoDrmDriver>>,
     /// Owned handle to the deferred bring-up work (control interface only). `disconnect()` takes
     /// the option under the mutex before synchronously cancelling the work and unplugging DRM.
     /// The mutex itself is heap-pinned because kernel locks must not move after initialization.
@@ -3807,7 +3809,7 @@ impl usb::Driver for VinoDriver {
                 return Ok(VinoBoundData {
                     _intf: intf.into(),
                     io: None,
-                    _registration: None,
+                    registration: None,
                     bringup: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?,
                     _i2c: core::array::from_fn(|_| None),
                 });
@@ -3841,7 +3843,7 @@ impl usb::Driver for VinoDriver {
             return Ok(VinoBoundData {
                 _intf: intf.into(),
                 io: None,
-                _registration: None,
+                registration: None,
                 bringup: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?,
                 _i2c: core::array::from_fn(|_| None),
             });
@@ -3962,7 +3964,7 @@ impl usb::Driver for VinoDriver {
         Ok(VinoBoundData {
             _intf: intf_ref,
             io: Some(io),
-            _registration: registration,
+            registration,
             bringup: KBox::pin_init(new_mutex!(bringup), GFP_KERNEL)?,
             _i2c: i2c,
         })
@@ -4067,8 +4069,14 @@ impl usb::Driver for VinoDriver {
         // Stop every producer. The DRM device itself is unregistered by `Registration`'s `Drop`
         // when the bound data is released -- the accepted registration teardown already calls
         // `drm_dev_unplug()`, so there is no driver-local force-unplug here any more.
-        if let Some(bringup) = bringup.as_ref() {
-            let drm_data: &drm_sink::VinoDrmData = &bringup.ddev;
+        //
+        // Taken from the registration rather than from `bringup`: `shutdown()` is also what breaks
+        // the device's self-references (the vblank timer's published `CrtcRef` and the pinned
+        // vblank ref), so skipping it leaks the whole `drm_device` and its DRM minor. A card can
+        // exist with `bringup == None` -- `BringUp::new()` is a fallible allocation and probe
+        // deliberately continues without it -- and that path used to skip teardown entirely.
+        if let Some(reg) = data.registration.as_ref() {
+            let drm_data: &drm_sink::VinoDrmData = reg.device();
             drm_data.shutdown();
         }
         dev_info!(dev, "vino: D6000 disconnected\n");

@@ -55,7 +55,10 @@ use kernel::{
     i2c, impl_has_hr_timer,
     interrupt::LocalInterruptDisabled,
     prelude::*,
-    sync::{aref::ARef, new_mutex, new_spinlock, Arc, ArcBorrow, Mutex, SetOnce, SpinLock},
+    sync::{
+        aref::ARef, new_mutex, new_spinlock, new_spinlock_irq, Arc, ArcBorrow, Mutex, SpinLock,
+        SpinLockIrq,
+    },
     time::{
         delay::fsleep,
         hrtimer::{
@@ -616,7 +619,44 @@ impl VinoDrmData {
         for (timer, _) in timers.iter().flatten() {
             timer.enabled.store(false, Ordering::Relaxed);
         }
-        drop(timers); // each handle's drop == hrtimer_cancel
+        // Split the registry: drop every `ArcHrTimerHandle` (each drop == `hrtimer_cancel`, which
+        // waits for a running callback), but keep the `Arc<VblankTimer>`s alive so the published
+        // CRTC handles can be released below. From here on no vblank callback can run or be
+        // re-armed, because `VinoCrtc::vblank` is only reachable through a CRTC of this device and
+        // every producer is already refusing work.
+        let timers = timers.map(|slot| {
+            slot.map(|(timer, handle)| {
+                drop(handle);
+                timer
+            })
+        });
+
+        // Break the two device-to-itself reference cycles that keep the `drm_device` -- and with it
+        // this card's DRM minor -- alive forever after unplug. Both run through a
+        // `crtc::CrtcRef`, which owns an `ARef<VinoDrmDevice>`:
+        //
+        //   1. `VblankTimer::crtc`, published by the first `enable_vblank` and never released. The
+        //      timer is owned by `VinoCrtc`, which lives inside the DRM device allocation.
+        //   2. `VinoCrtc::vblank_pinned`, the driver-held vblank reference. `atomic_disable`
+        //      normally releases it, but the 2026-07-22 unload crash proved `atomic_disable` does
+        //      not always run, so teardown must not depend on it.
+        //
+        // Safe to do here even though these were the last self-references: `shutdown()`'s only
+        // caller is `VinoDriver::disconnect`, which reaches it through the `drm::Registration`
+        // still held in the bound data -- and that owns an `ARef<VinoDrmDevice>` of its own -- so
+        // `&self` outlives this function regardless of what is dropped below. The taken values
+        // are dropped outside both locks: `drm_dev_put()` can end in `drm_dev_release()` and
+        // `drm_crtc_vblank_put()` takes the DRM vblank locks, neither of which may run under our
+        // spinlock.
+        for timer in timers.iter().flatten() {
+            let published = timer.crtc.lock().take();
+            if let Some(crtc_ref) = published {
+                let crtc: &VinoCrtc = crtc_ref.crtc();
+                drop(crtc.vblank_pinned.lock().take());
+                drop(crtc_ref);
+            }
+        }
+        drop(timers);
 
         *self.cmd_queue.lock() = KVec::new();
         *self.pending_scanout.lock() = [const { None }; HEADS];
@@ -2178,7 +2218,10 @@ impl KmsDriver for VinoDrmDriver {
 /// [`ArcHrTimerHandle::restart`], which re-queues the timer whether it is dead or still pending -- no new
 /// handle is minted, so the single `ArcHrTimerHandle` taken at first start remains the sole owner
 /// and its drop (at CRTC teardown, before the `drm_crtc` is freed) is the only full
-/// `hrtimer_cancel`. This is the same design `revdi`'s `EvdiCrtc`/`VblankTimer` uses.
+/// `hrtimer_cancel`. The *arming* half of this is the design `revdi`'s `EvdiCrtc`/`VblankTimer`
+/// uses; the two drivers deliberately diverge on how the callback reaches its CRTC (see the
+/// [`VblankTimer::crtc`] field) and on where the cancel is guaranteed (see the 2026-07-22
+/// correction below).
 ///
 /// **2026-07-16 history:** this used to free-run unconditionally (`Restart` regardless of
 /// `enabled`) with an explicit `__module_get`/`module_put` pinning the module for as long as the
@@ -2210,7 +2253,29 @@ pub(super) struct VblankTimer {
     /// The CRTC to deliver vblanks to, published the first time vblank is enabled. An owned
     /// handle rather than a raw pointer: it keeps the DRM device alive, so the timer callback can
     /// safely reach the CRTC from outside any DRM callback.
-    crtc: SetOnce<crtc::CrtcRef<VinoCrtc>>,
+    ///
+    /// **This is a reference cycle, and it must be broken explicitly.** A
+    /// [`crtc::CrtcRef`] holds an `ARef<VinoDrmDevice>`, while this timer is itself owned by the
+    /// device (via [`VinoCrtc::vblank`], which lives inside the DRM device allocation). Once
+    /// `enable_vblank` publishes the handle the device therefore holds a reference to itself, so
+    /// `drm_dev_put()` never reaches zero, `drm_dev_release()` never runs, and the card's minor is
+    /// never returned to `drm_minors_xa`. That is exactly the long-standing "DRM minor advances
+    /// 2, 3, 4, ... on every replug" anomaly: `drm_dev_unplug()` did run (the `card`/`renderD`
+    /// nodes do disappear), but the `drm_device` behind it was immortal.
+    /// [`VinoDrmData::shutdown`] clears this slot after `hrtimer_cancel`, which is what actually
+    /// frees the device.
+    ///
+    /// A [`SpinLockIrq`], not a [`SetOnce`], purely so it can be cleared: the publisher
+    /// (`enable_vblank`) runs with local interrupts already disabled, the reader is an hrtimer
+    /// callback in hardirq context, and the one clearer is process context with interrupts on.
+    ///
+    /// `revdi` solves the same problem the other way -- `EvdiCrtc`'s timer stores a bare
+    /// `AtomicPtr<bindings::drm_crtc>` and calls `drm_crtc_handle_vblank()` on it unsafely, so
+    /// there is no reference to leak and never was a cycle. Vino keeps the owned handle (no unsafe
+    /// deref in the callback) and pays for it with this lock plus the explicit clear in
+    /// `shutdown()`. See `docs/MODULE-LIFECYCLE.md` "Root cause 4" for the comparison.
+    #[pin]
+    crtc: SpinLockIrq<Option<crtc::CrtcRef<VinoCrtc>>>,
     /// One scanout frame in nanoseconds (from the mode's `framedur_ns`).
     interval_ns: AtomicI64,
     /// Whether vblanks should currently be delivered (toggled by enable/disable_vblank).
@@ -2221,7 +2286,7 @@ impl VblankTimer {
     fn new() -> impl PinInit<Self> {
         pin_init!(VblankTimer {
             timer <- HrTimer::new(),
-            crtc: SetOnce::new(),
+            crtc <- new_spinlock_irq!(None, "vino::vblank_crtc"),
             interval_ns: AtomicI64::new(16_666_666), // ~60 Hz until a mode sets it
             enabled: AtomicBool::new(false),
         })
@@ -2238,7 +2303,22 @@ impl HrTimerCallback for VblankTimer {
         if !this.enabled.load(Ordering::Relaxed) {
             return HrTimerRestart::NoRestart;
         }
-        if let Some(crtc) = this.crtc.as_ref() {
+        // Take an owned copy of the published handle and release the lock *before* delivering the
+        // vblank. `drm_crtc_handle_vblank()` takes `dev->vblank_time_lock`, and `enable_vblank`
+        // runs the other way round -- it is called with the DRM vblank locks already held and
+        // acquires this one -- so holding this lock across the delivery would be a lock inversion.
+        // Cloning is just a `drm_dev_get()`, and the clone cannot drop the last reference: the
+        // handle we cloned from stays published for the whole callback, because the only code that
+        // clears it (`VinoDrmData::shutdown`) does so after `hrtimer_cancel` has waited for this
+        // callback to return.
+        let crtc = {
+            // SAFETY: an hrtimer callback registered with `RelativeMode` (`HRTIMER_MODE_REL`, not
+            // `..._SOFT`) is run from `hrtimer_interrupt()` in hardirq context, so local
+            // interrupts are disabled for the whole of the borrow taken here.
+            let irq = unsafe { LocalInterruptDisabled::assume_disabled() };
+            this.crtc.lock_with(irq).clone()
+        };
+        if let Some(crtc) = crtc {
             crtc.crtc().handle_vblank();
         }
         let interval = this.interval_ns.load(Ordering::Relaxed).max(1_000_000);
@@ -2432,7 +2512,7 @@ impl VblankSupport for VinoCrtc {
     fn enable_vblank(
         crtc: &crtc::Crtc<Self::Crtc>,
         vblank_guard: &VblankGuard<'_, Self::Crtc>,
-        _irq: &LocalInterruptDisabled,
+        irq: &LocalInterruptDisabled,
     ) -> Result {
         let data: &VinoCrtc = crtc;
         // Track the mode's real frame duration so the tick matches the negotiated refresh rate.
@@ -2441,8 +2521,15 @@ impl VblankSupport for VinoCrtc {
             data.vblank.interval_ns.store(fd as i64, Ordering::Relaxed);
         }
         // Publish the CRTC for the timer callback. Only the first enable stores it; the CRTC a
-        // given timer serves never changes.
-        data.vblank.crtc.populate(crtc.to_owned_ref());
+        // given timer serves never changes, and re-taking the reference on every enable would just
+        // leak one `drm_dev_get()` per DPMS cycle. `lock_with` because the DRM core already called
+        // us with local interrupts disabled -- proven by the `irq` token.
+        {
+            let mut published = data.vblank.crtc.lock_with(irq);
+            if published.is_none() {
+                *published = Some(crtc.to_owned_ref());
+            }
+        }
         data.vblank.enabled.store(true, Ordering::Relaxed);
         let interval = data.vblank.interval_ns.load(Ordering::Relaxed);
         // The started timer is registered on the DEVICE, so teardown can cancel it without
