@@ -1347,6 +1347,72 @@ pub(crate) mod wht {
         frame_records(&strips, head)
     }
 
+    /// Encode ONE 64x16 strip whose top-left output pixel is `(sx, sy)`.
+    ///
+    /// This is the unit of work both frame encoders are built from, and it is the reason a
+    /// parallel encode is possible at all: a strip reads only its own 64x16 region through `px`
+    /// and produces its own independent byte vector, sharing no state with any other strip. The
+    /// scanout encoder in `drm_sink.rs` fans batches of these across CPUs; see `EncodeChunk`.
+    pub(crate) fn colour_strip_at(
+        sx: usize,
+        sy: usize,
+        px: &mut impl FnMut(usize, usize) -> (u8, u8, u8),
+    ) -> Result<KVec<u8>> {
+        let blocks = colour_strip_blocks(sx, sy, px)?;
+        colour_strip(&blocks, sx as u16, sy as u16)
+    }
+
+    /// The raster-ordered top-left coordinate of every strip a damage set selects.
+    ///
+    /// Split out of [`colour_frame_ep08_damage`] so the serial and parallel encoders select
+    /// exactly the same strips in exactly the same order. **The order is load-bearing:**
+    /// [`frame_records`] groups strips into one record per single-Y band and requires them
+    /// x-ordered within each band, so reordering here changes the wire format.
+    ///
+    /// A strip is selected iff a clip overlaps the 256x64 MACRO-TILE containing it (DLM's damage
+    /// granularity -- see `MACRO_W`/`MACRO_H` and `docs/DLM-DAMAGE-TILING.md`). DLM re-sends every
+    /// strip of a touched macro-tile; matching that avoids the stale-strip torn updates a
+    /// per-strip selection produced.
+    pub(crate) fn damage_strip_coords(
+        width: usize,
+        height: usize,
+        clips: &[(usize, usize, usize, usize)],
+    ) -> Result<KVec<(usize, usize)>> {
+        let mut coords: KVec<(usize, usize)> = KVec::new();
+        let mut sy = 0usize;
+        while sy < height {
+            let mut sx = 0usize;
+            while sx < width {
+                let mx = (sx / MACRO_W) * MACRO_W;
+                let my = (sy / MACRO_H) * MACRO_H;
+                let hit = clips.iter().any(|&(x0, y0, x1, y1)| {
+                    mx < x1 && x0 < mx + MACRO_W && my < y1 && y0 < my + MACRO_H
+                });
+                if hit {
+                    coords.push((sx, sy), GFP_KERNEL)?;
+                }
+                sx += STRIP_W;
+            }
+            sy += STRIP_H;
+        }
+        Ok(coords)
+    }
+
+    /// Every strip of a full frame, in the same raster order as [`damage_strip_coords`].
+    pub(crate) fn all_strip_coords(width: usize, height: usize) -> Result<KVec<(usize, usize)>> {
+        let mut coords: KVec<(usize, usize)> = KVec::new();
+        let mut sy = 0usize;
+        while sy < height {
+            let mut sx = 0usize;
+            while sx < width {
+                coords.push((sx, sy), GFP_KERNEL)?;
+                sx += STRIP_W;
+            }
+            sy += STRIP_H;
+        }
+        Ok(coords)
+    }
+
     /// Call counter for the per-strip encode breakdown logged by the damage encoder.
     static ENCODE_LOG_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -1377,34 +1443,17 @@ pub(crate) mod wht {
         if width % STRIP_W != 0 || height % STRIP_H != 0 {
             return Err(kernel::error::code::EINVAL);
         }
-        let mut strips: KVec<KVec<u8>> = KVec::new();
-        let (mut blocks_us, mut packs_us, mut nstrips) = (0i64, 0i64, 0usize);
-        let mut sy = 0usize;
-        while sy < height {
-            let mut sx = 0usize;
-            while sx < width {
-                // Include this strip iff any damage clip overlaps the 256x64 MACRO-TILE that contains
-                // it (DLM's damage granularity -- see MACRO_W/MACRO_H and docs/DLM-DAMAGE-TILING.md).
-                // DLM re-sends every strip of a touched macro-tile; matching that avoids the
-                // stale-strip torn updates a per-strip selection produced.
-                let mx = (sx / MACRO_W) * MACRO_W;
-                let my = (sy / MACRO_H) * MACRO_H;
-                let hit = clips.iter().any(|&(x0, y0, x1, y1)| {
-                    mx < x1 && x0 < mx + MACRO_W && my < y1 && y0 < my + MACRO_H
-                });
-                if hit {
-                    let t0 = Instant::<Monotonic>::now();
-                    let blocks = colour_strip_blocks(sx, sy, &mut px)?;
-                    let t1 = Instant::<Monotonic>::now();
-                    strips.push(colour_strip(&blocks, sx as u16, sy as u16)?, GFP_KERNEL)?;
-                    let t2 = Instant::<Monotonic>::now();
-                    blocks_us += (t1 - t0).as_micros_ceil();
-                    packs_us += (t2 - t1).as_micros_ceil();
-                    nstrips += 1;
-                }
-                sx += STRIP_W;
-            }
-            sy += STRIP_H;
+        let coords = damage_strip_coords(width, height, clips)?;
+        let mut strips: KVec<KVec<u8>> = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
+        let (mut blocks_us, mut packs_us, nstrips) = (0i64, 0i64, coords.len());
+        for &(sx, sy) in coords.iter() {
+            let t0 = Instant::<Monotonic>::now();
+            let blocks = colour_strip_blocks(sx, sy, &mut px)?;
+            let t1 = Instant::<Monotonic>::now();
+            strips.push(colour_strip(&blocks, sx as u16, sy as u16)?, GFP_KERNEL)?;
+            let t2 = Instant::<Monotonic>::now();
+            blocks_us += (t1 - t0).as_micros_ceil();
+            packs_us += (t2 - t1).as_micros_ceil();
         }
         let t3 = Instant::<Monotonic>::now();
         let records = frame_records(&strips, head)?;

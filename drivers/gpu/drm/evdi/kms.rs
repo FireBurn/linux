@@ -56,6 +56,12 @@ pub(crate) const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 static PRIMARY_FORMATS: [u32; 1] = [DRM_FORMAT_XRGB8888];
 
 /// Fallback mode advertised before the DLM client delivers an EDID via CONNECT.
+/// Multiplier applied to the DLM client's raw pixel-rate limit before `mode_valid` enforces it --
+/// see [`EvdiDrmData::set_mode_limits`] for why the raw figure is an under-estimate. `1` restores
+/// the previous behaviour exactly (and caps this dock at 1440p@120); raise it to offer higher-rate
+/// modes to the compositor.
+const BANDWIDTH_HEADROOM: u32 = 2;
+
 const FALLBACK_W: u32 = 1024;
 const FALLBACK_H: u32 = 768;
 
@@ -237,12 +243,36 @@ impl EvdiDrmData {
     /// Store the dock bandwidth limits the client supplied via CONNECT, for
     /// [`EvdiConnector`]'s `mode_valid` to enforce. Must be called before the EDID is
     /// published (`set_edid`'s hotplug re-probes the mode list against these limits).
+    ///
+    /// ★ 2026-07-26: the raw figure is scaled by [`BANDWIDTH_HEADROOM`] before being stored.
+    /// DLM supplies `pixels_per_second` as `sku_area_limit * 60` -- for this panel exactly
+    /// **442,368,000**, i.e. one 2560x1440@120 -- and it is a RAW pixel-rate proxy that takes no
+    /// account of DisplayLink's on-wire compression. Stored unscaled it made `mode_valid` admit
+    /// @120 (which compares equal) and reject **every** higher mode, so a 1440p165/180 monitor was
+    /// advertised to the compositor as a 60/85/120 monitor with no indication why. That is not the
+    /// EDID being trimmed -- the full 384-byte blob including its DisplayID block reaches
+    /// `add_edid_modes` intact -- it is purely this ceiling.
+    ///
+    /// The scaling matches the standalone `revdi/module/kms.rs`, which has carried it since the
+    /// dual-head work: macOS drives dual 1440p@120 on this same dock, so the real compressed USB-3
+    /// bandwidth demonstrably has headroom the raw proxy does not credit.
+    ///
+    /// ⚠ This governs only what is **offered**. Whether the dock will actually light a given mode
+    /// is a separate question -- vino sent 1440p165 and 1440p180 with correct clocks and the panel
+    /// stayed dark (`docs/HIGH-REFRESH.md`). Raising this makes the modes selectable so that
+    /// question can be asked; it does not answer it.
     pub(crate) fn set_mode_limits(&self, pixel_area: u32, pixels_per_second: u32) {
         let ptr = self.connector.load(core::sync::atomic::Ordering::Acquire);
         // SAFETY: as in `set_edid` -- `connector` was stashed during probe and outlives the device.
         let Some(connector) = (unsafe { ptr.as_ref() }) else {
             return;
         };
+        let pixels_per_second = pixels_per_second.saturating_mul(BANDWIDTH_HEADROOM);
+        pr_info!(
+            "evdi: mode limits -- area {pixel_area}, pixel rate {pixels_per_second}/s \
+             (client supplied {}/s x{BANDWIDTH_HEADROOM} compression headroom)\n",
+            pixels_per_second / BANDWIDTH_HEADROOM
+        );
         connector
             .pixel_area_limit
             .store(pixel_area, Ordering::Relaxed);

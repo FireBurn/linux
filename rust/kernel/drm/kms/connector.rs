@@ -680,6 +680,36 @@ impl<'a, T: DriverConnector> ConnectorGuard<'a, T> {
         unsafe { bindings::drm_set_preferred_mode(self.as_raw(), h_pref, w_pref) }
     }
 
+    /// Add a driver-synthesised CVT mode to this connector's probed mode list.
+    ///
+    /// For a display whose EDID declares continuous frequencies, a driver may legitimately offer a
+    /// timing the EDID does not itself enumerate. `reduced` selects CVT reduced blanking (CVT-RB),
+    /// which matters when the *pixel clock* rather than the pixel rate is the constrained
+    /// resource -- RB cuts the clock for the same active pixels.
+    ///
+    /// Returns `EINVAL` if the core could not build the timing.
+    pub fn add_cvt_mode(
+        &self,
+        hdisplay: i32,
+        vdisplay: i32,
+        vrefresh: i32,
+        reduced: bool,
+    ) -> Result {
+        let dev = self.drm_dev().as_raw();
+        // SAFETY: `dev` is this connector's live `drm_device`; `drm_cvt_mode` only computes a
+        // timing and allocates it, and we hold the mode-config lock via our type invariants.
+        let mode = unsafe {
+            bindings::drm_cvt_mode(dev, hdisplay, vdisplay, vrefresh, reduced, false, false)
+        };
+        if mode.is_null() {
+            return Err(EINVAL);
+        }
+        // SAFETY: `mode` was just allocated by `drm_cvt_mode` and ownership passes to the
+        // connector here; we hold the locks required to modify its mode list.
+        unsafe { bindings::drm_mode_probed_add(self.as_raw(), mode) };
+        Ok(())
+    }
+
     /// Parse an EDID, update the connector information, and add its advertised modes.
     ///
     /// Returns the number of modes added.

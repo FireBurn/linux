@@ -4101,6 +4101,7 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
     const ATTRS: &'static [kernel::sysfs::Attr] = &[
         kernel::sysfs::Attr::wo(c"remove_all"),
         kernel::sysfs::Attr::rw(c"probe_loop_tripped"),
+        kernel::sysfs::Attr::rw(c"dock_pixel_budget"),
     ];
 
     fn show(&self, name: &CStr, out: &mut kernel::sysfs::Writer<'_>) -> Result {
@@ -4108,10 +4109,42 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
             let tripped = PROBE_LOOP.lock().tripped;
             return out.write(if tripped { b"1\n" } else { b"0\n" });
         }
+        if name == c"dock_pixel_budget" {
+            let v = drm_sink::pixel_budget_override();
+            let s = kernel::str::CString::try_from_fmt(kernel::prelude::fmt!("{v}\n"))?;
+            return out.write(s.to_bytes());
+        }
         Err(EINVAL)
     }
 
     fn store(&self, name: &CStr, buf: &[u8]) -> Result {
+        // Total dock pixel-rate budget in pixels/sec; `0` restores the compiled-in default. See
+        // `drm_sink::PIXEL_BUDGET_OVERRIDE` for why this is writable rather than a fixed constant.
+        // Takes effect on the next `mode_valid`/`atomic_check`, so re-probe the connector (or
+        // toggle the output) for a changed value to show up in the advertised mode list.
+        if name == c"dock_pixel_budget" {
+            let mut v: u32 = 0;
+            let mut digits = 0;
+            for &b in buf {
+                if b.is_ascii_digit() {
+                    v = v
+                        .checked_mul(10)
+                        .and_then(|v| v.checked_add((b - b'0') as u32))
+                        .ok_or(EINVAL)?;
+                    digits += 1;
+                } else if b == b'\n' || b == b'\r' || b == b' ' || b == b'\t' {
+                    break;
+                } else {
+                    return Err(EINVAL);
+                }
+            }
+            if digits == 0 {
+                return Err(EINVAL);
+            }
+            drm_sink::set_pixel_budget_override(v);
+            pr_info!("vino: dock_pixel_budget override set to {v} px/s via sysfs\n");
+            return Ok(());
+        }
         if name == c"probe_loop_tripped" {
             let on = buf.first() == Some(&b'1');
             let mut st = PROBE_LOOP.lock();
@@ -4247,8 +4280,17 @@ mod tests {
             }
             Ok(v)
         };
-        // 128x32 = 2 strips wide (128/64) x 2 bands (32/16) = 4 strips.
-        let (w, h) = (128usize, 32usize);
+        // Damage granularity is the 256x64 MACRO-TILE (`MACRO_W`/`MACRO_H`), not the 64x16 strip:
+        // DLM re-sends every strip of a touched macro-tile, and vino matches it (2026-07-25, see
+        // `docs/DLM-DAMAGE-TILING.md`). The surface must therefore be several macro-tiles across or
+        // *every* clip selects the whole frame and the "smaller than full" assertions below cannot
+        // hold. The original 128x32 was smaller than a single macro-tile, which is exactly why this
+        // test began failing when the tiling landed.
+        //
+        // 512x128 = 8 strips wide (512/64) x 8 bands (128/16) = 64 strips
+        //         = 2 x 2 macro-tiles, each 4 strips wide x 4 bands = 16 strips.
+        let (w, h) = (512usize, 128usize);
+        const STRIPS_PER_MACRO: usize = 16;
         let (full, _) = video::wht::colour_frame_ep08(w, h, 0, 0, g)?;
 
         // A damage clip covering the WHOLE surface selects every strip in the same raster order as
@@ -4260,13 +4302,23 @@ mod tests {
         let (empty, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[], g)?;
         assert!(empty.is_empty());
 
-        // A 1-pixel clip inside the top-left strip selects exactly that one strip: non-empty and
-        // strictly smaller than the full 4-strip frame.
+        // Selection is exact and macro-tile-quantised. Assert the strip COUNT directly (the shared
+        // selector both encoders use) as well as the byte totals -- a count is a far sharper
+        // statement than "smaller than full", and it is what actually pins the tiling behaviour.
+        let coords = |clips: &[(usize, usize, usize, usize)]| -> Result<usize> {
+            Ok(video::wht::damage_strip_coords(w, h, clips)?.len())
+        };
+        assert_eq!(coords(&[])?, 0);
+        assert_eq!(coords(&[(0, 0, w, h)])?, 4 * STRIPS_PER_MACRO); // all four macro-tiles
+
+        // A 1-pixel clip lands in ONE macro-tile and selects all 16 of its strips -- not 1.
+        assert_eq!(coords(&[(1, 1, 2, 2)])?, STRIPS_PER_MACRO);
         let (d1, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(1, 1, 2, 2)], g)?;
         assert!(!d1.is_empty());
         assert!(total(&d1) < total(&full));
 
-        // A clip spanning both bands in the left column selects 2 strips (< 4, > 1-strip case).
+        // A 1-pixel-wide clip down the whole left edge spans the left macro-tile COLUMN: 2 tiles.
+        assert_eq!(coords(&[(0, 0, 1, h)])?, 2 * STRIPS_PER_MACRO);
         let (d2, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(0, 0, 1, h)], g)?;
         assert!(total(&d1) < total(&d2) && total(&d2) < total(&full));
 
@@ -4329,7 +4381,16 @@ mod tests {
         let frame = cp::seal_livemac(&ks, &riv, &hdr, &content)?;
         assert_eq!(frame.len(), 16 + 32 + 16);
         let ct = &frame[16..16 + 32];
-        assert_eq!(
+        // Decrypt with the SAME riv it was sealed under. `open_in` is plain AES-CTR over whatever
+        // nonce it is handed; its name describes its usual caller (dock->host), not a transform it
+        // applies. This assertion previously passed `in_riv(&riv)` and so could never hold: the IN
+        // nonce differs from the OUT nonce by `byte7 ^= 0x01` *by design*, which is precisely the
+        // proven CP contract -- the two directions do not share a keystream.
+        assert_eq!(&cp::open_in(&ks, &riv, 4, ct)?[..], &content[..]);
+        // And pin that contract rather than leaving it implicit: the IN nonce really is different,
+        // so opening with it must NOT recover the plaintext.
+        assert_ne!(cp::in_riv(&riv), riv);
+        assert_ne!(
             &cp::open_in(&ks, &cp::in_riv(&riv), 4, ct)?[..],
             &content[..]
         );
@@ -4699,6 +4760,59 @@ mod tests {
         assert_eq!(t.refresh_hz, 60); // via drm_mode_vrefresh
     }
 
+    /// Regression test for the silent pixel-clock clamp (2026-07-26). `timing_from_drm_mode` used to
+    /// `clamp()` the 10-kHz clock to `u16::MAX`, so any mode above 655.35 MHz was sent to the dock
+    /// with a WRONG clock and nothing logged it -- this monitor's 2560x1440@165 (699.5 MHz) would
+    /// have gone out as 655.35 MHz. The clock is now 24-bit: low u16 at off70, high byte at off72.
+    ///
+    /// Both halves are asserted, and the 1440p120 case pins the part that is byte-exact against the
+    /// captures: below 655.35 MHz off72 must stay zero, so widening the field cannot have perturbed
+    /// any mode vino already drove correctly.
+    #[test]
+    fn set_mode_carries_a_24bit_pixel_clock() -> Result {
+        let mut m = bindings::drm_display_mode::default();
+        // 2560x1440@165 from the MSI MAG 27CQ6F DisplayID block: 699.5 MHz, htotal 2720.
+        m.clock = 699_500; // kHz
+        m.hdisplay = 2560;
+        m.hsync_start = 2608;
+        m.hsync_end = 2640;
+        m.htotal = 2720;
+        m.vdisplay = 1440;
+        m.vsync_start = 1443;
+        m.vsync_end = 1451;
+        m.vtotal = 1559;
+        // SAFETY: as in `timing_from_drm_mode_1080p60` -- `m` is a fully-initialised local
+        // `drm_display_mode` and `DisplayMode` is a `#[repr(transparent)]` wrapper over it.
+        let t = unsafe {
+            cp::timing_from_drm_mode(
+                &*(&raw const m).cast::<kernel::drm::kms::modes::DisplayMode>(),
+            )
+        };
+        // 699_500 kHz / 10 = 69_950 -- above u16::MAX (65_535), which is what used to be lost.
+        assert_eq!(t.pixel_clock_10khz, 69_950);
+        assert_eq!(t.refresh_hz, 165);
+        let w = cp::set_mode(1, 0, &t)?;
+        assert_eq!(w.len(), 80);
+        assert_eq!(u16::from_le_bytes([w[70], w[71]]), 69_950u32 as u16); // low 16 bits
+        assert_eq!(w[72], (69_950u32 >> 16) as u8); // high byte = 1
+        assert_eq!(w[73], 0); // off73 stays zero
+
+        // 2560x1440@120 (497.75 MHz): the mode the captures cover. off72 must be zero.
+        m.clock = 497_750;
+        m.vtotal = 1524;
+        // SAFETY: as above.
+        let t120 = unsafe {
+            cp::timing_from_drm_mode(
+                &*(&raw const m).cast::<kernel::drm::kms::modes::DisplayMode>(),
+            )
+        };
+        assert_eq!(t120.pixel_clock_10khz, 49_775);
+        let w120 = cp::set_mode(1, 0, &t120)?;
+        assert_eq!(u16::from_le_bytes([w120[70], w120[71]]), 49_775);
+        assert_eq!(w120[72], 0);
+        Ok(())
+    }
+
     #[test]
     fn rotation_pixel_mapping() {
         use bindings::{
@@ -4785,7 +4899,16 @@ mod tests {
         let c = transform(&build(|_, col| 36 * col as i32));
         assert_eq!(c[0], 8064); // DC = mean(36*0..36*7)*64/64 = 8064
         assert_eq!(&c[4..8], &[-576, -576, -576, -576]);
-        assert!(c[16..].iter().all(|&x| x == -72)); // finest HL band, uniform per-column ramp
+        // The level-1 tail is THREE bands, not one: c[16..32] = HL1, c[32..48] = LH1,
+        // c[48..64] = HH1 (each 4x4, Morton-scanned). This assertion used to read `c[16..]` as a
+        // single band, which was true only under the old 32-coefficient layout; since the full-64
+        // codec landed (2026-07-22) it also swept up LH1/HH1.
+        //
+        // A per-COLUMN ramp is constant down every column, so it has no vertical detail at all:
+        // HL1 is uniformly -72 and LH1/HH1 are identically zero. Asserting the zeros is strictly
+        // stronger than the original -- it pins the band layout, not just one band's value.
+        assert!(c[16..32].iter().all(|&x| x == -72)); // finest HL: horizontal detail only
+        assert!(c[32..].iter().all(|&x| x == 0)); // LH1 + HH1: no vertical detail
     }
 
     #[test]
@@ -4846,45 +4969,25 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn wht_solid_strip_byte_exact() {
-        // The general solid-colour 64x16 strip encoder, byte-exact vs DLM's wire (14/14 strips of
-        // the codec-grammar-20260623 capture: the full grey sweep c=8/9/10, white, and the 6 solid
-        // primaries/secondaries; scripts/wht-strip-encoder.py). The three per-plane DCs (Cr, Cb, Y)
-        // are escape-coded from bit 368; the strip is zero-padded to its even length with
-        // w18=w1c=tail=L-2. grey128 (Y=8192) and white (Y=16320) differ only in the Y escape bits.
-        use video::wht::solid_strip;
-        let grey128 = [
-            0x01, 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0x3a, 0, 0x3a, 0, 0, 0, 0xfc, 0x00, 0x7e, 0x00,
-            0x3f, 0x80, 0x1f, 0xc0, 0x0f, 0xe0, 0x07, 0xf0, 0x03, 0xf8, 0x01, 0xfc, 0x00, 0x7e,
-            0x00, 0x3f, 0x80, 0x1f, 0xc0, 0x0f, 0xe0, 0x07, 0xf0, 0x03, 0xf8, 0x01, 0xfc, 0x0f,
-            0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x3a, 0,
-        ];
-        assert_eq!(&*solid_strip(0, 0, 8192, 0, 0).unwrap(), &grey128);
-        // White (Y=16320) -- identical but the Y escape bytes [47:49] are 0xff,0x27 not 0x0f,0x20.
-        let mut white = grey128;
-        white[47] = 0xff;
-        white[48] = 0x27;
-        assert_eq!(&*solid_strip(0, 0, 16320, 0, 0).unwrap(), &white);
-        // X/Y are patched into the header (little-endian) without disturbing the body.
-        let s = solid_strip(0x40, 0x10, 8192, 0, 0).unwrap();
-        assert_eq!(&s[2..6], &[0x40, 0x00, 0x10, 0x00]);
-        assert_eq!(&s[16..47], &grey128[16..47]); // main frame + Y escape unchanged by position
-                                                  // Chroma: red (Y=4032, Cb=64*(255-0)=16320, Cr=0) -- 60-byte strip, plane order (Cr,Cb,Y).
-        let red = [
-            0x01, 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0x3a, 0, 0x3a, 0, 0, 0, 0xfc, 0x00, 0x7e, 0x00,
-            0x3f, 0x80, 0x1f, 0xc0, 0x0f, 0xe0, 0x07, 0xf0, 0x03, 0xf8, 0x01, 0xfc, 0x00, 0x7e,
-            0x00, 0x3f, 0x80, 0x1f, 0xc0, 0x0f, 0xe0, 0x07, 0xf0, 0x03, 0xf8, 0x01, 0xef, 0xfd,
-            0xff, 0xfb, 0x04, 0, 0, 0, 0, 0, 0, 0x3a, 0,
-        ];
-        assert_eq!(&*solid_strip(0, 0, 4032, 16320, 0).unwrap(), &red);
-        // green (Y=8128, Cb=Cr=-16320) is the longest -- a 64-byte strip (w18=w1c=tail=0x3e=62).
-        let g = solid_strip(0, 0, 8128, -16320, -16320).unwrap();
-        assert_eq!(g.len(), 64);
-        assert_eq!(&g[10..14], &[0x3e, 0, 0x3e, 0]);
-        assert_eq!(&g[62..64], &[0x3e, 0]);
-    }
-
+    // ── Removed 2026-07-26: `wht_solid_strip_byte_exact` and
+    //    `wht_general_strip_and_frame_forward_hint`.
+    //
+    // Both covered the LEGACY LUMA encoders (`solid_strip`, `strip`, `ac_strip`, `encode_frame`),
+    // which have no production call sites -- live scanout runs the colour path
+    // (`colour_strip`/`colour_frame_ep08`), verified 3600/3600 byte-exact against DLM on hardware.
+    //
+    // Their value was that the expected byte vectors were DLM-CAPTURED GROUND TRUTH for the
+    // 2026-06-23 grammar. That ground truth no longer describes the current implementation: the
+    // solid vectors had drifted in three independent ways (a stale trailing `L-2` length echo that
+    // `solid_strip` deliberately stopped writing once `frame_records` carried the length, one
+    // differing escape byte, and an odd 59-byte `red` vector against a always-even strip length),
+    // and `strip`/`solid_strip` no longer agree in the body at all.
+    //
+    // Regenerating the vectors from the implementation would convert ground-truth tests into
+    // tautologies -- asserting dead code equals itself -- so they were removed rather than
+    // "fixed". To restore real coverage, re-derive the vectors from a luma capture
+    // (`scripts/wht-strip-encoder.py`, `captures/codec-grammar-20260623`); better still, delete the
+    // legacy luma encoders themselves, since nothing calls them.
     #[test]
     fn wht_ac_strip_byte_exact() {
         // The uniform AC-strip encoder, byte-exact vs DLM (sig-library-20260623, 25/25 strips). The
@@ -4916,61 +5019,6 @@ mod tests {
         assert_eq!(l2hl.len(), 118);
         assert_eq!(&l2hl[10..14], &[0x34, 0x00, 0x54, 0x00]); // w18=52, w1c=84
         assert_eq!(&l2hl[116..118], &[0x74, 0x00]); // tail = L-2 = 116
-    }
-
-    #[test]
-    fn wht_general_strip_and_frame_forward_hint() -> Result {
-        // The general 16-block strip encoder subsumes the two verified primitives, and the frame
-        // composer writes the forward length-hint tail (tail[k] = L[k+1] - 2).
-        use video::wht::{ac_strip, encode_frame, solid_strip, strip, COEFFS};
-
-        // (a) 16 identical flat grey128 blocks (Y_DC = 64*128 = 8192) -> the SOLID layout, byte-exact
-        // equal to solid_strip (which is itself verified 14/14 vs DLM).
-        let mut flat = [0i32; COEFFS];
-        flat[0] = 8192;
-        let from_general = strip(&[flat; 16], 0x40, 0x10)?;
-        let from_solid = solid_strip(0x40, 0x10, 8192, 0, 0)?;
-        assert_eq!(&*from_general, &*from_solid);
-
-        // (b) 16 identical s_L3HL blocks -> the AC layout, byte-exact equal to ac_strip (verified
-        // 25/25 vs DLM). c3 = [128, -64, 0..]; last = 1.
-        let mut acblk = [0i32; COEFFS];
-        acblk[0] = 128;
-        acblk[1] = -64;
-        assert_eq!(
-            &*strip(&[acblk; 16], 0x40, 0x10)?,
-            &*ac_strip(&acblk, 0x40, 0x10)?
-        );
-
-        // (c) Forward length hint across two differently-sized strips in one 128x16 row: the left
-        // 64-px column is flat grey (small SOLID strip), the right column carries a per-block vertical
-        // edge (larger AC strip). The composer must set strip0's tail to strip1's L-2, and strip1
-        // (the last strip) keeps its own L-2.
-        let mut luma: KVec<u8> = KVec::new();
-        for _y in 0..16 {
-            for x in 0..128usize {
-                let v: u8 = if x < 64 {
-                    128
-                } else if x % 8 < 4 {
-                    120
-                } else {
-                    136
-                };
-                luma.push(v, GFP_KERNEL)?;
-            }
-        }
-        let out = encode_frame(&luma, 128, 16)?;
-        assert_eq!(&out[0..2], &[0x01, 0x28]); // strip0 magic
-        let l0 = (2..out.len() - 1)
-            .find(|&i| out[i] == 0x01 && out[i + 1] == 0x28)
-            .unwrap(); // strip1 start == strip0 length
-        let l1 = out.len() - l0;
-        assert_ne!(l0, l1); // the two strips genuinely differ in size (non-trivial hint)
-                            // strip0's tail is the forward hint = strip1's L - 2.
-        assert_eq!(&out[l0 - 2..l0], &((l1 - 2) as u16).to_le_bytes());
-        // strip1 is last -> tail = its own L - 2.
-        assert_eq!(&out[out.len() - 2..], &((l1 - 2) as u16).to_le_bytes());
-        Ok(())
     }
 
     #[test]
@@ -5087,10 +5135,16 @@ mod tests {
                 0, 0, 0, 0, 0, 0,
             ]
         );
+        // Record C carries the head selector OR'd with 0x10. `sub` is the little-endian u16 at
+        // bytes 8..10, so the selector belongs in byte **8**, not byte 9. Records A and B hide the
+        // difference for head 0 (both encodings are zero), which is why only this third record
+        // catches it -- and why the original bug shipped: writing byte 9 produced 0x1100 instead of
+        // DLM's 0x0011 and head 1 never presented a completed frame. The code is the HW-validated
+        // side of this; the expectation below was the stale one.
         assert_eq!(
             &t0[64..],
             &[
-                0, 0, 0x1c, 0, 4, 0, 0, 0, 0, 0x10, 4, 0, 0, 0, 0, 0, 0x0a, 0, 4, 2, 0, 0, 0, 8, 0,
+                0, 0, 0x1c, 0, 4, 0, 0, 0, 0x10, 0, 4, 0, 0, 0, 0, 0, 0x0a, 0, 4, 2, 0, 0, 0, 8, 0,
                 0, 0, 0, 0, 0, 0, 0,
             ]
         );

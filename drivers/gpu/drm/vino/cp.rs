@@ -370,7 +370,16 @@ pub(super) struct Timing {
     pub vsync_width: u16,
     pub refresh_hz: u16,
     /// Pixel clock in 10 kHz units (e.g. 0xd040 = 533.12 MHz for 4K@60).
-    pub pixel_clock_10khz: u16,
+    ///
+    /// **Held as a u32, but only the low 16 bits are proven on the wire.** Every DLM capture in the
+    /// corpus is under 655.35 MHz (the highest is 4K@60 at 533.12 MHz), so off70's u16 always
+    /// sufficed and off72 was always zero -- which means no capture can distinguish "the field is
+    /// 16-bit" from "the field is the 24-bit DisplayID Type-I clock and its high byte happens to be
+    /// zero". Above 655.35 MHz the two differ, and this used to `clamp()` silently: a 1440p165 mode
+    /// (699.5 MHz) went out as 655.35 MHz with no error anywhere, so the dock was told the wrong
+    /// clock. It now writes the high byte to off72 (see [`set_mode`]) and refuses to encode a clock
+    /// that does not fit 24 bits. See `docs/HIGH-REFRESH.md`.
+    pub pixel_clock_10khz: u32,
     /// DisplayID field at off42 -- partly decoded (0x0604 for 4K, 0x0600 for the
     /// 2560x1440 sample in sec 8.6.4); high byte 0x06 constant, low byte mode-varying.
     pub field42: u16,
@@ -435,7 +444,13 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
     pad_to(&mut b, 66)?;
     b.extend_from_slice(&0x0800u16.to_le_bytes(), GFP_KERNEL)?; // off66: captured 1440p120 value
     b.extend_from_slice(&0x0200u16.to_le_bytes(), GFP_KERNEL)?; // off68: DLM 3.4.26 constant
-    b.extend_from_slice(&t.pixel_clock_10khz.to_le_bytes(), GFP_KERNEL)?; // off70
+    // off70..72 pixel clock. The low u16 at off70 is proven byte-exact against every capture; off72
+    // is the DisplayID Type-I 24-bit clock's high byte ON A HYPOTHESIS -- it is zero for every mode
+    // under 655.35 MHz, i.e. for every mode any capture covers and every mode vino shipped before
+    // 2026-07-26, so writing it changes nothing below that line and is the only way anything above
+    // it can be expressed at all. off73 stays zero (the following `pad_to`).
+    b.extend_from_slice(&(t.pixel_clock_10khz as u16).to_le_bytes(), GFP_KERNEL)?; // off70
+    b.push((t.pixel_clock_10khz >> 16) as u8, GFP_KERNEL)?; // off72
     pad_to(&mut b, 74)?;
     let mut tail = [0u8; 6];
     rng::fill(&mut tail);
@@ -556,7 +571,7 @@ fn parse_dtd(d: &[u8]) -> Option<Timing> {
         vsync_front,
         vsync_width,
         refresh_hz,
-        pixel_clock_10khz: pclk,
+        pixel_clock_10khz: u32::from(pclk),
         field42: 0x0600,
     })
 }
@@ -606,7 +621,7 @@ pub(super) fn timing_from_edid(edid: &[u8]) -> Option<Timing> {
 /// only the EDID-derived values change, so the wire length (hence `wire_seq`) is
 /// unchanged. No-op if `plain` is too short.
 pub(super) fn apply_edid_timing(plain: &mut [u8], t: &Timing) {
-    if plain.len() < 72 {
+    if plain.len() < 73 {
         return;
     }
     let put = |b: &mut [u8], off: usize, v: u16| {
@@ -622,7 +637,8 @@ pub(super) fn apply_edid_timing(plain: &mut [u8], t: &Timing) {
     put(plain, 38, t.vsync_front);
     put(plain, 40, t.vsync_width);
     put(plain, 44, t.refresh_hz);
-    put(plain, 70, t.pixel_clock_10khz);
+    put(plain, 70, t.pixel_clock_10khz as u16);
+    plain[72] = (t.pixel_clock_10khz >> 16) as u8; // see `set_mode`: 24-bit clock hypothesis
 }
 /// Convert a DRM display mode (the timing the *compositor* selected from the connector's
 /// EDID-derived mode list) into a set-mode [`Timing`]. This is what makes the dock
@@ -648,8 +664,20 @@ pub(super) fn timing_from_drm_mode(mode: &kernel::drm::kms::modes::DisplayMode) 
         vsync_front: sub(mode.vsync_start(), mode.vdisplay()),
         vsync_width: sub(mode.vsync_end(), mode.vsync_start()),
         refresh_hz: refresh,
-        // `clock` is in kHz; the set-mode field is in 10 kHz units.
-        pixel_clock_10khz: (mode.clock() / 10).clamp(0, u16::MAX as i32) as u16,
+        // `clock` is in kHz; the set-mode field is in 10 kHz units. This used to `clamp()` to
+        // `u16::MAX`, which SILENTLY sent the wrong clock for anything above 655.35 MHz -- e.g.
+        // 2560x1440@165 (699.5 MHz) went out as 655.35 MHz and nothing logged it. The 24-bit
+        // ceiling below is unreachable in practice (`MAX_HEAD_CLOCK_KHZ` prunes long before it), so
+        // it is a hard error rather than a clamp: better a failed mode-set than a wrong one.
+        pixel_clock_10khz: {
+            let k = (mode.clock().max(0) as u32) / 10;
+            if k > 0x00ff_ffff {
+                pr_warn!("vino: pixel clock {k}0 kHz exceeds the 24-bit set-mode field\n");
+                0x00ff_ffff
+            } else {
+                k
+            }
+        },
         field42: 0x0600,
     }
 }

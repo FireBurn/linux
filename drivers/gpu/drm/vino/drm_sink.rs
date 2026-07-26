@@ -51,13 +51,13 @@ use kernel::{
         },
         KmsDriver, ModeConfigGuard, ModeConfigInfo, ModeObject as _, UnregisteredKmsDevice,
     },
-    error::code::{EINVAL, ENOTSUPP, ENXIO},
+    error::code::{EINVAL, ENOMEM, ENOTSUPP, ENXIO},
     i2c, impl_has_hr_timer,
     interrupt::LocalInterruptDisabled,
     prelude::*,
     sync::{
-        aref::ARef, new_mutex, new_spinlock, new_spinlock_irq, Arc, ArcBorrow, Mutex, SpinLock,
-        SpinLockIrq,
+        aref::ARef, new_mutex, new_spinlock, new_spinlock_irq, Arc, ArcBorrow, Completion, Mutex,
+        SpinLock, SpinLockIrq,
     },
     time::{
         delay::fsleep,
@@ -93,9 +93,20 @@ const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
 /// Cursor-plane format list.
 static CURSOR_FORMATS: [u32; 1] = [DRM_FORMAT_ARGB8888];
 
-/// Per-mode pixel-clock ceiling (kHz) -- about 4K@60 (CEA 594 MHz). Modes above this are pruned
-/// by the connector `mode_valid` hook ([`VinoConnector::mode_valid`]).
-const MAX_HEAD_CLOCK_KHZ: i32 = 600_000;
+/// Per-mode pixel-clock ceiling (kHz). Modes above this are pruned by the connector `mode_valid`
+/// hook ([`VinoConnector::mode_valid`]).
+///
+/// Was 600,000 ("about 4K@60, CEA 594 MHz"), which silently pruned every high-refresh mode a
+/// 1440p gaming panel offers: the MSI MAG 27CQ6F on this dock advertises 2560x1440@165
+/// (699.5 MHz) and @180 (714.81 MHz) in its DisplayID block, and both were dropped as
+/// `ClockHigh` before any of vino's own logic saw them. It is raised to 750,000 -- comfortably
+/// past that panel's own 720 MHz max-dotclock limit, so the *monitor's* EDID stays the thing that
+/// bounds the mode list, which is what `mode_valid` is for.
+///
+/// ⚠ This is not evidence the D6000 can drive 720 MHz downstream; nothing in the corpus says
+/// either way, and DLM was never observed above 1440p120. It only stops vino from pruning the
+/// question before the dock can answer it. See `docs/HIGH-REFRESH.md`.
+const MAX_HEAD_CLOCK_KHZ: i32 = 750_000;
 
 /// **Hardware experiment 2026-07-23 — RESULT: NEGATIVE, both left `false`.**
 ///
@@ -151,6 +162,26 @@ const TEST_FORCE_FULL_FRAMES: bool = false;
 /// snapshot path is ever changed, where it becomes a direct regression test again.
 const TEST_DETECT_BUFFER_RECYCLE: bool = false;
 
+/// Runtime override for the dock's total pixel-rate budget, in pixels/sec; `0` = use the
+/// compiled-in per-device default. Backs `/sys/devices/vino/dock_pixel_budget`.
+///
+/// The default (884,736,000) is an **estimate**, not a decoded dock field -- one 1440p@120 times a
+/// factor-of-two compression allowance -- and it is the only thing standing between this driver and
+/// a mode the monitor genuinely supports. Published DL-6950 capability (2x 4K@60 = 995,328,000
+/// px/s) suggests it is if anything too low. Rather than replace one guess with another, the figure
+/// is made writable so a hardware run can move it and observe the dock's answer, which costs an
+/// `echo` instead of a rebuild-and-reboot. Global rather than per-device: vino drives one dock.
+static PIXEL_BUDGET_OVERRIDE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Read/write accessors for [`PIXEL_BUDGET_OVERRIDE`], for the sysfs attribute in `vino.rs`.
+pub(super) fn pixel_budget_override() -> u32 {
+    PIXEL_BUDGET_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed)
+}
+pub(super) fn set_pixel_budget_override(v: u32) {
+    PIXEL_BUDGET_OVERRIDE.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// **The single head-count knob** for the whole driver. Every per-head array/loop is sized by this
 /// (`connectors`, `gamma`, `video_keys`, the CP setup in `vino.rs` via `CP_SETUP_HEADS = HEADS`, the
 /// scanout keyframe/arm bitmasks). Which heads actually light up is decided at runtime by per-head
@@ -181,14 +212,24 @@ pub(crate) const VIDEO_EPS: [u8; HEADS] = [0x08, 0x0b];
 const MAX_DAMAGE_CLIPS: usize = 16;
 /// Minimum interval between normal frames for one head.
 ///
-/// **Reverted 2026-07-23 from 16 ms (~60 Hz) to 140 ms**, matching the older steady-state Vino
-/// cadence. Long DLM captures average roughly 7 full fps, but the paired physical COLD capture now
-/// proves that activation is a separate burst phase: frames start 24--35 ms apart until the
-/// downstream clock is programmed. Do not lower this ordinary-desktop throttle to reproduce that
-/// burst -- doing so makes every compositor flip pay for a multi-megabyte encode. The bounded
-/// [`COLD_TRAINING_PRESENTATIONS`] replay below reuses one encoding to keep the endpoint busy during
-/// training, then returns to this normal cadence.
-const FRAME_PERIOD_MS: i64 = 140;
+/// **140 -> 16 ms on 2026-07-26, once the encoder stopped being the cost.** The 140 ms value was
+/// set on 2026-07-23 with the reasoning "do not lower this, doing so makes every compositor flip
+/// pay for a multi-megabyte encode" -- correct at the time, when one frame cost ~155 ms to encode.
+/// The parallel encoder (see [`parallel_strip_encode`]) changed the arithmetic: measured on hardware, a
+/// damage delta is now `hash 2 ms + encode 4--13 ms + wire 1--7 ms` = **7--22 ms end to end**, and
+/// a full frame ~98 ms. At 140 ms this throttle, not the pipeline, was the limiter -- a hard 7.1 fps
+/// cap that the user reported as visible sluggishness against DLM.
+///
+/// This is a *minimum interval*, not a target, so a frame that genuinely costs more than 16 ms
+/// simply paces itself; nothing is queued up or dropped by shortening it.
+///
+/// ⚠ **Known interaction to watch.** [`queue_scanout`] skips the snapshot while `shadow_busy`, so
+/// the closer the cadence gets to the encode time, the more often a commit lands mid-encode and
+/// falls back to reading the compositor's live framebuffer -- the buffer-recycling race that caused
+/// the drag artifacting (see [`ShadowSurface`]). 33 ms would leave clear air between deltas; 16 ms
+/// deliberately does not. If tearing reappears under a drag, this is the first thing to raise, and
+/// the real fix is double-buffering the shadow rather than re-throttling.
+const FRAME_PERIOD_MS: i64 = 16;
 
 /// How long the compositor must have been quiet before the worker will read a framebuffer directly
 /// instead of a [`ShadowSurface`].
@@ -295,12 +336,14 @@ type BoundInterface<'a> = super::UsbLink<'a>;
 
 /// Exact-enough generation key for one timing. Width/height alone is not a generation: switching
 /// 2560x1440@60 -> @120 used to leave the same key and allowed the old frame to cross the new
-/// mode-set. The four u16 wire fields fit losslessly in one atomic u64.
+/// mode-set. Still lossless: the pixel clock widened to 24 bits when >655.35 MHz modes became
+/// expressible, so refresh moved into the 8 bits above it (it is a whole-Hz rate -- this monitor
+/// tops out at 180 and no DisplayLink head approaches 255).
 fn timing_key(t: &super::cp::Timing) -> u64 {
     ((t.hactive as u64) << 48)
         | ((t.vactive as u64) << 32)
-        | ((t.refresh_hz as u64) << 16)
-        | t.pixel_clock_10khz as u64
+        | (((t.refresh_hz & 0xff) as u64) << 24)
+        | (t.pixel_clock_10khz & 0x00ff_ffff) as u64
 }
 
 /// Content of the last frame successfully submitted for one head, represented in the dock's native
@@ -388,6 +431,8 @@ struct PendingScanout {
     /// This flip's pixels were copied into [`VinoDrmData::shadow`] during the atomic commit, so the
     /// worker must encode from there and never from `fb`. See [`ShadowSurface`].
     from_shadow: bool,
+    /// Which of the head's [`SHADOW_SLOTS`] surfaces holds them. Meaningless when `!from_shadow`.
+    shadow_idx: usize,
 }
 
 impl Clone for PendingScanout {
@@ -404,6 +449,7 @@ impl Clone for PendingScanout {
             // copy is always framebuffer-backed. Only the settle repaint clones, and it only ever
             // runs against an idle compositor.
             from_shadow: false,
+            shadow_idx: 0,
         }
     }
 }
@@ -428,10 +474,28 @@ impl Clone for PendingScanout {
 /// Stored compactly at `w * 4` stride (GEM dumb pitch is padded); the encoder takes the stride as a
 /// parameter, so every damage/rotation/gamma path works against this exactly as against a mapped
 /// framebuffer. The allocation is reused across frames and only reallocated when the mode changes.
+/// Per-head snapshot surfaces.
+///
+/// TWO, so the atomic commit can copy into the surface the worker is not currently encoding from.
+/// With one, every commit landing mid-encode fell back to the compositor's live buffer -- and that
+/// path is deliberately serial, so after the encoder was parallelised the fallback cost 49 ms
+/// against 6.8 ms for an equivalent shadow-backed frame. Costs `SHADOW_SLOTS * w * h * 4` per head
+/// (~29 MB per head at 1440p); three would nearly always avoid the fallback but is not worth the
+/// memory, since a snapshot is paced at `FRAME_PERIOD_MS` and an encode is now far shorter.
+const SHADOW_SLOTS: usize = 2;
+
 struct ShadowSurface {
     w: usize,
     h: usize,
     pixels: KVVec<u8>,
+    /// Per-strip content hashes, computed **during** the copy in [`snapshot_to_shadow`].
+    ///
+    /// The snapshot and the hash were two separate full passes over the same 14.7 MB, and the hash
+    /// had become **73% of a small delta's total cost** (`hash 2.9 ms` of `~4 ms`). Folding it into
+    /// the copy makes it one pass, with each strip band hashed straight after being written while it
+    /// is still hot in cache. Bit-identical to hashing the surface afterwards: nothing writes this
+    /// buffer between the snapshot and the encode, which is the whole point of it being private.
+    hashes: KVVec<u64>,
 }
 
 /// How long after a keyframe to repaint the same head once more.
@@ -478,23 +542,32 @@ pub(super) struct VinoDrmData {
     /// milliseconds per frame and eventually produced multi-second pageflip timeouts.
     #[pin]
     pending_scanout: Mutex<[Option<PendingScanout>; HEADS]>,
-    /// A one-shot repaint of the head's newest known framebuffer, armed when a keyframe is sent and
-    /// due `SETTLE_REPAINT_MS` later. Cleared as soon as it is taken, or whenever a real flip
-    /// arrives (that flip already carries newer content, so the redundant repaint is pointless).
-    /// See [`SETTLE_REPAINT_MS`] for the hardware observation that motivates it.
+    /// A one-shot repaint of the head's newest known framebuffer. Cleared as soon as it is taken,
+    /// or whenever a real flip arrives (that flip already carries newer content, so the redundant
+    /// repaint is pointless). See [`SETTLE_REPAINT_MS`] for the hardware observation behind it.
+    ///
+    /// The `bool` is "promote to a full keyframe". It is **true** for the post-keyframe settle
+    /// repaint, whose job is to replace a whole stale surface. It is **false** for a *debt* repaint,
+    /// which exists only to carry outstanding `dirty_ttl` retransmissions out to the dock's second
+    /// buffer -- promoting those to a 3.19 MB keyframe would be enormously more expensive than the
+    /// handful of strips actually owed.
     #[pin]
-    settle_repaint: Mutex<[Option<(Instant<Monotonic>, PendingScanout)>; HEADS]>,
+    settle_repaint: Mutex<[Option<(Instant<Monotonic>, PendingScanout, bool)>; HEADS]>,
     /// Per-head private pixel copy taken during the atomic commit. See [`ShadowSurface`] for the
     /// buffer-recycling bug this closes. The worker `take()`s the surface out of this slot for the
     /// duration of an encode and puts it back afterwards, so a long encode never holds the lock
     /// against the commit path.
     #[pin]
-    shadow: Mutex<[Option<ShadowSurface>; HEADS]>,
-    /// Set while the worker has moved a head's [`ShadowSurface`] out of `shadow` for an encode.
-    /// The commit path must not allocate a replacement behind it: the worker puts the original back
-    /// when it finishes, which would discard any snapshot taken in the meantime, and at 120 Hz the
-    /// churn is a 14.7 MB allocation per flip.
-    shadow_busy: [AtomicBool; HEADS],
+    shadow: Mutex<[[Option<ShadowSurface>; SHADOW_SLOTS]; HEADS]>,
+    /// Which slot the worker currently holds for each head, or `-1` for none.
+    ///
+    /// Replaces a plain "busy" flag. With ONE slot, any commit landing during an encode had to skip
+    /// its snapshot and fall back to the compositor's live buffer -- and since the live-buffer path
+    /// is deliberately serial (never parallelise against a buffer KWin can recycle), that fallback
+    /// became the dominant cost once the encoder was parallelised: **49 ms serial vs 6.8 ms
+    /// parallel end-to-end for a comparable frame**. A second slot lets the commit path snapshot
+    /// into the surface the worker is not reading, so those frames stay parallel.
+    shadow_inflight: [AtomicI64; HEADS],
     /// When each head's shadow was last refreshed. Snapshots are paced on their own clock rather
     /// than on `last_frame`, which does not advance while the worker is mid-encode -- every commit
     /// arriving during those ~150 ms would otherwise read as due.
@@ -530,8 +603,36 @@ pub(super) struct VinoDrmData {
     /// The work item that drains `cmd_queue`. Embedded on the `drm::Device` (not `VinoDrmData`
     /// directly) per the safe KMS binding's `WorkItem`/`HasWork` blanket impls -- see
     /// `queue_cmd`'s doc comment for how it's enqueued.
+    ///
+    /// It handles CP/KMS commands **only**. Video scanout moved to the per-head items below on
+    /// 2026-07-26; `cmd_work` re-enqueues both of them when its batch finishes.
     #[pin]
     cmd_work: Work<VinoDrmDevice>,
+    /// ★ Per-head scanout workers, one per display head (2026-07-26).
+    ///
+    /// Previously one worker served both heads round-robin, so a head waited out its neighbour's
+    /// entire encode-plus-transmit before its own could start: at ~6 ms per head that is a hard
+    /// ~83 fps each however fast the cadence allows, and the two heads have genuinely independent
+    /// USB endpoints (EP08 / EP0b) that were being used strictly one at a time.
+    ///
+    /// The prerequisite was the `video_q`/`video_staging` lock split: both used to be a single
+    /// `Mutex` over a both-heads array held across a whole frame's `send()`, so head 1 could not
+    /// touch its own endpoint while head 0 transmitted. With each head taking only its own slot out
+    /// of the array, the two workers never contend for more than the moment of the swap.
+    ///
+    /// Everything else these workers touch is per-head state indexed by their own head
+    /// (`pending_scanout`, `settle_repaint`, `shadow`, `strip_hashes`, `dirty_ttl`, `last_frame`,
+    /// `sustain_until`, and now `scanout_fails`/`scanout_skip`). The one genuinely shared resource
+    /// is the control plane, and `cp_link`'s mutex is held across send *and* receive, so concurrent
+    /// heads serialise the lockstep dialogue rather than interleaving it.
+    ///
+    /// ⚠ The work ID is a *const generic*, so it cannot be computed from a runtime head index --
+    /// hence one field per head and the `enqueue_scanout` match. The assertion below keeps that
+    /// honest if [`HEADS`] is ever raised.
+    #[pin]
+    scanout_work_h0: Work<VinoDrmDevice, 1>,
+    #[pin]
+    scanout_work_h1: Work<VinoDrmDevice, 2>,
     /// Downstream EDID per head. Connector callbacks use their head index to read this owned state;
     /// publishing EDID therefore requires no raw pointer back into a DRM mode object.
     #[pin]
@@ -648,16 +749,42 @@ pub(super) struct VinoDrmData {
     /// Dock-wide pixel-rate budget (pixels/sec), already multiplied by the compression headroom.
     /// The DisplayLink chip has ONE total-throughput budget shared across all heads; without this
     /// two heads can each pass the per-head [`MAX_HEAD_CLOCK_KHZ`] cap while together overrunning the
-    /// dock. Split evenly across the currently-connected heads ([`own_pixel_budget`]) and enforced
-    /// in [`VinoConnector::mode_valid`] + [`VinoCrtc::atomic_check`]. `0` = unknown → no limiting
-    /// (so a wrong/absent value never causes a false mode rejection). Ported from revdi's proven
-    /// dual-head manager; see `docs/CROSS-HEAD-BANDWIDTH-DESIGN.md`.
+    /// dock. Read through [`VinoDrmData::dock_budget`], which lets [`PIXEL_BUDGET_OVERRIDE`] replace
+    /// it at runtime; [`VinoConnector::mode_valid`] prunes against the whole figure and
+    /// [`VinoCrtc::atomic_check`] enforces the combined rate across lit heads
+    /// ([`VinoDrmData::other_heads_rate`]). `0` = unknown → no limiting (so a wrong or absent value
+    /// never causes a false mode rejection). See `docs/CROSS-HEAD-BANDWIDTH-DESIGN.md` and
+    /// `docs/HIGH-REFRESH.md` for why the even split this replaced made 1440p165 unreachable.
     dock_pixel_budget: core::sync::atomic::AtomicU32,
-    /// Consecutive failed live-scanout frames on this device, for log rate-limiting.
-    scanout_fails: core::sync::atomic::AtomicU64,
-    /// Upcoming pageflips to skip before this device's next scanout attempt (backoff while the
-    /// dock NAKs). A single successful frame clears it.
-    scanout_skip: core::sync::atomic::AtomicU64,
+    /// ★ Mutual exclusion between `cmd_work`'s mode-set handling and the per-head scanout workers
+    /// (2026-07-26). Set for the duration of a command batch that contains a `ModeSet`, and only
+    /// such a batch -- a cursor-only batch must not stall video, and cursor moves arrive
+    /// continuously while the mouse is in motion.
+    ///
+    /// ⚠ **Checking `cmd_queue` is not enough**, which is why this exists. `cmd_work` *drains* the
+    /// queue into a local `KVec` before executing anything, so throughout the mode-set -- including
+    /// `submit_prompt_training`, which writes the activation carrier straight to the head's video
+    /// endpoint -- `cmd_queue` is empty and a scanout worker scanning it would see no reason to
+    /// hold off. Two submitters on one endpoint interleave their records on the wire, and
+    /// `submit_prompt_training` would additionally find `video_q[head]` taken out by the worker,
+    /// read that `None` as "not opened yet" and open a *second* queue on the same pipe.
+    ///
+    /// Paired with [`Self::video_inflight`] as a store-then-check handshake, hence `SeqCst` on both
+    /// sides: `Release`/`Acquire` alone permits both parties to miss each other's store.
+    cmd_busy: core::sync::atomic::AtomicBool,
+    /// Set by a scanout worker around the whole of `run_pending_scanout`, so `cmd_work` can wait out
+    /// a frame that was already in flight when it set [`Self::cmd_busy`]. See there.
+    video_inflight: [core::sync::atomic::AtomicBool; HEADS],
+    /// Consecutive failed live-scanout frames **per head**, for log rate-limiting.
+    scanout_fails: [core::sync::atomic::AtomicU64; HEADS],
+    /// Upcoming pageflips to skip before this head's next scanout attempt (backoff while the dock
+    /// NAKs). A single successful frame on that head clears it.
+    ///
+    /// Both were device-wide until per-head scanout workers landed (2026-07-26). That was harmless
+    /// with one worker doing everything in sequence, but with a worker per head it means one head
+    /// NAKing throttles its healthy neighbour's flips and mixes their failure counts into one
+    /// log line. Independent workers need independent backoff.
+    scanout_skip: [core::sync::atomic::AtomicU64; HEADS],
     /// Per-head video key delivered in the bring-up CP setup's `id=0x32` message (decoded dump:
     /// `captures/rr-out-sequence-20260716/cp-dialogue-decoded.txt`). ITS CRYPTOGRAPHIC ROLE IN
     /// EP08 IS NOT YET REVERSE-ENGINEERED -- only the wire slot it belongs in is proven, not
@@ -681,13 +808,15 @@ impl VinoDrmData {
             cmd_queue <- new_mutex!(KVec::new()),
             pending_scanout <- new_mutex!([const { None }; HEADS]),
             settle_repaint <- new_mutex!([const { None }; HEADS]),
-            shadow <- new_mutex!([const { None }; HEADS]),
-            shadow_busy: [const { AtomicBool::new(false) }; HEADS],
+            shadow <- new_mutex!([const { [const { None }; SHADOW_SLOTS] }; HEADS]),
+            shadow_inflight: [const { AtomicI64::new(-1) }; HEADS],
             last_snapshot <- new_spinlock!([const { None }; HEADS]),
             last_flip <- new_spinlock!([const { None }; HEADS]),
             flips: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
             vblank <- new_spinlock!([const { None }; HEADS]),
             cmd_work <- new_work!("vino::kms_cmd"),
+            scanout_work_h0 <- new_work!("vino::scanout_h0"),
+            scanout_work_h1 <- new_work!("vino::scanout_h1"),
             cached_edids <- new_mutex!([const { None }; HEADS]),
             heads_present: core::sync::atomic::AtomicU32::new(0),
             gamma <- new_mutex!([None; HEADS]),
@@ -708,8 +837,10 @@ impl VinoDrmData {
             // D6000 default: 442,368,000 px/s (one 1440p@120) x2 compression headroom = dual
             // 1440p@120. Overwrite from the dock once its budget field is RE'd (CONTROL-PLANE.md).
             dock_pixel_budget: core::sync::atomic::AtomicU32::new(884_736_000),
-            scanout_fails: core::sync::atomic::AtomicU64::new(0),
-            scanout_skip: core::sync::atomic::AtomicU64::new(0),
+            cmd_busy: core::sync::atomic::AtomicBool::new(false),
+            video_inflight: core::array::from_fn(|_| core::sync::atomic::AtomicBool::new(false)),
+            scanout_fails: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
+            scanout_skip: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
             video_keys <- new_mutex!([[0u8; 32]; HEADS]),
         })
     }
@@ -782,13 +913,23 @@ impl VinoDrmData {
         *self.cmd_queue.lock() = KVec::new();
         *self.pending_scanout.lock() = [const { None }; HEADS];
         *self.settle_repaint.lock() = [const { None }; HEADS];
-        *self.shadow.lock() = [const { None }; HEADS];
+        *self.shadow.lock() = [const { [const { None }; SHADOW_SLOTS] }; HEADS];
         *self.strip_hashes.lock() = [const { None }; HEADS];
         *self.dirty_ttl.lock() = [const { None }; HEADS];
         // Cancel the queued drain and reclaim the `ARef<VinoDrmDevice>` the enqueue handed to
         // the workqueue, if it was still pending. Dropping it here releases the self-reference
         // that would otherwise keep this device alive until the work ran.
+        //
+        // ⚠ All three items must be cancelled, and `cmd_work` must go FIRST: it re-enqueues both
+        // scanout workers when its batch finishes, so cancelling a scanout worker while `cmd_work`
+        // could still run would let it come straight back and hold a fresh self-reference past the
+        // point this function claims to have drained everything. `shutting_down` is already
+        // published (checked at the top of each worker loop), so this only has to wait out work
+        // that was already in flight. Missing a `cancel_sync` here is the same class of bug as the
+        // `CrtcRef` cycles that leaked a DRM minor per replug -- see `docs/MODULE-LIFECYCLE.md`.
         drop(self.cmd_work.cancel_sync());
+        drop(self.scanout_work_h0.cancel_sync());
+        drop(self.scanout_work_h1.cancel_sync());
 
         // A running callback may have taken a batch just before shutdown was published. It has
         // finished now; clear anything it left behind and tear the USB queues down while their
@@ -796,7 +937,7 @@ impl VinoDrmData {
         *self.cmd_queue.lock() = KVec::new();
         *self.pending_scanout.lock() = [const { None }; HEADS];
         *self.settle_repaint.lock() = [const { None }; HEADS];
-        *self.shadow.lock() = [const { None }; HEADS];
+        *self.shadow.lock() = [const { [const { None }; SHADOW_SLOTS] }; HEADS];
         *self.strip_hashes.lock() = [const { None }; HEADS];
         *self.dirty_ttl.lock() = [const { None }; HEADS];
         *self.video_q.lock() = [const { None }; HEADS];
@@ -1770,27 +1911,45 @@ impl VinoDrmData {
                 != 0
     }
 
-    /// How many heads on this dock currently have a monitor attached (`present`), for splitting the
-    /// shared pixel-rate budget. At least 1, so a lone head (or a momentary all-disconnected read
-    /// racing `detect`) gets the whole budget rather than dividing by zero.
-    fn connected_heads(&self) -> u32 {
-        self.heads_present
-            .load(core::sync::atomic::Ordering::Acquire)
-            .count_ones()
-            .max(1)
+    /// The dock's total pixel-rate budget (pixels/sec) shared across all heads. `0` = unknown, which
+    /// disables limiting entirely so a wrong or absent value never causes a false mode rejection.
+    /// A non-zero [`PIXEL_BUDGET_OVERRIDE`] wins, so the figure can be moved from userspace without
+    /// a rebuild -- the compiled-in default is an estimate, not an RE'd dock field.
+    fn dock_budget(&self) -> u32 {
+        let over = PIXEL_BUDGET_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed);
+        if over != 0 {
+            return over;
+        }
+        self.dock_pixel_budget
+            .load(core::sync::atomic::Ordering::Relaxed)
     }
 
-    /// This head's even share of the dock's total pixel-rate budget (pixels/sec). `0` = no limit set
-    /// yet (budget unknown). Because every head only ever checks its own share, the sum across heads
-    /// is guaranteed to stay within the total without a global cross-CRTC check.
-    fn own_pixel_budget(&self) -> u32 {
-        let total = self
-            .dock_pixel_budget
-            .load(core::sync::atomic::Ordering::Relaxed);
-        if total == 0 {
-            return 0;
+    /// Combined pixel rate of every head *except* `head` that currently has a mode driven onto it.
+    ///
+    /// This replaces the previous even-split model, where each head was allowed
+    /// `total / connected_heads` and never had to look at its neighbour. That kept the sum within
+    /// the total without a cross-CRTC check, but it also made every head's ceiling depend on a
+    /// monitor merely being *plugged in* rather than lit -- so a dock with two panels attached could
+    /// not run one head above half the budget even with the other head asleep. On this hardware that
+    /// is the difference between offering 2560x1440@165 (608 Mpx/s, fits the whole budget) and
+    /// pruning it as unreachable. `last_timing` records what was actually committed; it survives
+    /// `atomic_disable`, so activity is read from `modeset_requested` (zeroed there) instead.
+    fn other_heads_rate(&self, head: usize) -> u32 {
+        let timings = *self.last_timing.lock();
+        let mut total: u32 = 0;
+        for (i, t) in timings.iter().enumerate() {
+            if i == head || self.modeset_requested[i].load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            if let Some(t) = t {
+                total = total.saturating_add(
+                    u32::from(t.hactive)
+                        .saturating_mul(u32::from(t.vactive))
+                        .saturating_mul(u32::from(t.refresh_hz)),
+                );
+            }
         }
-        total / self.connected_heads()
+        total
     }
 
     /// Queue a [`KmsCmd`] for the async worker and make sure it runs. Pushing never blocks (a
@@ -1832,7 +1991,12 @@ impl VinoDrmData {
         // Enqueue while the queue lock still serializes us with `shutdown()`. Otherwise shutdown
         // could cancel an idle work item between this unlock and enqueue, leaving a late work-owned
         // device reference behind after teardown.
-        let _ = workqueue::system().enqueue(ARef::from(dev));
+        //
+        // `::<_, 0>` names `cmd_work`. The ID is only inferrable while a single `WorkItem` impl
+        // exists; adding the per-head scanout items made every bare `enqueue` ambiguous, which is
+        // exactly the failure mode you want here -- an unannotated enqueue would otherwise be free
+        // to pick the wrong worker.
+        let _ = workqueue::system().enqueue::<_, 0>(ARef::from(dev));
         drop(queue);
     }
 
@@ -1874,13 +2038,28 @@ impl VinoDrmData {
         // the worker spends encoding, so every commit in that window would read as due and copy the
         // surface again. And never snapshot while the worker holds it -- it puts the original back
         // when it finishes, so anything written in the meantime is discarded anyway.
-        if (owes_keyframe || since_snapshot_ms >= FRAME_PERIOD_MS)
-            && !self.shadow_busy[head].load(Ordering::Acquire)
-        {
+        if owes_keyframe || since_snapshot_ms >= FRAME_PERIOD_MS {
+            // Pick a slot the worker is not reading. With two slots there is always one free unless
+            // a still-pending frame occupies the other; in that case fall through to the live
+            // framebuffer exactly as the single-slot code always did.
+            // Avoid ONLY the slot the worker is reading. Reusing the slot a still-pending frame
+            // points at is safe *here* and must be allowed, or the second slot buys nothing: this
+            // branch always produces a snapshotted frame, and a snapshotted frame always replaces
+            // the pending one (the "never evict a snapshotted frame" rule below only guards against
+            // *un*-snapshotted replacements). Both then reference the same slot holding the newest
+            // pixels. Excluding it as well left ~40% of frames on the serial live-buffer path.
+            //
+            // With `SHADOW_SLOTS == 2` and at most one in flight, this never fails.
+            let inflight = self.shadow_inflight[head].load(Ordering::Acquire);
+            let free = (0..SHADOW_SLOTS).find(|&i| i as i64 != inflight);
             let mut shadow = self.shadow.lock();
-            match snapshot_to_shadow(&mut shadow[head], &frame.fb, frame.w, frame.h) {
-                Ok(()) => {
+            match free.ok_or(EBUSY).and_then(|idx| {
+                snapshot_to_shadow(&mut shadow[head][idx], &frame.fb, frame.w, frame.h)?;
+                Ok(idx)
+            }) {
+                Ok(idx) => {
                     frame.from_shadow = true;
+                    frame.shadow_idx = idx;
                     self.last_snapshot.lock()[head] = Some(Instant::<Monotonic>::now());
                 }
                 Err(e) => {
@@ -1907,7 +2086,7 @@ impl VinoDrmData {
             // and this flip's pixels are picked up by the next snapshot.
             if old.from_shadow && !frame.from_shadow {
                 pending[head] = Some(old);
-                let _ = workqueue::system().enqueue(ARef::from(dev));
+                self.enqueue_scanout(dev, head);
                 return;
             }
             if old.w != frame.w || old.h != frame.h || old.rotation != frame.rotation {
@@ -1943,13 +2122,220 @@ impl VinoDrmData {
             }
         }
         pending[head] = Some(frame);
-        let _ = workqueue::system().enqueue(ARef::from(dev));
+        self.enqueue_scanout(dev, head);
         drop(pending);
+    }
+
+    /// Wake `head`'s scanout worker. The work ID is a const generic, so the runtime head index has
+    /// to be matched into it here; the `HEADS == 2` assertion by the `WorkItem` impls keeps this
+    /// exhaustive. Enqueueing an already-pending item is a no-op, and enqueueing one that is
+    /// currently *running* re-arms it -- which is what makes a flip landing mid-encode get picked up
+    /// on the worker's next pass instead of being lost.
+    fn enqueue_scanout(&self, dev: &VinoDrmDevice, head: usize) {
+        match head {
+            0 => {
+                let _ = workqueue::system().enqueue::<_, 1>(ARef::from(dev));
+            }
+            1 => {
+                let _ = workqueue::system().enqueue::<_, 2>(ARef::from(dev));
+            }
+            _ => {}
+        }
+    }
+
+    /// Wait for any frame already in flight on a scanout worker to finish, after [`Self::cmd_busy`]
+    /// has been published. A worker that has not yet started re-checks `cmd_busy` and backs off on
+    /// its own; this only covers one that got past that check before the flag was set.
+    ///
+    /// Bounded, and it proceeds anyway on timeout: a mode-set that never reaches the dock is worse
+    /// than one that races a frame, and this is the path cold activation depends on. The bound is
+    /// generous against a worst-case frame (a ~3.19 MB keyframe: ~21 ms to encode plus its wire
+    /// time), so exceeding it means something is genuinely wedged and the log line is the point.
+    fn wait_for_video_idle(&self) {
+        use core::sync::atomic::Ordering::SeqCst;
+        for _ in 0..500 {
+            if !self.video_inflight.iter().any(|f| f.load(SeqCst)) {
+                return;
+            }
+            fsleep(Delta::from_millis(1));
+        }
+        pr_warn!("vino: timed out waiting for in-flight scanout before a mode-set; proceeding\n");
+    }
+
+    /// Wake every head's scanout worker. Used by `cmd_work` once its batch is done, since a command
+    /// batch is exactly what makes the scanout workers bail (see [`run_scanout_worker`]).
+    fn enqueue_scanout_all(&self, dev: &VinoDrmDevice) {
+        for head in 0..HEADS {
+            self.enqueue_scanout(dev, head);
+        }
+    }
+
+    /// Choose what `head` should transmit next: `(frame, wait_ms)`. A frame means encode and send it
+    /// now; a `wait_ms` means nothing is due yet but something will be in that many milliseconds;
+    /// neither means this head is idle and its worker can exit.
+    ///
+    /// Extracted from the old single worker's round-robin on 2026-07-26. The rotation existed only
+    /// to stop an animated head 0 starving a static head 1; with a worker per head there is nothing
+    /// to arbitrate and the fairness question disappears.
+    fn select_scanout(&self, head: usize) -> (Option<PendingScanout>, Option<i64>) {
+        // Do not TAKE and discard a frame which arrived before the cadence deadline. KWin may stop
+        // committing immediately after that flip (for example, when a window stops moving), so no
+        // later callback would wake us and the newest image would remain missing forever. Leave it
+        // in the coalescing slot, wait for the short remainder, and then pick the newest version of
+        // it. Concurrent flips continue replacing/merging that slot while this worker sleeps.
+        let mut pending = self.pending_scanout.lock();
+        let mut selected = None;
+        let mut wait_ms: Option<i64> = None;
+        if self.modeset_requested[head].load(Ordering::Acquire) != 0 && pending[head].is_some() {
+            let owes_keyframe =
+                self.keyframe_pending.load(Ordering::Acquire) & (1u32 << head) != 0;
+            let elapsed_ms = self.last_frame.lock()[head]
+                .map_or(FRAME_PERIOD_MS, |t| t.elapsed().as_millis());
+            // A framebuffer-backed frame may only be read once the compositor has gone quiet; while
+            // it is actively rendering, encoding from its live buffer is precisely the drag-
+            // artifacting bug (see `ShadowSurface`). Busy heads always get a snapshot on their next
+            // due commit, so waiting costs at most one frame period.
+            let coherent = pending[head].as_ref().is_some_and(|f| f.from_shadow);
+            let quiet_ms = self.last_flip.lock()[head]
+                .map_or(i64::MAX, |t| t.elapsed().as_millis());
+            if !coherent && quiet_ms < SNAPSHOT_IDLE_MS {
+                wait_ms = Some((SNAPSHOT_IDLE_MS - quiet_ms).max(1));
+            } else if owes_keyframe || elapsed_ms >= FRAME_PERIOD_MS {
+                selected = pending[head].take();
+                // A busy compositor continuously replaces `settle_repaint` via `queue_scanout`, so
+                // relying on the idle timer alone does NOT produce the sustained full-frame stream a
+                // cold downstream needs. Force the cadence-selected live framebuffer to be a
+                // keyframe while training. The elapsed check above still caps this at
+                // `FRAME_PERIOD_MS`; setting the bit any earlier would bypass the cadence limiter.
+                let sustaining = self.sustain_until.lock()[head]
+                    .is_some_and(|until| (until - Instant::<Monotonic>::now()).as_millis() > 0);
+                if sustaining {
+                    self.keyframe_pending
+                        .fetch_or(1u32 << head, Ordering::Release);
+                }
+            } else {
+                wait_ms = Some((FRAME_PERIOD_MS - elapsed_ms).max(1));
+            }
+        }
+        // Nothing flipped in. Fall back to the one-shot settle repaint if one is due, so a
+        // compositor that went idle straight after enabling the output still ends up with its real
+        // desktop on the panel rather than the buffer that happened to be current when the
+        // mode-set's keyframe went out.
+        if selected.is_none() {
+            let mut settle = self.settle_repaint.lock();
+            if self.modeset_requested[head].load(Ordering::Acquire) == 0 {
+                settle[head] = None;
+            } else if let Some((due, _, _)) = settle[head].as_ref() {
+                let remaining = *due - Instant::<Monotonic>::now();
+                if remaining.as_millis() <= 0 {
+                    let taken = settle[head].take();
+                    let as_keyframe = taken.as_ref().is_some_and(|(_, _, kf)| *kf);
+                    selected = taken.map(|(_, f, _)| f);
+                    if as_keyframe {
+                        self.keyframe_pending
+                            .fetch_or(1u32 << head, Ordering::Release);
+                    }
+                    if !TEST_FORCE_FULL_FRAMES {
+                        let kind = if as_keyframe {
+                            "settle repaint (compositor idle after mode-set)"
+                        } else {
+                            "debt repaint (retransmissions owed, compositor idle)"
+                        };
+                        pr_info!("vino: head {head} {kind}\n");
+                    }
+                } else {
+                    let remaining = remaining.as_millis().max(1);
+                    wait_ms = Some(wait_ms.map_or(remaining, |old| old.min(remaining)));
+                }
+            }
+        }
+        (selected, wait_ms)
     }
 }
 
 impl_has_work! {
     impl HasWork<VinoDrmDevice> for VinoDrmData { self.cmd_work }
+    impl HasWork<VinoDrmDevice, 1> for VinoDrmData { self.scanout_work_h0 }
+    impl HasWork<VinoDrmDevice, 2> for VinoDrmData { self.scanout_work_h1 }
+}
+
+/// One scanout work item exists per head, and a work ID is a const generic. Raising [`HEADS`]
+/// without adding a `scanout_work_hN` field (plus its `HasWork`/`WorkItem` impls and an
+/// `enqueue_scanout` arm) would silently leave the extra heads with no worker at all -- their
+/// frames would sit in `pending_scanout` until some other head's flip happened to run. Fail the
+/// build instead.
+const _: () = assert!(
+    HEADS == 2,
+    "add a scanout_work_hN work item per head (see VinoDrmData::enqueue_scanout)"
+);
+
+impl WorkItem<1> for VinoDrmData {
+    type Pointer = ARef<VinoDrmDevice>;
+    fn run(this: ARef<VinoDrmDevice>) {
+        run_scanout_worker(this, 0);
+    }
+}
+
+impl WorkItem<2> for VinoDrmData {
+    type Pointer = ARef<VinoDrmDevice>;
+    fn run(this: ARef<VinoDrmDevice>) {
+        run_scanout_worker(this, 1);
+    }
+}
+
+/// One head's deferred scanout loop: pick this head's due frame, encode it, transmit it, repeat
+/// until the head has nothing left to do. Both heads run this concurrently on `system()`.
+///
+/// ⚠ **The urgent interlock.** A queued `ModeSet` must reach the dock before any video for that
+/// head (the dock EPIPEs a write onto an unconfigured stream), and this worker cannot execute
+/// commands itself -- so it *returns* when one is outstanding rather than looping. Nothing is
+/// stranded by that: `cmd_work` re-enqueues both scanout workers when its batch finishes, and any
+/// later `ModeSet` goes through `queue_cmd`, which enqueues `cmd_work` again, so a re-enqueue
+/// always follows the drain that displaced us. A frame already in `pending_scanout` is left there
+/// -- this returns before `select_scanout` takes it.
+///
+/// Two conditions, and both are needed: a `ModeSet` sitting in `cmd_queue` (not yet drained), and
+/// [`VinoDrmData::cmd_busy`] (drained and executing -- the window in which `cmd_queue` is
+/// misleadingly empty). The `video_inflight` store must be published *before* reading `cmd_busy`,
+/// and both use `SeqCst`, so this and `wait_for_video_idle` cannot both conclude the other is idle.
+fn run_scanout_worker(this: ARef<VinoDrmDevice>, head: usize) {
+    use core::sync::atomic::Ordering::SeqCst;
+    let data: &VinoDrmData = &this;
+    // As in `cmd_work`: once the I/O window refuses a token, unplug has begun and there is no USB
+    // left to do. `drm_dev_enter()` holds the parent interface Bound for the duration.
+    let Ok(link) = super::UsbLink::open(&data.io, data.eps) else {
+        return;
+    };
+    let dev = &link;
+    loop {
+        if data.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        // Claim the head's video endpoint first, then look for a reason not to use it.
+        data.video_inflight[head].store(true, SeqCst);
+        let blocked = data.cmd_busy.load(SeqCst)
+            || data
+                .cmd_queue
+                .lock()
+                .iter()
+                .any(|cmd| matches!(cmd, KmsCmd::ModeSet { .. }));
+        if blocked {
+            data.video_inflight[head].store(false, SeqCst);
+            return;
+        }
+        let (frame, cadence_wait_ms) = data.select_scanout(head);
+        if let Some(frame) = frame {
+            run_pending_scanout(dev, data, frame);
+            data.video_inflight[head].store(false, SeqCst);
+            continue;
+        }
+        data.video_inflight[head].store(false, SeqCst);
+        if let Some(ms) = cadence_wait_ms {
+            fsleep(Delta::from_millis(ms));
+            continue;
+        }
+        return;
+    }
 }
 
 impl WorkItem for VinoDrmData {
@@ -1970,7 +2356,6 @@ impl WorkItem for VinoDrmData {
             return;
         };
         let dev = &link;
-        let mut next_head = 0usize;
         loop {
             let cmds = core::mem::replace(&mut *data.cmd_queue.lock(), KVec::new());
             // A cold dual-head atomic commit queues both enables together. DLM treats that as one
@@ -1989,6 +2374,17 @@ impl WorkItem for VinoDrmData {
                         dual_timings[head_i] = Some(*timing);
                     }
                 }
+            }
+            // ★ Exclude the scanout workers for exactly as long as this batch can touch a video
+            // endpoint, and no longer. `activate_dual_wake` and the `ModeSet` arm both run
+            // `submit_prompt_training`, which writes the activation carrier to the head's endpoint;
+            // a concurrent scanout frame there would interleave records on the wire and would have
+            // its `video_q` slot double-opened. Cursor-only batches deliberately skip this: they
+            // never touch video, and a mouse in motion produces a continuous stream of them.
+            let has_modeset = cmds.iter().any(|c| matches!(c, KmsCmd::ModeSet { .. }));
+            if has_modeset {
+                data.cmd_busy.store(true, core::sync::atomic::Ordering::SeqCst);
+                data.wait_for_video_idle();
             }
             let dual_wake = dual_timings.iter().flatten().count() >= 2;
             if dual_wake {
@@ -2133,120 +2529,61 @@ impl WorkItem for VinoDrmData {
                     pr_info!("vino: async KMS command failed ({e:?})\n");
                 }
             }
-
-            // A second head's mode-set may have arrived while the first head's blocking CP batch
-            // was in flight. Give stream-control commands priority over starting a multi-megabyte
-            // encode; cursor-only traffic may wait behind one frame and is coalesced at enqueue.
-            let urgent = data
-                .cmd_queue
-                .lock()
-                .iter()
-                .any(|cmd| matches!(cmd, KmsCmd::ModeSet { .. }));
-            if urgent {
-                continue;
-            }
-
-            // Consume at most one framebuffer before checking the CP queue again. Round-robin
-            // selection prevents an animated head 0 from starving a static head 1 keyframe.
-            //
-            // Do not TAKE and discard a frame which arrived before the per-head cadence deadline.
-            // KWin may stop committing immediately after that flip (for example, when a window
-            // stops moving), so no later callback would wake us and the newest image would remain
-            // missing forever. Leave it in the coalescing slot, wait for the short remainder, and
-            // then pick the newest version of it. Concurrent flips continue replacing/merging that
-            // slot while this worker sleeps.
-            let (frame, cadence_wait_ms) = {
-                let mut pending = data.pending_scanout.lock();
-                let mut selected = None;
-                let mut wait_ms: Option<i64> = None;
-                for offset in 0..HEADS {
-                    let head = (next_head + offset) % HEADS;
-                    if data.modeset_requested[head].load(Ordering::Acquire) != 0
-                        && pending[head].is_some()
-                    {
-                        let owes_keyframe =
-                            data.keyframe_pending.load(Ordering::Acquire) & (1u32 << head) != 0;
-                        let elapsed_ms = data.last_frame.lock()[head]
-                            .map_or(FRAME_PERIOD_MS, |t| t.elapsed().as_millis());
-                        // A framebuffer-backed frame may only be read once the compositor has gone
-                        // quiet; while it is actively rendering, encoding from its live buffer is
-                        // precisely the drag-artifacting bug (see `ShadowSurface`). Busy heads
-                        // always get a snapshot on their next due commit, so waiting costs at most
-                        // one frame period.
-                        let coherent = pending[head].as_ref().is_some_and(|f| f.from_shadow);
-                        let quiet_ms = data.last_flip.lock()[head]
-                            .map_or(i64::MAX, |t| t.elapsed().as_millis());
-                        if !coherent && quiet_ms < SNAPSHOT_IDLE_MS {
-                            let remaining = (SNAPSHOT_IDLE_MS - quiet_ms).max(1);
-                            wait_ms = Some(wait_ms.map_or(remaining, |old| old.min(remaining)));
-                            continue;
-                        }
-                        if owes_keyframe || elapsed_ms >= FRAME_PERIOD_MS {
-                            selected = pending[head].take();
-                            // A busy compositor continuously replaces `settle_repaint` via
-                            // `queue_scanout`, so relying on the idle timer alone does NOT produce
-                            // the sustained full-frame stream a cold downstream needs. Force the
-                            // cadence-selected live framebuffer to be a keyframe while training.
-                            // The elapsed check above still caps this at FRAME_PERIOD_MS; setting
-                            // the bit any earlier would bypass the cadence limiter.
-                            let sustaining = data.sustain_until.lock()[head].is_some_and(|until| {
-                                (until - Instant::<Monotonic>::now()).as_millis() > 0
-                            });
-                            if sustaining {
-                                data.keyframe_pending
-                                    .fetch_or(1u32 << head, Ordering::Release);
-                            }
-                            next_head = (head + 1) % HEADS;
-                            break;
-                        }
-                        let remaining = (FRAME_PERIOD_MS - elapsed_ms).max(1);
-                        wait_ms = Some(wait_ms.map_or(remaining, |old| old.min(remaining)));
-                    }
-                }
-                // Nothing flipped in. Fall back to the one-shot settle repaint if one is due, so a
-                // compositor that went idle straight after enabling the output still ends up with
-                // its real desktop on the panel rather than the buffer that happened to be current
-                // when the mode-set's keyframe went out.
-                if selected.is_none() {
-                    let mut settle = data.settle_repaint.lock();
-                    for offset in 0..HEADS {
-                        let head = (next_head + offset) % HEADS;
-                        if data.modeset_requested[head].load(Ordering::Acquire) == 0 {
-                            settle[head] = None;
-                            continue;
-                        }
-                        let Some((due, _)) = settle[head].as_ref() else {
-                            continue;
-                        };
-                        let remaining = *due - Instant::<Monotonic>::now();
-                        if remaining.as_millis() <= 0 {
-                            selected = settle[head].take().map(|(_, f)| f);
-                            data.keyframe_pending
-                                .fetch_or(1u32 << head, Ordering::Release);
-                            next_head = (head + 1) % HEADS;
-                            if !TEST_FORCE_FULL_FRAMES {
-                                pr_info!("vino: head {head} settle repaint (compositor idle after mode-set)\n");
-                            }
-                            break;
-                        }
-                        let remaining = remaining.as_millis().max(1);
-                        wait_ms = Some(wait_ms.map_or(remaining, |old| old.min(remaining)));
-                    }
-                }
-                (selected, wait_ms)
-            };
-            if let Some(frame) = frame {
-                run_pending_scanout(dev, data, frame);
-                continue;
-            }
-            if let Some(ms) = cadence_wait_ms {
-                fsleep(Delta::from_millis(ms));
-                continue;
+            if has_modeset {
+                data.cmd_busy
+                    .store(false, core::sync::atomic::Ordering::SeqCst);
             }
 
             if data.cmd_queue.lock().is_empty() {
                 break;
             }
+        }
+        // Video is no longer this worker's job. Wake both heads' scanout workers: a command batch is
+        // exactly what makes them bail (a queued `ModeSet` must reach the dock before that head's
+        // video), so this is the handshake that lets them resume. Enqueueing a head with nothing
+        // pending costs one no-op pass through `select_scanout`.
+        data.enqueue_scanout_all(&this);
+    }
+}
+
+/// ★ Experiment 2026-07-26 — **does the dock support a refresh rate above 120 Hz at all?**
+///
+/// DLM drives this dock at 2560x1440@180 with both panels lit, so the hardware is capable; vino
+/// sending the same timing leaves the panel dark (`docs/HIGH-REFRESH.md`). Two candidate causes
+/// remain and the EDID's own mode list cannot separate them, because every mode it offers above
+/// 120 Hz also needs a pixel clock above 655.35 MHz:
+///
+/// 1. **the off72 clock high byte is wrong** -- vino's 24-bit encoding is a hypothesis, and if the
+///    dock reads only 16 bits it saw `71481 & 0xffff` = 59.45 MHz, i.e. garbage; or
+/// 2. **vino's high-refresh path is broken somewhere else entirely.**
+///
+/// `1920x1080@165` separates them in one test. Its CVT-RB clock is ~381 MHz, which fits the
+/// **proven** 16-bit field at off70..71 and writes **zero** to off72 -- so it exercises >120 Hz
+/// refresh while depending on nothing unproven. Its pixel rate (342,144,000/s) is also below even
+/// DLM's own declared 442,368,000 budget, so bandwidth cannot be the confound either.
+///
+/// * **Lights** => refresh above 120 works, and off72 is the only remaining defect.
+/// * **Dark** => off72 was never the issue and the fault is elsewhere in the mode-set.
+///
+/// Legitimate to synthesise: the panel's EDID declares continuous frequencies (48-180 Hz, max
+/// dotclock 720 MHz), it just does not enumerate this particular timing. Remove once the question
+/// is answered.
+const TEST_SYNTH_1080P165: bool = true;
+
+/// Add vino's driver-synthesised probe modes to a connector that already has its EDID modes.
+/// Returns how many were added, for `get_modes`' count.
+fn probe_modes(connector: &kms::connector::ConnectorGuard<'_, VinoConnector>) -> i32 {
+    if !TEST_SYNTH_1080P165 {
+        return 0;
+    }
+    match connector.add_cvt_mode(1920, 1080, 165, true) {
+        Ok(()) => {
+            pr_info!("vino: added synthesised 1920x1080@165 CVT-RB probe mode\n");
+            1
+        }
+        Err(e) => {
+            pr_info!("vino: synthesised 1920x1080@165 mode failed ({e:?})\n");
+            0
         }
     }
 }
@@ -2598,14 +2935,17 @@ impl crtc::DriverCrtc for VinoCrtc {
     /// message for the negotiated mode. The command is queued and is a no-op until CP engages.
     const HAS_ATOMIC_CHECK: bool = true;
 
-    /// Cross-head bandwidth admission: reject a commit whose pixel rate exceeds THIS head's even
-    /// share of the dock's shared budget. Because each head only checks its own share, the sum
-    /// across heads stays within the total without a global cross-CRTC check (revdi's proven model;
-    /// `docs/CROSS-HEAD-BANDWIDTH-DESIGN.md`). A commit that does not increase this head's rate is
-    /// always allowed (it can only hold or reduce the combined total); no limiting when budget is 0.
+    /// Cross-head bandwidth admission: reject a commit that would push the *combined* rate of every
+    /// lit head past the dock's shared budget (`docs/CROSS-HEAD-BANDWIDTH-DESIGN.md`). This is where
+    /// the real enforcement lives; `mode_valid` deliberately prunes only against the whole budget,
+    /// because a mode list must say what the head *can* do, not what its neighbour leaves spare.
+    /// A commit that does not increase this head's rate is always allowed (it can only hold or
+    /// reduce the combined total); no limiting when the budget is 0 (unknown).
     fn atomic_check(check: CrtcAtomicCheck<'_, Self>) -> Result {
-        let data: &VinoDrmData = check.crtc().drm_dev();
-        let own_budget = data.own_pixel_budget();
+        let crtc = check.crtc();
+        let head = crtc.head as usize;
+        let data: &VinoDrmData = crtc.drm_dev();
+        let budget = data.dock_budget();
         let (old, new) = check.take_old_new_state();
         let old_rate = if old.active() {
             let m = old.mode();
@@ -2623,12 +2963,14 @@ impl crtc::DriverCrtc for VinoCrtc {
         } else {
             0
         };
-        if own_budget == 0 || new_rate <= old_rate {
+        if budget == 0 || new_rate <= old_rate {
             return Ok(());
         }
-        if new_rate > own_budget {
+        let others = data.other_heads_rate(head);
+        let combined = new_rate.saturating_add(others);
+        if combined > budget {
             pr_warn!(
-                "vino: rejecting commit -- head pixel rate {new_rate} exceeds this head's budget share ({own_budget})\n"
+                "vino: rejecting commit -- head {head} rate {new_rate} + other heads {others} = {combined} exceeds the dock budget ({budget})\n"
             );
             return Err(EINVAL);
         }
@@ -2702,7 +3044,7 @@ impl crtc::DriverCrtc for VinoCrtc {
         data.pending_scanout.lock()[head as usize] = None;
         data.settle_repaint.lock()[head as usize] = None;
         // Release the ~14.7 MB private copy; a re-enable owes a keyframe and re-snapshots.
-        data.shadow.lock()[head as usize] = None;
+        data.shadow.lock()[head as usize] = [const { None }; SHADOW_SLOTS];
         data.sustain_until.lock()[head as usize] = None;
         data.strip_hashes.lock()[head as usize] = None;
         data.dirty_ttl.lock()[head as usize] = None;
@@ -2992,9 +3334,9 @@ impl plane::DriverPlane for VinoPlane {
         // Throttle: while scanout is failing (dock NAKing because CP isn't engaged), skip the
         // upcoming pageflips set by the backoff below instead of converting+encoding+sending a
         // frame the dock will just drop.
-        let skip = data.scanout_skip.load(Relaxed);
+        let skip = data.scanout_skip[head as usize].load(Relaxed);
         if skip > 0 {
-            data.scanout_skip.store(skip - 1, Relaxed);
+            data.scanout_skip[head as usize].store(skip - 1, Relaxed);
             return;
         }
         data.queue_scanout(
@@ -3009,6 +3351,7 @@ impl plane::DriverPlane for VinoPlane {
                 h,
                 // `queue_scanout` decides whether this commit is due for a snapshot.
                 from_shadow: false,
+                shadow_idx: 0,
             },
         );
     }
@@ -3016,7 +3359,7 @@ impl plane::DriverPlane for VinoPlane {
 
 /// Compress and submit one coalesced primary-plane flip on the deferred worker. Keeping all slow
 /// work here makes the DRM atomic callback bounded to state inspection plus an `ARef` increment.
-fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: PendingScanout) {
+fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, mut frame: PendingScanout) {
     use core::sync::atomic::Ordering::Relaxed;
 
     let head_i = frame.head as usize;
@@ -3041,12 +3384,30 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
     // streams full frames continuously at ~7 fps. Re-arm unconditionally so this experiment
     // actually reproduces that.
     let settle_copy = (was_keyframe || TEST_FORCE_FULL_FRAMES).then(|| frame.clone());
+    // A framebuffer-backed frame only ever reaches the worker through the `SNAPSHOT_IDLE_MS` path
+    // -- the compositor has been quiet for 60 ms, which is precisely the condition that makes
+    // reading its buffer safe in the first place. Take the snapshot HERE rather than encoding from
+    // the live buffer, so these frames keep the parallel encoder instead of dropping to the serial
+    // path (measured 5--8 ms vs 38--73 ms for a comparable frame). Best-effort: if no slot is free
+    // or the copy fails, fall through to the old live-buffer behaviour exactly as before.
+    if !frame.from_shadow {
+        let inflight = data.shadow_inflight[head_i].load(Ordering::Acquire);
+        if let Some(idx) = (0..SHADOW_SLOTS).find(|&i| i as i64 != inflight) {
+            let mut shadow = data.shadow.lock();
+            if snapshot_to_shadow(&mut shadow[head_i][idx], &frame.fb, frame.w, frame.h).is_ok() {
+                frame.from_shadow = true;
+                frame.shadow_idx = idx;
+            }
+        }
+    }
+
     // Encode from vino's private copy when the commit path took one. The surface is moved out of
     // its slot for the duration so the multi-hundred-millisecond encode never holds the lock
     // against an atomic commit, then returned for the next snapshot to reuse the allocation.
     let result = if frame.from_shadow {
-        data.shadow_busy[head_i].store(true, Ordering::Release);
-        let taken = data.shadow.lock()[head_i].take();
+        let slot = frame.shadow_idx.min(SHADOW_SLOTS - 1);
+        data.shadow_inflight[head_i].store(slot as i64, Ordering::Release);
+        let taken = data.shadow.lock()[head_i][slot].take();
         match taken {
             Some(shadow) if shadow.w == frame.w && shadow.h == frame.h => {
                 // Make the fix observable: a head whose frames are all coherent reports a snapshot
@@ -3056,27 +3417,71 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
                 if ns == 1 || ns % 64 == 0 {
                     pr_info!("vino: head {head_i} encoded {ns} frame(s) from the shadow copy\n");
                 }
+                // Move the pixels into a refcounted source so the encode can fan out across CPUs
+                // (`PixelSource`). Ownership, not a borrow: each worker holds an `Arc` clone, so
+                // the buffer cannot go away while one is still reading it, and the join below is a
+                // scheduling detail rather than the thing keeping the memory alive.
+                let ShadowSurface {
+                    w,
+                    h,
+                    pixels,
+                    hashes,
+                } = shadow;
+                let src = match Arc::new(
+                    PixelSource {
+                        pixels,
+                        pitch: w * 4,
+                        w,
+                        h,
+                        gamma: data.gamma_snapshot(head_i),
+                        hashes,
+                    },
+                    GFP_KERNEL,
+                ) {
+                    Ok(src) => src,
+                    Err(_) => {
+                        data.shadow_inflight[head_i].store(-1, Ordering::Release);
+                        scanout_gate(frame.head, 9, "worker: pixel source allocation failed");
+                        return;
+                    }
+                };
                 let r = encode_and_send(
                     dev,
                     data,
                     frame.head,
-                    shadow.pixels.as_ptr(),
-                    shadow.w * 4,
+                    src.pixels.as_ptr(),
+                    src.pitch,
                     frame.rotation,
                     &frame.clips[..frame.nclips],
                     frame.w,
                     frame.h,
+                    Some(&src),
                 );
-                data.shadow.lock()[head_i] = Some(shadow);
-                data.shadow_busy[head_i].store(false, Ordering::Release);
+                // Every chunk has been joined, so this is the last reference and the buffer comes
+                // back for the next snapshot to reuse. If it somehow is not, drop it and let the
+                // commit path allocate a fresh surface rather than block or leak.
+                let returned = Arc::into_unique_or_drop(src).map(|src| {
+                    // `PixelSource` is `Unpin`, so unwrapping the pin is free; the buffers are then
+                    // swapped out for empty ones and the husk dropped.
+                    let mut src = core::pin::Pin::into_inner(src);
+                    ShadowSurface {
+                        w,
+                        h,
+                        pixels: core::mem::replace(&mut src.pixels, KVVec::new()),
+                        hashes: core::mem::replace(&mut src.hashes, KVVec::new()),
+                    }
+                });
+                data.shadow.lock()[head_i][slot] = returned;
+                data.shadow_inflight[head_i].store(-1, Ordering::Release);
                 r
             }
             // Geometry moved under us, or the slot was empty. Drop the frame rather than fall back
             // to the live framebuffer: a mode change already owes a keyframe, and the next commit
             // takes a correctly sized snapshot.
             other => {
-                data.shadow.lock()[head_i] = other.filter(|s| s.w == frame.w && s.h == frame.h);
-                data.shadow_busy[head_i].store(false, Ordering::Release);
+                data.shadow.lock()[head_i][slot] =
+                    other.filter(|s| s.w == frame.w && s.h == frame.h);
+                data.shadow_inflight[head_i].store(-1, Ordering::Release);
                 scanout_gate(frame.head, 8, "worker: shadow snapshot missing or wrong geometry");
                 return;
             }
@@ -3095,10 +3500,10 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
     };
     match result {
         Ok(()) => {
-            let n = data.scanout_fails.swap(0, Relaxed);
-            data.scanout_skip.store(0, Relaxed);
+            let n = data.scanout_fails[head_i].swap(0, Relaxed);
+            data.scanout_skip[head_i].store(0, Relaxed);
             if n > 0 {
-                pr_info!("vino: scanout recovered after {n} failed frame(s)\n");
+                pr_info!("vino: head {head_i} scanout recovered after {n} failed frame(s)\n");
             }
             // Arm the one-shot settle repaint. A compositor that goes idle right after enabling an
             // output would otherwise leave whatever it had drawn at keyframe time -- in the
@@ -3118,18 +3523,48 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
                 } else {
                     SETTLE_REPAINT_MS
                 };
-                data.settle_repaint.lock()[head_i] =
-                    Some((Instant::<Monotonic>::now() + Delta::from_millis(delay), copy));
+                data.settle_repaint.lock()[head_i] = Some((
+                    Instant::<Monotonic>::now() + Delta::from_millis(delay),
+                    copy,
+                    true,
+                ));
+            } else {
+                // ★ Stranded retransmit debt (HW-observed 2026-07-26). `dirty_ttl` is only paid
+                // down by frames that actually go out, and a repaint is otherwise re-armed ONLY
+                // after a keyframe. So when a window is dragged off a head, the compositor stops
+                // committing to it and any strips still owing a transmission are never sent: the
+                // dock's second buffer keeps the window, and the residue persists indefinitely --
+                // it does not decay, because nothing is scheduled to repair it. The user-visible
+                // signature is exact: a piece of the dragged window left behind on the head it
+                // left, which does NOT clear on its own but disappears the moment any unrelated
+                // click makes the compositor commit to that head again.
+                //
+                // Arm a repaint of this same framebuffer at the normal cadence so the ledger is
+                // paid off. Deliberately NOT promoted to a keyframe: only the owed strips are
+                // re-selected, so this costs a small delta, not a full surface. It terminates by
+                // construction -- each pass decrements every debt, so at most `DAMAGE_REPEATS`
+                // passes run before the ledger is clear and nothing re-arms.
+                let owes = data.dirty_ttl.lock()[head_i]
+                    .as_ref()
+                    .is_some_and(|debt| debt.iter().any(|&d| d > 0));
+                if owes {
+                    let copy = frame.clone();
+                    data.settle_repaint.lock()[head_i] = Some((
+                        Instant::<Monotonic>::now() + Delta::from_millis(FRAME_PERIOD_MS),
+                        copy,
+                        false,
+                    ));
+                }
             }
         }
         Err(e) => {
             // Log at exponentially sparser points and back off future worker attempts. An error is
             // transport state, not a reason to stall the compositor's pageflip path.
-            let n = data.scanout_fails.fetch_add(1, Relaxed) + 1;
+            let n = data.scanout_fails[head_i].fetch_add(1, Relaxed) + 1;
             if n == 1 || n.is_power_of_two() {
-                pr_err!("vino: scanout frame failed ({e:?}) [x{n}] -- throttling\n");
+                pr_err!("vino: head {head_i} scanout frame failed ({e:?}) [x{n}] -- throttling\n");
             }
-            data.scanout_skip.store(core::cmp::min(n, 120), Relaxed);
+            data.scanout_skip[head_i].store(core::cmp::min(n, 120), Relaxed);
         }
     }
 }
@@ -3200,6 +3635,9 @@ fn scanout_one(
     // count and object size for us.
     let pitch = vmap.pitch();
     let view = vmap.view();
+    // No parallel encode from a live compositor buffer: these pixels are KWin's, not vino's, and
+    // fanning more readers across a buffer that can be recycled mid-encode is exactly the drag
+    // artifacting the snapshot path exists to prevent.
     encode_and_send(
         dev,
         data,
@@ -3210,6 +3648,7 @@ fn scanout_one(
         clips,
         w,
         h,
+        None,
     )
 }
 
@@ -3357,6 +3796,7 @@ fn snapshot_to_shadow(
     if w == 0 || h == 0 {
         return Err(EINVAL);
     }
+    let t0 = Instant::<Monotonic>::now();
     let row = w.checked_mul(4).ok_or(EINVAL)?;
     let need = row.checked_mul(h).ok_or(EINVAL)?;
     // Map the compositor's pages; the guard unmaps on drop, including on the early returns below.
@@ -3366,20 +3806,91 @@ fn snapshot_to_shadow(
     let view = vmap.view();
     let src = view.as_ptr().cast::<u8>();
 
+    let sw = super::video::wht::STRIP_W;
+    let sh = super::video::wht::STRIP_H;
+    let w_pad = (w + sw - 1) & !(sw - 1);
+    let h_pad = (h + sh - 1) & !(sh - 1);
+    let tiles_x = w_pad / sw;
+    let tiles_y = h_pad / sh;
+
     if !matches!(slot, Some(s) if s.w == w && s.h == h) {
         let mut pixels: KVVec<u8> = KVVec::new();
         pixels.resize(need, 0, GFP_KERNEL)?;
-        *slot = Some(ShadowSurface { w, h, pixels });
+        let mut hashes: KVVec<u64> = KVVec::new();
+        hashes.resize(tiles_x * tiles_y, 0, GFP_KERNEL)?;
+        *slot = Some(ShadowSurface {
+            w,
+            h,
+            pixels,
+            hashes,
+        });
     }
     let shadow = slot.as_mut().ok_or(kernel::error::code::ENOMEM)?;
-    for y in 0..h {
-        // SAFETY: `y < h` and the XRGB8888 pitch covers every visible pixel of the validated
-        // mapping, so this row lies inside the mapped framebuffer (`pitch * h` bytes).
-        let s = unsafe { core::slice::from_raw_parts(src.add(y * pitch), row) };
-        shadow.pixels[y * row..y * row + row].copy_from_slice(s);
+    if shadow.hashes.len() != tiles_x * tiles_y {
+        shadow.hashes.resize(tiles_x * tiles_y, 0, GFP_KERNEL)?;
+    }
+
+    // Copy and hash in ONE pass, band by band. Each 16-row strip band is copied, then immediately
+    // hashed out of the destination while those rows are still in cache. This is bit-identical to
+    // running `framebuffer_strip_hashes` over the finished surface: same per-strip seed, same
+    // row-chained XXH64, same clipping of the padded region to the real `w`/`h` (a fully padded
+    // band reads no rows and keeps just its seed).
+    // Copy and hash are timed separately. The handover records `snapshot+hash` at 3.0-6.6 ms on the
+    // compositor's own commit thread and attributes the bulk to the copy ("reading the GEM buffer is
+    // write-combining memory and inherently slow") -- but snapshot-alone was never measured, so that
+    // split was an assumption, and it decides what to do next: a slow *copy* is memory-bandwidth
+    // bound and parallelises across the encoder's workqueue exactly as the strip encode did, whereas
+    // a slow *hash* would not have been fixed by folding it in here at all. Two `ktime` reads per
+    // band (~90 at 1440p) cost well under 10 us against the 14.7 MB being timed.
+    let mut copy_ns: i64 = 0;
+    let mut hash_ns: i64 = 0;
+    for ty in 0..tiles_y {
+        let sy = ty * sh;
+        let y_end = (sy + sh).min(h);
+        let t_copy = Instant::<Monotonic>::now();
+        for y in sy..y_end {
+            // SAFETY: `y < h` and the XRGB8888 pitch covers every visible pixel of the validated
+            // mapping, so this row lies inside the mapped framebuffer (`pitch * h` bytes).
+            let s = unsafe { core::slice::from_raw_parts(src.add(y * pitch), row) };
+            shadow.pixels[y * row..y * row + row].copy_from_slice(s);
+        }
+        let t_hash = Instant::<Monotonic>::now();
+        copy_ns += (t_hash - t_copy).as_nanos();
+        for tx in 0..tiles_x {
+            let sx = tx * sw;
+            let x_end = (sx + sw).min(w);
+            let mut hash = 0x9e37_79b1_85eb_ca87u64
+                ^ (sx as u64).rotate_left(17)
+                ^ (sy as u64).rotate_left(43);
+            if sx < x_end {
+                for y in sy..y_end {
+                    let off = y * row + sx * 4;
+                    hash = xxhash::xxh64(&shadow.pixels[off..off + (x_end - sx) * 4], hash);
+                }
+            }
+            shadow.hashes[ty * tiles_x + tx] = hash;
+        }
+        hash_ns += (Instant::<Monotonic>::now() - t_hash).as_nanos();
+    }
+    // The fold moves hashing OFF the scanout worker (which gates frame rate) and ONTO the atomic
+    // commit path, so the cost here has to be watched: this path must stay bounded, and it is the
+    // compositor's own thread. Sparse, and cheap next to the 14.7 MB it is timing.
+    let n = SNAPSHOT_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 2 || n % 64 == 0 {
+        pr_info!(
+            "vino: snapshot+hash {}x{} took {}us (copy {}us hash {}us, n={n})\n",
+            w,
+            h,
+            (Instant::<Monotonic>::now() - t0).as_micros_ceil(),
+            copy_ns / 1000,
+            hash_ns / 1000
+        );
     }
     Ok(())
 }
+
+/// Call counter for the sparse [`snapshot_to_shadow`] timing log.
+static SNAPSHOT_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Convert changed strip hashes into a compact set of already tile-aligned damage rectangles.
 /// Horizontal runs are joined, then equal runs on adjacent bands are extended vertically. A very
@@ -3438,6 +3949,346 @@ fn changed_strip_rects(
 /// One bit per (gate, head): has this "returned Ok without writing anything" reason been reported?
 static SCANOUT_GATE_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Hard ceiling on work items per frame, purely to bound per-frame allocation.
+///
+/// Each chunk costs an `Arc<EncodeChunk>` plus a `Completion`, a `Mutex` and its coordinate list, so
+/// the count cannot be unbounded. At `ENCODE_MIN_STRIPS_PER_CHUNK` a full 1440p frame (3600 strips)
+/// wants ~112 chunks, comfortably under this.
+const ENCODE_MAX_WORK_ITEMS: usize = 256;
+
+/// Fewest strips per chunk worth dispatching. Below this the allocation, enqueue and completion
+/// cost more than the strips themselves; a small delta stays on the serial path.
+const ENCODE_MIN_STRIPS_PER_CHUNK: usize = 32;
+
+/// Call counter for the sparse parallel-encode log line.
+static ENCODE_LOG_PAR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Immutable per-frame pixel source shared by the parallel encode workers.
+///
+/// This **owns** the pixels: the head's [`ShadowSurface`] buffer is moved in for the duration of
+/// one encode and moved back out afterwards. That is what makes the fan-out sound without an
+/// unsafe assertion -- each chunk holds an [`Arc`] clone, so the buffer provably outlives every
+/// worker reading it, rather than the code merely promising that the joining thread waits.
+///
+/// It is only safe to share at all because of the snapshot fix: these pixels belong to vino and
+/// nothing else can write them. Parallelising against KWin's live framebuffer would have made the
+/// drag artifacting worse, not better -- more readers racing the same recycled buffer.
+struct PixelSource {
+    pixels: KVVec<u8>,
+    pitch: usize,
+    w: usize,
+    h: usize,
+    gamma: Option<[u8; 768]>,
+    /// Strip hashes computed during the snapshot -- see [`ShadowSurface::hashes`]. Carried through
+    /// so the encoder does not re-read the whole surface just to re-derive them.
+    hashes: KVVec<u64>,
+}
+
+impl PixelSource {
+    /// Output pixel -> gamma-corrected source RGB. Identity rotation only (the parallel path is
+    /// gated on that), so output and source coordinates coincide.
+    ///
+    /// Padding beyond the real frame is black and is never a read, exactly like the serial `px`
+    /// closure in [`encode_and_send_wht`] -- the dock ignores the padded region, it exists only so
+    /// a non-64x16-aligned mode still tiles into whole strips.
+    #[inline]
+    fn px(&self, dx: usize, dy: usize) -> (u8, u8, u8) {
+        if dx >= self.w || dy >= self.h {
+            return (0, 0, 0);
+        }
+        let off = dy * self.pitch + dx * 4;
+        // Bounds-checked once per pixel instead of the serial path's raw `read_unaligned`. The
+        // check is noise next to the 64-coefficient transform each pixel feeds.
+        let Some(chunk) = self.pixels.get(off..off + 4) else {
+            return (0, 0, 0);
+        };
+        let Ok(bytes) = <[u8; 4]>::try_from(chunk) else {
+            return (0, 0, 0);
+        };
+        let p = u32::from_le_bytes(bytes);
+        apply_gamma(
+            &self.gamma,
+            ((p >> 16) & 0xff) as u8,
+            ((p >> 8) & 0xff) as u8,
+            (p & 0xff) as u8,
+        )
+    }
+}
+
+/// Encode a batch of strips from `src`, in the order given.
+fn encode_coords(src: &PixelSource, coords: &[(usize, usize)]) -> Result<KVec<KVec<u8>>> {
+    let mut out = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
+    for &(sx, sy) in coords.iter() {
+        let mut px = |dx, dy| src.px(dx, dy);
+        out.push(
+            super::video::wht::colour_strip_at(sx, sy, &mut px)?,
+            GFP_KERNEL,
+        )?;
+    }
+    Ok(out)
+}
+
+/// One contiguous batch of strips, encoded on whichever CPU the unbound workqueue picks.
+///
+/// Chunks share nothing but the read-only [`PixelSource`]: each writes only its own `out`, so no
+/// locking is needed on the hot path and the results reassemble by chunk order.
+#[pin_data]
+struct EncodeChunk {
+    #[pin]
+    work: Work<EncodeChunk>,
+    #[pin]
+    done: Completion,
+    src: Arc<PixelSource>,
+    coords: KVec<(usize, usize)>,
+    /// Encoded strip bodies. Written once by the worker, read once by the joiner after `done`;
+    /// the lock is uncontended and taken twice per chunk per frame.
+    #[pin]
+    out: Mutex<KVec<KVec<u8>>>,
+}
+
+impl_has_work! {
+    impl HasWork<Self> for EncodeChunk { self.work }
+}
+
+impl EncodeChunk {
+    fn new(src: Arc<PixelSource>, coords: KVec<(usize, usize)>) -> Result<Arc<Self>> {
+        Arc::pin_init(
+            pin_init!(EncodeChunk {
+                work <- new_work!("vino::EncodeChunk::work"),
+                done <- Completion::new(),
+                src,
+                coords,
+                out <- new_mutex!(KVec::new(), "vino::EncodeChunk::out"),
+            }),
+            GFP_KERNEL,
+        )
+    }
+}
+
+impl WorkItem for EncodeChunk {
+    type Pointer = Arc<EncodeChunk>;
+
+    fn run(this: Arc<EncodeChunk>) {
+        if let Ok(strips) = encode_coords(&this.src, &this.coords) {
+            *this.out.lock() = strips;
+        }
+        // Complete unconditionally. On failure `out` stays short and the joiner detects that by
+        // length -- but it must never be left blocked on a completion that cannot fire.
+        this.done.complete_all();
+    }
+}
+
+/// Encode `coords` across CPUs and return the strip bodies in the **same** order.
+///
+/// Order is not a nicety: [`super::video::wht::frame_records`] groups strips into one wire record
+/// per single-Y band and needs them x-ordered within a band, so the chunks are contiguous slices
+/// of the raster-ordered coordinate list and are reassembled strictly in chunk order.
+///
+/// Returns `Ok(None)` when the frame is too small to be worth splitting, so the caller falls
+/// through to the serial encoder rather than paying dispatch cost for a handful of strips.
+fn parallel_strip_encode(
+    src: &Arc<PixelSource>,
+    coords: &[(usize, usize)],
+) -> Result<Option<KVec<KVec<u8>>>> {
+    // Chunk by the SIZE OF THE WORK, not by this machine's CPU count. An earlier version capped the
+    // count at a fraction of `nr_cpu_ids`, which meant a 64-core host encoded no faster than a
+    // 16-core one. Splitting purely by work keeps every machine's parallelism available without the
+    // driver having to model the hardware.
+    //
+    // This is not thread oversubscription: these are work items, and `system_unbound()` decides how
+    // many run at once. Handing it more, smaller items than there are CPUs costs a little dispatch
+    // overhead but improves load balancing -- with one chunk per CPU a single slow chunk holds up
+    // the whole join, whereas fine-grained items let idle workers pick up the remainder.
+    let nchunks = (coords.len() / ENCODE_MIN_STRIPS_PER_CHUNK).min(ENCODE_MAX_WORK_ITEMS);
+    if nchunks < 2 {
+        return Ok(None);
+    }
+    let per = coords.len().div_ceil(nchunks);
+
+    let mut chunks: KVec<Arc<EncodeChunk>> = KVec::with_capacity(nchunks, GFP_KERNEL)?;
+    let mut queued: KVec<bool> = KVec::with_capacity(nchunks, GFP_KERNEL)?;
+    let mut start = 0usize;
+    while start < coords.len() {
+        let end = (start + per).min(coords.len());
+        let mut mine: KVec<(usize, usize)> = KVec::with_capacity(end - start, GFP_KERNEL)?;
+        for &c in &coords[start..end] {
+            mine.push(c, GFP_KERNEL)?;
+        }
+        let chunk = EncodeChunk::new(src.clone(), mine)?;
+        // `enqueue` gives the item back if it is already pending -- impossible for one allocated
+        // a line ago, but if it ever happened, waiting on its completion would hang the scanout
+        // worker forever. Record it and encode that chunk inline instead.
+        let ok = workqueue::system_unbound().enqueue(chunk.clone()).is_ok();
+        queued.push(ok, GFP_KERNEL)?;
+        chunks.push(chunk, GFP_KERNEL)?;
+        start = end;
+    }
+
+    // The scanout worker runs on `workqueue::system()`, so blocking here cannot deadlock against
+    // the unbound pool the chunks run on.
+    let mut strips: KVec<KVec<u8>> = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mine = if queued[i] {
+            chunk.done.wait_for_completion();
+            core::mem::take(&mut *chunk.out.lock())
+        } else {
+            encode_coords(&chunk.src, &chunk.coords)?
+        };
+        if mine.len() != chunk.coords.len() {
+            // A chunk failed to allocate. Sending a frame with strips missing would paint a
+            // partial image the dock would keep, so fail the whole encode and let the caller's
+            // retry/backoff handle it.
+            return Err(ENOMEM);
+        }
+        for s in mine {
+            strips.push(s, GFP_KERNEL)?;
+        }
+    }
+    Ok(Some(strips))
+}
+
+/// ★ Diagnostic (2026-07-26): is the compositor's published damage trustworthy?
+///
+/// The full-surface strip hash is now **73% of a small delta's cost** (`hash 2.9 ms` of `~4 ms`
+/// total), so scoping it to `FB_DAMAGE_CLIPS` is the remaining lever for 120 Hz. But the clips are
+/// currently *ignored* (the encoder's parameter is literally `_clips`), so nothing here has ever
+/// been measured -- and the standing comment that "KWin commonly changes framebuffer objects without
+/// publishing that blob" was never verified.
+///
+/// This compares, per frame, the strips the published clips would select against the strips the hash
+/// actually found changed. Three outcomes, each pointing somewhere different:
+///
+/// * **no clips at all** -- nothing to scope to; keep hashing. Note this is *spec-conforming*, not a
+///   KWin bug: an absent damage property means "the whole plane is damaged", and hashing instead of
+///   sending a full frame is an optimisation over that.
+/// * **clips a SUPERSET of the hash's answer** (`missed == 0` over a long run) -- trustworthy, and
+///   the hash can be scoped to them.
+/// * **clips a SUBSET** (`missed > 0`) -- something under-reports. That is either a genuine
+///   compositor damage bug, or vino's own accumulation gap: vino DROPS frames (cadence limiter,
+///   gates), and DRM damage is relative to the previous *commit*, not to the last frame vino
+///   actually transmitted. `queue_scanout` merges superseded commits' clips, but only up to
+///   `MAX_DAMAGE_CLIPS` before collapsing to a full-surface rect. Distinguish by whether misses
+///   correlate with skipped commits.
+///
+/// ⚠ `clip_strips == total` means the merge already collapsed to a full-surface rect, which makes
+/// coverage trivially complete -- those frames prove nothing and are counted separately.
+///
+/// **RESULT (2026-07-26): scoping the hash to damage clips is a DEAD END. Left switched off.**
+///
+/// Every frame measured reported `clip_strips = 3600/3600` -- the full surface -- including frames
+/// where `changed = 0`. Dumping the rectangles showed why: they are literally
+/// `(0,0)..(2560,1440)`, and the `clips=2`/`clips=3` cases are just `queue_scanout` merging several
+/// superseded commits that each already carried one.
+///
+/// ⚠ **`no_clips = 0` does NOT mean the compositor published damage.** This counts rectangles the
+/// *iterator yielded*, and `drm_atomic_helper_damage_iter_init` yields exactly one full-plane rect
+/// when userspace sent no `FB_DAMAGE_CLIPS` blob:
+///
+/// ```text
+/// if (!iter->clips || state->ignore_damage_clips ||
+///     !drm_rect_equals(&state->src, &old_state->src)) {
+///         iter->full_update = true;
+/// }
+/// ```
+///
+/// vino does not set `ignore_damage_clips` and the plane `src` is stable, so the trigger is
+/// `!iter->clips` -- no blob attached.
+///
+/// **This is not a compositor bug.** `drm_plane.c` documents the gap: the damage helpers implement
+/// *frame* damage only and have "no buffer age support or similar damage accumulation algorithm
+/// implemented yet". A compositor rendering into a swapchain cannot express per-buffer damage
+/// correctly through this API, so reporting nothing -- meaning "assume everything changed" -- is the
+/// safe and correct choice. `framebuffer_strip_hashes` is effectively vino implementing the missing
+/// accumulation itself, and doing it *better*: it diffs against what the dock actually holds, not
+/// against whatever the compositor last committed (vino drops and coalesces frames, so those differ).
+const TEST_COMPARE_DAMAGE_CLIPS: bool = false;
+
+/// Cumulative clip-vs-hash tallies: (frames, frames-with-no-clips, frames-collapsed-to-full,
+/// changed strips, strips the clips failed to cover).
+static CLIPCHECK: [core::sync::atomic::AtomicU64; 5] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Compare published damage against the strips the hash found changed. Read-only; see
+/// [`TEST_COMPARE_DAMAGE_CLIPS`].
+fn compare_clips_to_hashes(
+    head: u8,
+    clips: &[(usize, usize, usize, usize)],
+    old: &[u64],
+    new: &[u64],
+    w_pad: usize,
+    h_pad: usize,
+) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let tiles_x = w_pad / super::video::wht::STRIP_W;
+    let total = old.len();
+    if new.len() != total || total != tiles_x * (h_pad / super::video::wht::STRIP_H) {
+        return;
+    }
+    // Select through the very same helper the encoder uses, so this measures the real decision.
+    let Ok(coords) = super::video::wht::damage_strip_coords(w_pad, h_pad, clips) else {
+        return;
+    };
+    let mut covered: KVVec<bool> = KVVec::new();
+    if covered.resize(total, false, GFP_KERNEL).is_err() {
+        return;
+    }
+    for &(sx, sy) in coords.iter() {
+        let idx = (sy / super::video::wht::STRIP_H) * tiles_x + sx / super::video::wht::STRIP_W;
+        if idx < total {
+            covered[idx] = true;
+        }
+    }
+    let (mut changed, mut missed) = (0u64, 0u64);
+    for i in 0..total {
+        if old[i] != new[i] {
+            changed += 1;
+            if !covered[i] {
+                missed += 1;
+            }
+        }
+    }
+    let n = CLIPCHECK[0].fetch_add(1, Relaxed) + 1;
+    if clips.is_empty() {
+        CLIPCHECK[1].fetch_add(1, Relaxed);
+    }
+    if coords.len() == total {
+        CLIPCHECK[2].fetch_add(1, Relaxed);
+    }
+    CLIPCHECK[3].fetch_add(changed, Relaxed);
+    let missed_total = CLIPCHECK[4].fetch_add(missed, Relaxed) + missed;
+    // Log every frame that MISSES (those are the interesting ones), plus a periodic cumulative line.
+    if missed > 0 {
+        pr_info!(
+            "vino: clipcheck head={head} MISS clips={} clip_strips={}/{} changed={changed} missed={missed}\n",
+            clips.len(),
+            coords.len(),
+            total
+        );
+    }
+    if n <= 4 || n % 64 == 0 {
+        pr_info!(
+            "vino: clipcheck head={head} n={n} clips={} clip_strips={}/{} changed={changed} missed={missed} \
+             | cumulative: no_clips={} full_surface={} changed={} missed={missed_total}\n",
+            clips.len(),
+            coords.len(),
+            total,
+            CLIPCHECK[1].load(Relaxed),
+            CLIPCHECK[2].load(Relaxed),
+            CLIPCHECK[3].load(Relaxed)
+        );
+        // Dump the actual rectangles. `clip_strips == total` with only 2--3 clips is ambiguous:
+        // it could be one full-output rect, or a few that happen to tile the surface once expanded
+        // to 256x64 macro-tiles. Those mean very different things about who is being coarse.
+        for (i, &(x0, y0, x1, y1)) in clips.iter().enumerate().take(6) {
+            pr_info!(
+                "vino:   clip[{i}] = ({x0},{y0})..({x1},{y1})  {}x{} px\n",
+                x1.saturating_sub(x0),
+                y1.saturating_sub(y0)
+            );
+        }
+    }
+}
+
 /// Report, once per (gate, head), that a scanout attempt produced no wire traffic.
 ///
 /// Every deferral gate in [`encode_and_send_wht`] returns `Ok(())` -- correctly, since a deferred
@@ -3463,6 +4314,7 @@ fn encode_and_send_wht(
     _clips: &[(usize, usize, usize, usize)],
     w: usize,
     h: usize,
+    par_src: Option<&Arc<PixelSource>>,
 ) -> Result {
     // Gate the EP08 write on the mode-set (id=0x48) for THIS mode having actually been sent to
     // the dock. On an enabling-modeset commit the plane update (`commit_planes`) runs BEFORE the
@@ -3604,11 +4456,31 @@ fn encode_and_send_wht(
     let mut content_hashes: Option<KVVec<u64>> = None;
     let mut content_damage: KVec<DamageRect> = KVec::new();
     if identity {
-        let hashes = framebuffer_strip_hashes(vaddr, pitch, w, h, w_pad, h_pad)?;
+        // Reuse the hashes computed during the snapshot copy when this frame came from one -- that
+        // fold removed a whole second 14.7 MB pass, which was 73% of a small delta's cost. Falls
+        // back to hashing here for the live-framebuffer path, which takes no snapshot. The
+        // expected-length check keeps a geometry change from silently reusing a stale grid.
+        let expected = (w_pad / super::video::wht::STRIP_W) * (h_pad / super::video::wht::STRIP_H);
+        let hashes = match par_src.filter(|s| s.hashes.len() == expected) {
+            Some(src) => {
+                // 3600 x u64 = ~29 KB; copying it is noise next to the 14.7 MB read it replaces,
+                // and an owned copy is needed anyway to publish into `strip_hashes` below.
+                let mut owned: KVVec<u64> = KVVec::new();
+                owned.resize(expected, 0, GFP_KERNEL)?;
+                owned.copy_from_slice(&src.hashes);
+                owned
+            }
+            None => framebuffer_strip_hashes(vaddr, pitch, w, h, w_pad, h_pad)?,
+        };
         if !full {
             let previous = data.strip_hashes.lock();
             if let Some(state) = &previous[head_i] {
                 if state.w_pad == w_pad && state.h_pad == h_pad {
+                    // ★ DIAGNOSTIC: are the compositor's FB_DAMAGE_CLIPS trustworthy enough to
+                    // scope the hash to? Read-only; see `TEST_COMPARE_DAMAGE_CLIPS`.
+                    if TEST_COMPARE_DAMAGE_CLIPS {
+                        compare_clips_to_hashes(head, _clips, &state.hashes, &hashes, w_pad, h_pad);
+                    }
                     // Charge every strip whose content moved with a fresh debt, then select every
                     // strip that still owes a transmission -- including ones that changed on an
                     // earlier frame and have not yet reached both dock buffers. See `dirty_ttl`.
@@ -3667,10 +4539,48 @@ fn encode_and_send_wht(
             (p & 0xff) as u8,
         )
     };
-    let (frames, next_seq) = if full {
-        super::video::wht::colour_frame_ep08(w_pad, h_pad, seq0, head, px)?
-    } else {
-        super::video::wht::colour_frame_ep08_damage(w_pad, h_pad, seq0, head, &content_damage, px)?
+    // Parallel encode when this frame is vino's own snapshot under identity rotation. 98.4% of the
+    // encode is independent per-strip work, so this is the whole lever; the serial path below stays
+    // as the fallback for rotation, live-buffer frames and frames too small to be worth splitting.
+    let parallel = match par_src.filter(|_| identity) {
+        Some(src) => {
+            let coords = if full {
+                super::video::wht::all_strip_coords(w_pad, h_pad)?
+            } else {
+                super::video::wht::damage_strip_coords(w_pad, h_pad, &content_damage)?
+            };
+            match parallel_strip_encode(src, &coords)? {
+                Some(strips) => {
+                    let n = ENCODE_LOG_PAR.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 2 || n % 32 == 0 {
+                        pr_info!(
+                            "vino: parallel encode head={head} strips={} chunks={}\n",
+                            coords.len(),
+                            (coords.len() / ENCODE_MIN_STRIPS_PER_CHUNK)
+                                .min(ENCODE_MAX_WORK_ITEMS)
+                        );
+                    }
+                    Some((
+                        super::video::wht::frame_records(&strips, head)?,
+                        seq0.wrapping_add(1),
+                    ))
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
+    let (frames, next_seq) = match parallel {
+        Some(r) => r,
+        None if full => super::video::wht::colour_frame_ep08(w_pad, h_pad, seq0, head, px)?,
+        None => super::video::wht::colour_frame_ep08_damage(
+            w_pad,
+            h_pad,
+            seq0,
+            head,
+            &content_damage,
+            px,
+        )?,
     };
     let t_encoded = Instant::<Monotonic>::now();
     // Did the source move while `px` was sampling it? See `TEST_DETECT_BUFFER_RECYCLE`.
@@ -3792,7 +4702,24 @@ fn encode_and_send_wht(
         // frame that is presented once.
         2
     } else {
-        2
+        // ★ Deltas are presented ONCE (was twice, 2026-07-26).
+        //
+        // The transport is not the problem: measured wire throughput is 274--350 MB/s, i.e. 75--85%
+        // of practical USB 3.0 bulk, so there is nothing meaningful left in URB size (64 KiB) or
+        // queue depth (8 = 512 KiB in flight, which drains in ~1.5 ms against a ~6 us refill). The
+        // only real saving available is to stop sending the same bytes twice.
+        //
+        // The second presentation was added to reach the dock's second buffer -- but it was then
+        // MEASURED that two back-to-back presentations both land in the SAME buffer, so it never
+        // did that job. What actually covers both buffers is `DAMAGE_REPEATS` spread across
+        // successive frames, plus the debt repaint that carries the ledger out when the compositor
+        // stops committing (that pair is what fixed the drag-off-screen ghosting). This is
+        // therefore a straight 2x reduction in wire bytes per delta with the coverage mechanism
+        // left intact.
+        //
+        // If ghosting ever returns, raise `DAMAGE_REPEATS` rather than restoring this -- repeats
+        // spaced across frames are what reach the second buffer, consecutive ones are not.
+        1
     };
     let first_wire_len = arm_len + image_len + super::video::wht::frame_trailer(head, seq0).len();
     pr_debug!(
@@ -3852,31 +4779,48 @@ fn encode_and_send_wht(
         let wire_len = arm_slice.len() + image_len + frame_trailer.len();
         last_wire_len = wire_len;
         {
-            let mut staging_slots = data.video_staging.lock();
-            let staging_slot = &mut staging_slots[head_i];
-            if staging_slot.is_none() {
-                let mut staging = KVec::new();
-                staging.resize(XFER, 0, GFP_KERNEL)?;
-                *staging_slot = Some(staging);
-            }
-            let staging = staging_slot.as_mut().ok_or(kernel::error::code::ENOMEM)?;
-
-            let mut qs = data.video_q.lock();
-            let slot = &mut qs[head_i];
-            if slot.is_none() {
-                match dev.video_queue(head_i, 8, XFER) {
+            // ★ Take this head's staging buffer and URB queue OUT of their shared arrays for the
+            // duration of the submission, then put them back -- the same borrow pattern
+            // `ShadowSurface` uses. Previously both array locks were held across every `send()` of
+            // the whole frame, which is tens of milliseconds: with one lock covering BOTH heads,
+            // head 1 could not touch its own independent endpoint while head 0 was transmitting.
+            // That made per-head concurrency impossible no matter how the work was scheduled, since
+            // `BulkOutQueue::send` blocks whenever it has to reap a slot to reuse it.
+            //
+            // The slots are per-head and nothing else touches them between take and restore, so
+            // this serialises exactly what it must (one submitter per head) and nothing more.
+            let mut staging = match data.video_staging.lock()[head_i].take() {
+                Some(s) => s,
+                None => {
+                    let mut s = KVec::new();
+                    s.resize(XFER, 0, GFP_KERNEL)?;
+                    s
+                }
+            };
+            let mut queue = match data.video_q.lock()[head_i].take() {
+                Some(q) => q,
+                None => match dev.video_queue(head_i, 8, XFER) {
                     Ok(q) => {
-                        *slot = Some(q);
                         pr_info!(
                             "vino: head={} persistent video queue opened (depth=8, {} B URBs)\n",
                             head,
                             XFER
                         );
+                        q
                     }
-                    Err(e) => return Err(e),
-                }
-            }
-            let q = slot.as_mut().ok_or(kernel::error::code::ENODEV)?;
+                    // Nothing was taken that needs restoring yet except staging.
+                    Err(e) => {
+                        data.video_staging.lock()[head_i] = Some(staging);
+                        return Err(e);
+                    }
+                },
+            };
+            // Submit inside a closure so BOTH borrows are returned to their slots on every exit
+            // path, including the mid-frame submit failure below. Dropping the queue instead would
+            // silently close and reopen the endpoint pipe on the next frame.
+            let submit = |staging: &mut KVec<u8>, q: &mut super::usb::BulkOutQueue| -> Result {
+                let staging = &mut staging[..];
+                let q = &mut *q;
             // Scatter/gather cursor over [optional ARM][record chunks][trailer]. Join only one
             // transfer at a time in the reusable bounded staging allocation, eliminating the
             // former `KVec` whose capacity was the entire multi-megabyte frame.
@@ -3919,6 +4863,13 @@ fn encode_and_send_wht(
                 }
                 wire_off += data_len;
             }
+                Ok(())
+            };
+            let submitted = submit(&mut staging, &mut queue);
+            // Restore both borrows before propagating any error.
+            data.video_staging.lock()[head_i] = Some(staging);
+            data.video_q.lock()[head_i] = Some(queue);
+            submitted?;
         }
 
         // The ARM burst was delivered with presentation zero. Clear it immediately rather than
@@ -4047,6 +4998,9 @@ fn encode_and_send(
     clips: &[(usize, usize, usize, usize)],
     w: usize,
     h: usize,
+    // The same pixels as `vaddr`, owned and shareable, when this frame came from a snapshot. Only
+    // then may the encode fan out across CPUs -- see `PixelSource`.
+    par_src: Option<&Arc<PixelSource>>,
 ) -> Result {
     // WHT colour codec path -- the only scanout codec. Non-64x16-aligned modes (e.g. 1920x1080,
     // 1080%16=8) are handled by `encode_and_send_wht` PADDING the frame up to the next 64x16 multiple
@@ -4054,7 +5008,7 @@ fn encode_and_send(
     // bands = 1088 rows for a 1080p mode-set, the extra 8 rows padded), and the dock displays only
     // the mode's real size, ignoring the pad. (The old RLE fallback that faulted the dock on 1080p is
     // gone; this replaces it byte-shape-correctly.)
-    encode_and_send_wht(dev, data, head, vaddr, pitch, rotation, clips, w, h)
+    encode_and_send_wht(dev, data, head, vaddr, pitch, rotation, clips, w, h, par_src)
 }
 
 // ---- Encoder ----------------------------------------------------------------
@@ -4112,7 +5066,7 @@ impl connector::DriverConnector for VinoConnector {
             // reporting a count the core did not actually get.
             if let Ok(n) = connector.add_edid_modes(blob) {
                 if n > 0 {
-                    return n;
+                    return n + probe_modes(&connector);
                 }
             }
         }
@@ -4174,12 +5128,14 @@ impl connector::DriverConnector for VinoConnector {
                 return ModeStatus::Bad;
             }
         }
-        // Cross-head bandwidth: prune modes whose pixel rate exceeds THIS head's even share of the
-        // dock's shared budget, so two heads can't each pass the per-head cap yet together overrun
-        // the DisplayLink chip. Skipped when the budget is unknown (0) -- never a false rejection.
-        // See `docs/CROSS-HEAD-BANDWIDTH-DESIGN.md`.
+        // Cross-head bandwidth: prune modes this head could not run even with every other head
+        // dark, i.e. against the dock's WHOLE budget. The combined-rate check that actually keeps
+        // two lit heads inside the chip's total is `VinoCrtc::atomic_check`; doing it here as well
+        // (as an even share) hid modes that are perfectly reachable when the other head is asleep,
+        // which is exactly the 2560x1440@165 case. Skipped when the budget is unknown (0) -- never
+        // a false rejection. See `docs/CROSS-HEAD-BANDWIDTH-DESIGN.md`.
         let data: &VinoDrmData = connector.drm_dev();
-        let budget = data.own_pixel_budget();
+        let budget = data.dock_budget();
         if budget != 0 {
             let rate = u32::from(mode.hdisplay())
                 .saturating_mul(u32::from(mode.vdisplay()))
