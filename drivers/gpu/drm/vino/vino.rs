@@ -883,6 +883,13 @@ impl WorkItem for BringUp {
             }
             KEEPALIVE_RUN.store(true, core::sync::atomic::Ordering::SeqCst);
             while KEEPALIVE_RUN.load(core::sync::atomic::Ordering::Relaxed) {
+                // The modeset worker reproduces one short DLM control/video timeline from an
+                // absolute mode-set anchor. Do not race an independent poll/heartbeat/presence
+                // transaction into that sequence; resume immediately after its closing markers.
+                if data.cp_timeline_exclusive() {
+                    fsleep(Delta::from_millis(1));
+                    continue;
+                }
                 if data
                     .send_cp(dev, 0x14, 0, |ctr| cp::device_query_req(ctr, 0x000c))
                     .is_ok()
@@ -3355,76 +3362,17 @@ impl VinoDriver {
                 edid_out.is_some()
             );
 
-            // (2) Dynamic mode-set from the dock's EDID preferred detailed timing.
+            // Do not mode-set during CP/EDID setup. The physical DLM cold capture performs both
+            // EDID/ENGAGE rounds, completes its downstream-readiness interval, and only then sends
+            // the modes negotiated independently for head 0 and head 1. Vino instead sent head 0's
+            // preferred EDID timing here (1440p60 in the failing capture), before readiness, then
+            // KWin replaced it with both real 1440p120 modes. That leaves three mode generations in
+            // one cold activation and can poison both heads' shared display-engine state.
             //
-            // 2026-07-16 finding (see `project_video_arm_burst_disconnect_20260716` /
-            // `project_mode_mismatch_theory_20260716` memory): this used to fall back to the
-            // hardcoded `cp::Timing::UHD_60` (3840x2160@60) when no EDID was available. That
-            // value is byte-verified against a real capture but is otherwise TOTALLY UNRELATED
-            // to `drm_sink.rs`'s own connector fallback (`FALLBACK_W/H` = 2560x1440) or to
-            // whatever mode the compositor actually negotiates and encodes frames for (observed
-            // 1920x1440@60 in the run that disconnected) -- three independent numbers with no
-            // shared source of truth. If the dock latches its internal video-decode geometry from
-            // this bring-up-time CP mode-set, then receives a real frame sized for a completely
-            // different resolution once KMS negotiates one, that mismatch alone is a plausible
-            // hard-fault trigger -- DLM never has this problem because its mode-set is always
-            // driven by the one real negotiated timing, never an unrelated guess.
-            //
-            // Fix: only send this CP mode-set when we have a REAL EDID-derived timing (which
-            // `set_edid` below also hands to the DRM connector, so both paths agree on the same
-            // number). With no EDID, skip it entirely and let `VinoCrtc::atomic_enable`'s own
-            // runtime resend (`cp::timing_from_drm_mode(new.mode())`, driven by whatever mode the
-            // compositor actually picks) be the ONLY mode-set that ever reaches the dock --
-            // self-consistent with the frame that gets encoded from that same mode, by
-            // construction, rather than inventing a second, independently-wrong number here.
-            // Bring-up mode-set uses head 0's EDID timing (the primary head); per-head EDIDs are now
-            // in `edid_heads` -- the `edid_out` scratch was drained into them in the loop above.
-            if let Some(timing) = edid_heads[0].as_deref().and_then(cp::timing_from_edid) {
-                match cp::set_mode(cp_ctr, 0, &timing) {
-                    Ok(smode) => {
-                        // `set_mode` returns the exact 80-byte inner plaintext; the sealing layer
-                        // appends the 16-byte Dl3Cmac on the wire.
-                        let content = &smode[..];
-                        pr_info!(
-                            "vino: sending live mode-set (id=0x48, ctr={cp_ctr}, wseq={wseq})\n"
-                        );
-                        match Self::send_live_cp(
-                            dev,
-                            session,
-                            ep84_q.as_mut(),
-                            &mut resp,
-                            edid_out,
-                            0x48,
-                            wseq,
-                            content,
-                        ) {
-                            Ok((ok, e)) => {
-                                drained += e.reads;
-                                acks += e.acks;
-                                rejects += e.rejects;
-                                pr_info!(
-                                    "vino: live mode-set {} ({}x{}@{} from EDID)\n",
-                                    if ok { "sent" } else { "NAK'd" },
-                                    timing.hactive,
-                                    timing.vactive,
-                                    timing.refresh_hz
-                                );
-                            }
-                            Err(e) => pr_info!("vino: live mode-set failed ({e:?})\n"),
-                        }
-                        // Advance the keystream past this mode-set so runtime KMS sends continue it.
-                        wseq = wseq.wrapping_add(((content.len() + 15) / 16) as u32);
-                        cp_ctr += 1;
-                    }
-                    Err(e) => pr_info!("vino: mode-set build failed ({e:?})\n"),
-                }
-            } else {
-                pr_info!(
-                    "vino: no EDID -- skipping bring-up mode-set (was an unrelated hardcoded \
-                     fallback that could mismatch whatever mode KMS negotiates; \
-                     atomic_enable's runtime resend is now the only mode-set sent)\n"
-                );
-            }
+            // `VinoCrtc::atomic_enable` already sends the exact negotiated timing for each head and
+            // gates its matching framebuffer on that send. It is therefore the only authoritative
+            // mode-set path, matching DLM and eliminating this speculative early head-0 mode.
+            pr_info!("vino: EDID setup complete -- deferring all mode-sets to KMS\n");
         }
 
         // Final sweep of the EP83 interrupt queue so a status byte the dock pushed late (after the
@@ -4310,6 +4258,17 @@ mod tests {
 
         // Non-aligned geometry is rejected (same contract as colour_frame_ep08).
         assert!(video::wht::colour_frame_ep08_damage(100, 32, 0, 0, &[(0, 0, 1, 1)], g).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn black_training_frame_matches_captured_1440p_size() -> Result {
+        // Corrected Vino captures repeatedly measured a 205,696-byte first write:
+        // 2,560-byte ARM + 203,040-byte black image + 96-byte frame trailer.
+        let frame = video::wht::black_frame_ep08(2560, 1440, 0)?;
+        let image_len = frame.iter().map(|part| part.len()).sum::<usize>();
+        assert_eq!(image_len, 203_040);
+        assert_eq!(2_560 + image_len + video::wht::frame_trailer(0, 0).len(), 205_696);
         Ok(())
     }
 

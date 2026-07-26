@@ -1301,6 +1301,52 @@ pub(crate) mod wht {
         Ok((frame_records(&strips, head)?, seq0.wrapping_add(1)))
     }
 
+    /// Build a valid all-black WHT frame without sampling or transforming a framebuffer.
+    ///
+    /// This is the prompt post-mode-set training carrier. A real 1440p compositor keyframe can
+    /// take hundreds of milliseconds to hash and encode, but the D6000's lighting capture starts
+    /// video only ~110 ms after the mode-set, while its stream-enable bracket is still active.
+    /// Every black strip uses the live full-colour [`colour_strip`] grammar, but all sixteen zero
+    /// coefficient blocks are constructed once and reused. Constructing this frame is therefore
+    /// proportional to the 64x16 strip grid rather than to every source pixel and reproduces the
+    /// captured 203,040-byte 1440p black image. The caller still sends the real framebuffer as a
+    /// full keyframe afterwards; this frame exists only to deliver ARM plus continuous,
+    /// correctly-framed video inside the dock's activation window.
+    pub(crate) fn black_frame_ep08(
+        width: usize,
+        height: usize,
+        head: u8,
+    ) -> Result<KVec<KVec<u8>>> {
+        if width % STRIP_W != 0 || height % STRIP_H != 0 {
+            return Err(kernel::error::code::EINVAL);
+        }
+        let mut blocks: KVec<ColourBlock> = KVec::with_capacity(STRIP_BLOCKS, GFP_KERNEL)?;
+        for _ in 0..STRIP_BLOCKS {
+            blocks.push(
+                ColourBlock {
+                    qcr: [0; COEFFS],
+                    qcb: [0; COEFFS],
+                    qy: [0; COEFFS],
+                    lcr: 0,
+                    lcb: 0,
+                    ly: 0,
+                },
+                GFP_KERNEL,
+            )?;
+        }
+        let mut strips: KVec<KVec<u8>> = KVec::new();
+        let mut sy = 0usize;
+        while sy < height {
+            let mut sx = 0usize;
+            while sx < width {
+                strips.push(colour_strip(&blocks, sx as u16, sy as u16)?, GFP_KERNEL)?;
+                sx += STRIP_W;
+            }
+            sy += STRIP_H;
+        }
+        frame_records(&strips, head)
+    }
+
     /// Damage-aware variant of [`colour_frame_ep08`]: encodes **only** the 64x16 strips that
     /// intersect a client damage rectangle, producing a *partial* frame (the dock updates the tiles
     /// it receives at their self-encoded positions and keeps the rest -- how DLM does partial
