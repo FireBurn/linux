@@ -959,6 +959,39 @@ impl WorkItem for BringUp {
                 // sits (1.116-1.157). See `VinoDrmData::drain_cp_pushes`.
                 const MAX_UNPAIRED_DRAIN: usize = 4;
                 pushes += data.drain_cp_pushes(dev, MAX_UNPAIRED_DRAIN);
+                // Userspace-requested sink re-engage (`/sys/devices/vino/reengage`). Runs here
+                // rather than in the sysfs write because this loop already owns a live `Io` token
+                // and the CP dialogue; see `drm_sink::REENGAGE_REQUEST` for why the path needs a
+                // trigger that does not depend on presence detection working first.
+                let requested = drm_sink::take_reengage_requests();
+                if requested != 0 {
+                    for h in 0..VinoDriver::CP_SETUP_HEADS {
+                        if requested & (1 << h) == 0 {
+                            continue;
+                        }
+                        dev_info!(cdev, "vino: head {h} sink re-engage requested via sysfs\n");
+                        data.set_connected(drm_dev, h);
+                        data.reengage_head(dev, h as u8);
+                        // The same downstream readiness wait a fresh bring-up uses, so a mode-set
+                        // following the hotplug lands on a settled link rather than a
+                        // mid-negotiation one. Bounded, and it drops out at once if the session is
+                        // going away.
+                        let rs = Instant::<Monotonic>::now();
+                        while (Instant::<Monotonic>::now() - rs).as_millis() < 1300
+                            && keepalive_running()
+                        {
+                            let _ =
+                                data.send_cp(dev, 0x14, 0, |ctr| cp::device_query_req(ctr, 0x000c));
+                            fsleep(Delta::from_millis(15));
+                        }
+                        head_known[h] = true;
+                        head_silent[h] = 0;
+                        drm_dev.hotplug_event();
+                    }
+                    // The wait above consumed time the other deadlines were counting on.
+                    next_presence = Instant::<Monotonic>::now() + PRESENCE_PERIOD;
+                    next_heartbeat = Instant::<Monotonic>::now() + HEARTBEAT_PERIOD;
+                }
                 // Stage 2: periodic per-head monitor presence re-check.
                 let now_p = Instant::<Monotonic>::now();
                 if (now_p - next_presence).as_millis() >= 0 {
@@ -4191,6 +4224,7 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         kernel::sysfs::Attr::wo(c"remove_all"),
         kernel::sysfs::Attr::rw(c"probe_loop_tripped"),
         kernel::sysfs::Attr::rw(c"dock_pixel_budget"),
+        kernel::sysfs::Attr::wo(c"reengage"),
     ];
 
     fn show(&self, name: &CStr, out: &mut kernel::sysfs::Writer<'_>) -> Result {
@@ -4232,6 +4266,26 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
             }
             drm_sink::set_pixel_budget_override(v);
             pr_info!("vino: dock_pixel_budget override set to {v} px/s via sysfs\n");
+            return Ok(());
+        }
+        // Re-run one head's downstream sink enable (`echo 0 > /sys/devices/vino/reengage`).
+        //
+        // `reengage_head` is the fix for a monitor replug and it had never once run: its only
+        // trigger was a runtime presence transition the watcher never reported, so the fix and the
+        // detection it depends on could only ever be tested together. This separates them -- the
+        // sequence can be exercised on demand, and it doubles as the manual recovery for a
+        // replugged monitor that stayed dark. The work happens on the keepalive loop, which already
+        // owns a live I/O token; see `drm_sink::REENGAGE_REQUEST`.
+        if name == c"reengage" {
+            let head = match buf.first() {
+                Some(&b) if b.is_ascii_digit() => (b - b'0') as u32,
+                _ => return Err(EINVAL),
+            };
+            if head as usize >= VinoDriver::CP_SETUP_HEADS {
+                return Err(EINVAL);
+            }
+            drm_sink::request_reengage(head);
+            pr_info!("vino: head {head} sink re-engage queued via sysfs\n");
             return Ok(());
         }
         if name == c"probe_loop_tripped" {

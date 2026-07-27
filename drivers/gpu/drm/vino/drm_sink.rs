@@ -182,6 +182,34 @@ pub(super) fn set_pixel_budget_override(v: u32) {
     PIXEL_BUDGET_OVERRIDE.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Heads whose downstream sink userspace has asked to have re-engaged, as a bitmask.
+///
+/// [`VinoDrmData::reengage_head`] is the fix for a monitor replug -- the dock enables a head's sink
+/// from the EDID engage, and unplugging the monitor tears that state down, so a replug vino does
+/// not notice leaves the dock accepting every video byte with the panel dark. It has been in the
+/// tree since 2026-07-26 and has **never once run**, because its only trigger is a runtime presence
+/// transition the watcher had never reported. Code on a path that cannot execute is not a fix; it
+/// is a hypothesis.
+///
+/// Writing a head index to `/sys/devices/vino/reengage` sets that head's bit here and the keepalive
+/// loop -- which already holds a live `Io` token and runs the CP dialogue -- performs the sequence
+/// on its next iteration. That makes the path reachable on demand: it can be exercised without
+/// waiting for detection to work, it is an immediate manual recovery for a replug that stayed dark,
+/// and if it does *not* relight a head then re-engagement was never the whole story. Doing the USB
+/// I/O in the sysfs write instead would mean reaching a bound interface from a module-global
+/// attribute group, which is the kind of lifetime shortcut this driver has been removing.
+static REENGAGE_REQUEST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Request a re-engage of `head`'s downstream sink (sysfs writer side).
+pub(super) fn request_reengage(head: u32) {
+    REENGAGE_REQUEST.fetch_or(1 << head, Ordering::Release);
+}
+
+/// Take the pending re-engage mask, clearing it (keepalive side).
+pub(super) fn take_reengage_requests() -> u32 {
+    REENGAGE_REQUEST.swap(0, Ordering::Acquire)
+}
+
 /// **The single head-count knob** for the whole driver. Every per-head array/loop is sized by this
 /// (`connectors`, `gamma`, `video_keys`, the CP setup in `vino.rs` via `CP_SETUP_HEADS = HEADS`, the
 /// scanout keyframe/arm bitmasks). Which heads actually light up is decided at runtime by per-head
