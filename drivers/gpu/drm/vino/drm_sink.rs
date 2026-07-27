@@ -4150,7 +4150,31 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, mut frame: 
                     .as_ref()
                     .is_some_and(|debt| debt.iter().any(|&d| d > 0));
                 if owes {
-                    let copy = frame.clone();
+                    // ★ Re-snapshot at repaint time; do NOT replay this frame's pixels.
+                    //
+                    // `from_shadow` pins the frame to one of `SHADOW_SLOTS` (2) private surfaces,
+                    // and later commits reuse those slots round-robin. By the time this repaint
+                    // runs, the slot it names may hold a completely different frame -- so the owed
+                    // strips go out carrying whatever landed there since, and because the send
+                    // publishes `strip_hashes` from that same content, vino then believes the dock
+                    // is up to date. Nothing is ever scheduled to correct it. Permanent.
+                    //
+                    // Measured 2026-07-27 by scoring the dock's accumulated state per strip against
+                    // a screenshot taken once the desktop had settled, split by when each strip was
+                    // last transmitted:
+                    //
+                    //     last written mid-drag :   640 strips, max err > 64:   0   (mean-max ~22)
+                    //     last written settled  :  1424 strips, max err > 64: 943   (mean-max 146)
+                    //
+                    // Everything sent while the compositor was committing is correct; only what
+                    // this idle path sends afterwards is wrong -- which is exactly "corruption that
+                    // appears when dragging and stays when you stop".
+                    //
+                    // Clearing `from_shadow` makes `run_pending_scanout` take its own fresh,
+                    // coherent snapshot for this pass (the idle path it already has for exactly
+                    // this), so the owed strips carry current pixels instead of a recycled slot's.
+                    let mut copy = frame.clone();
+                    copy.from_shadow = false;
                     data.settle_repaint.lock()[head_i] = Some((
                         Instant::<Monotonic>::now() + Delta::from_millis(FRAME_PERIOD_MS),
                         copy,
