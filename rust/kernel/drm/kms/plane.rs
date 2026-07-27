@@ -66,6 +66,30 @@ impl BitOr for Rotation {
     }
 }
 
+/// Supported plane pixel-blend modes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BlendModes(u32);
+
+impl BlendModes {
+    /// Source pixels are premultiplied by alpha.
+    pub const PREMULTIPLIED: Self = Self(1 << bindings::DRM_MODE_BLEND_PREMULTI);
+    /// Source pixels provide straight alpha coverage.
+    pub const COVERAGE: Self = Self(1 << bindings::DRM_MODE_BLEND_COVERAGE);
+    /// Ignore per-pixel alpha.
+    pub const PIXEL_NONE: Self = Self(1 << bindings::DRM_MODE_BLEND_PIXEL_NONE);
+
+    fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl BitOr for BlendModes {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
 
 /// The main trait for implementing the [`struct drm_plane`] API for [`Plane`].
 ///
@@ -433,6 +457,22 @@ impl<T: DriverPlane> UnregisteredPlane<T> {
                 default_rotation.bits(),
                 supported_rotations.bits(),
             )
+        })
+    }
+
+    /// Attaches the `pixel blend mode` property to this plane.
+    ///
+    /// `supported_modes` is a bitmask of `BIT(DRM_MODE_BLEND_*)`; `DRM_MODE_BLEND_PREMULTI` must
+    /// always be included. Any plane that advertises a pixel format with an alpha channel is
+    /// required to have this property -- `drm_mode_config_validate()` `WARN`s at registration
+    /// otherwise, because userspace has no way to know how the alpha will be interpreted.
+    ///
+    /// Call this during [`KmsDriver::create_objects`](crate::drm::kms::KmsDriver::create_objects),
+    /// before the device is registered.
+    pub fn create_blend_mode_property(&self, supported_modes: BlendModes) -> Result {
+        // SAFETY: `as_raw()` is a valid, not-yet-registered plane.
+        to_result(unsafe {
+            bindings::drm_plane_create_blend_mode_property(self.as_raw(), supported_modes.bits())
         })
     }
 }
