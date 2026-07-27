@@ -4479,6 +4479,16 @@ static PHASE_N: [core::sync::atomic::AtomicU64; HEADS] =
 static SHADOW_FRAMES: [core::sync::atomic::AtomicU64; HEADS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; HEADS];
 
+/// Per-head cost of the per-presentation `id=0x14 sub=0x0c` CP sync: call count, cumulative and
+/// worst-case microseconds. See its call site in `encode_and_send_wht` for why the worst case is
+/// the number that decides whether it has to change.
+static CP_SYNC_N: [core::sync::atomic::AtomicU64; HEADS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; HEADS];
+static CP_SYNC_TOTAL_US: [core::sync::atomic::AtomicU64; HEADS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; HEADS];
+static CP_SYNC_MAX_US: [core::sync::atomic::AtomicU64; HEADS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; HEADS];
+
 /// Per-head [`TEST_DETECT_BUFFER_RECYCLE`] tallies: frames checked, frames whose content moved
 /// under the encoder, and the total number of strips that differed.
 static RECYCLE_CHECKED: [core::sync::atomic::AtomicU64; HEADS] =
@@ -5819,7 +5829,27 @@ fn encode_and_send_wht(
             }
         }
 
-        if let Err(e) = data.send_cp(dev, 0x14, 0, |ctr| super::cp::device_query_req(ctr, 0x000c)) {
+        // ★ Instrumented 2026-07-27. This runs once per presentation, per head, and takes the
+        // GLOBAL `cp_link` mutex to do a synchronous control OUT followed by an EP84 IN bounded by
+        // `cp_reply_timeout()` (8 ms). At 120 Hz on two heads that is 240 round trips a second
+        // through a single lock -- the last structure that makes the two heads contend after the
+        // `video_q`/`video_staging` split, and if the dock does not answer, one drain timeout is
+        // the whole 8.33 ms frame budget. Whether that is costing anything real is an open
+        // question and nobody has measured it, so measure it before changing it: the running
+        // maximum is what matters (a rare 8 ms stall is invisible in a mean).
+        let t_cp = Instant::<Monotonic>::now();
+        let cp_res = data.send_cp(dev, 0x14, 0, |ctr| super::cp::device_query_req(ctr, 0x000c));
+        let cp_us = (Instant::<Monotonic>::now() - t_cp).as_micros_ceil() as u64;
+        let worst = CP_SYNC_MAX_US[head_i].fetch_max(cp_us, Ordering::Relaxed).max(cp_us);
+        let n = CP_SYNC_N[head_i].fetch_add(1, Ordering::Relaxed) + 1;
+        let total = CP_SYNC_TOTAL_US[head_i].fetch_add(cp_us, Ordering::Relaxed) + cp_us;
+        if n <= 2 || n % 256 == 0 {
+            pr_info!(
+                "vino: per-frame CP sync head={head} this={cp_us}us mean={}us worst={worst}us over {n} frame(s)\n",
+                total / n
+            );
+        }
+        if let Err(e) = cp_res {
             pr_info!(
                 "vino: scanout head={} per-frame CP sync failed ({e:?})\n",
                 head
