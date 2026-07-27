@@ -4347,6 +4347,7 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         kernel::sysfs::Attr::wo(c"remove_all"),
         kernel::sysfs::Attr::rw(c"probe_loop_tripped"),
         kernel::sysfs::Attr::rw(c"dock_pixel_budget"),
+        kernel::sysfs::Attr::rw(c"head_max_refresh"),
         kernel::sysfs::Attr::wo(c"reengage"),
         kernel::sysfs::Attr::rw(c"blank_marker"),
         kernel::sysfs::Attr::rw(c"record_sub_parity"),
@@ -4362,6 +4363,14 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         }
         if name == c"dock_pixel_budget" {
             let v = drm_sink::pixel_budget_override();
+            let s = kernel::str::CString::try_from_fmt(kernel::prelude::fmt!("{v}\n"))?;
+            return out.write(s.to_bytes());
+        }
+        // The refresh ceiling actually in force, not the override -- unlike the dock budget this
+        // one prunes the advertised mode list, so "why is 165 Hz missing" wants the effective
+        // figure, and reading back a bare `0` would answer the wrong question.
+        if name == c"head_max_refresh" {
+            let v = drm_sink::max_refresh_hz();
             let s = kernel::str::CString::try_from_fmt(kernel::prelude::fmt!("{v}\n"))?;
             return out.write(s.to_bytes());
         }
@@ -4391,7 +4400,13 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         // `drm_sink::PIXEL_BUDGET_OVERRIDE` for why this is writable rather than a fixed constant.
         // Takes effect on the next `mode_valid`/`atomic_check`, so re-probe the connector (or
         // toggle the output) for a changed value to show up in the advertised mode list.
-        if name == c"dock_pixel_budget" {
+        //
+        // `head_max_refresh` is the same knob for the per-head REFRESH ceiling in Hz
+        // (`drm_sink::DOCK_MAX_REFRESH_HZ`, 120 -- the highest rate this dock has ever been shown to
+        // display; DLM clamps 180 Hz to 120 on the wire and vino's own 165/180 attempts went dark).
+        // That one prunes the advertised mode list, so a change needs a connector re-probe to show
+        // up in `kscreen-doctor`/`xrandr`; `echo 165` re-runs the open high-refresh experiment.
+        if name == c"dock_pixel_budget" || name == c"head_max_refresh" {
             let mut v: u32 = 0;
             let mut digits = 0;
             for &b in buf {
@@ -4409,6 +4424,14 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
             }
             if digits == 0 {
                 return Err(EINVAL);
+            }
+            if name == c"head_max_refresh" {
+                drm_sink::set_max_refresh_override(v);
+                let eff = drm_sink::max_refresh_hz();
+                pr_info!(
+                    "vino: head_max_refresh override set to {v} Hz via sysfs (in force: {eff} Hz)\n"
+                );
+                return Ok(());
             }
             drm_sink::set_pixel_budget_override(v);
             pr_info!("vino: dock_pixel_budget override set to {v} px/s via sysfs\n");
@@ -5161,6 +5184,46 @@ mod tests {
         assert_eq!(u16::from_le_bytes([w120[70], w120[71]]), 49_775);
         assert_eq!(w120[72], 0);
         Ok(())
+    }
+
+    /// The dock's refresh ceiling prunes exactly the rates no stack has ever displayed.
+    ///
+    /// The monitor's EDID offers 2560x1440 at 120, 165 and 180 Hz. DLM takes the 180 Hz mode from
+    /// the compositor and puts **119.998 Hz** on the wire (`captures/dlm-180hz-cp-20260726-2300`);
+    /// vino sent the real 165 and 180 Hz timings and both panels went dark with the dock acking
+    /// every byte (`docs/HIGH-REFRESH.md`). 120 Hz is the last rate this hardware is known to
+    /// display, so the mode list stops there.
+    ///
+    /// The 120 Hz case is the one that matters most: it sits on the boundary and must pass by
+    /// **equality**. A `<` here would prune the working configuration and dark both panels.
+    #[test]
+    fn refresh_ceiling_prunes_only_the_unproven_rates() {
+        assert_eq!(drm_sink::max_refresh_hz(), 120); // no override in force under KUnit
+        let ok = drm_sink::refresh_within_limit;
+
+        // Allowed: the proven configuration, on the boundary, and everything under it. 164.96 Hz
+        // and 119.998 Hz both arrive here already rounded by `drm_mode_vrefresh`.
+        assert!(ok(120));
+        assert!(ok(60));
+        assert!(ok(119));
+        // Pruned: the two rates that were tried on hardware and left the panel dark.
+        assert!(!ok(165));
+        assert!(!ok(180));
+        // A degenerate mode reports 0 Hz; that carries no rate information, so it is not this
+        // check's business to reject it (`MAX_HEAD_CLOCK_KHZ` and the dock budget still bound it),
+        // and a signed refresh must never be read as a huge unsigned one.
+        assert!(ok(0));
+        assert!(ok(-1));
+
+        // The ceiling is refresh, deliberately NOT pixel rate: 3840x2160@60 is 497,664,000 px/s --
+        // above DLM's declared per-connector 442,368,000 -- and this dock is documented to drive it,
+        // so a rate cap set at DLM's figure would prune a mode that works. The active-rate helper
+        // still backs the dock-wide budget checks, and must saturate rather than wrap.
+        let rate = drm_sink::active_pixel_rate;
+        assert!(ok(60) && rate(3840, 2160, 60) == 497_664_000);
+        assert_eq!(rate(2560, 1440, 120), 442_368_000); // DLM's declared limit, exactly
+        assert_eq!(rate(65535, 65535, 65535), u32::MAX); // saturates, never wraps small
+        assert_eq!(rate(2560, 1440, -1), 0);
     }
 
     /// The whole set-mode message vino builds, byte-checked against every **DLM** `id=0x48 sub=0x22`

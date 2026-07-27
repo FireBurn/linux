@@ -182,6 +182,91 @@ pub(super) fn set_pixel_budget_override(v: u32) {
     PIXEL_BUDGET_OVERRIDE.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// **The highest refresh rate this dock has ever been shown to display, in Hz.** Modes above it are
+/// pruned from every head's mode list ([`VinoConnector::mode_valid`]) and refused on commit
+/// ([`VinoCrtc::atomic_check`]).
+///
+/// This is measured, not assumed. With KWin/kscreen reporting `2560x1440@180.00*` on **both** lit
+/// heads, DisplayLinkManager's `id=0x48 sub=0x22` set-mode carries 497.75 MHz over htotal 2720 x
+/// vtotal 1525 = **119.998 Hz** — an active rate of 442,359,113 px/s, exactly the
+/// `pixel_per_second_limit` DLM declares (442,368,000 = one 2560x1440@120). DLM accepts a
+/// high-refresh mode from the compositor and then programs the dock at 120; the compositor believes
+/// 180, the dock is driven at 120 (`captures/dlm-180hz-cp-20260726-2300/SUMMARY.md`). Across the
+/// whole corpus, no stack has ever put a >120 Hz timing on this dock's wire.
+///
+/// vino is the only one that has *tried*, and it has the answer: 2560x1440@165 (699.5 MHz) and
+/// @180 (714.81 MHz) both reached the wire un-clamped, the dock acked every byte, vino kept
+/// streaming with zero USB errors and zero `EPIPE` — and **both panels stayed dark**
+/// (`docs/HIGH-REFRESH.md`). A mode the desktop offers and the dock blanks on is worse than a mode
+/// that was never offered, so the EDID's 165/180 Hz entries do not survive into the mode list.
+///
+/// **Why a refresh ceiling rather than a pixel-rate one.** The tempting figure is DLM's declared
+/// 442,368,000 px/s, but that is a per-connector *share* handed to evdi with two heads attached,
+/// not a per-head hardware limit — capping a head there would also prune 3840x2160@60
+/// (497,664,000 px/s), which this dock is documented to drive and which vino offers today. Refresh
+/// is the axis every measurement actually agrees on. The dock's aggregate throughput is a separate
+/// question and stays where it was, in [`VinoDrmData::dock_pixel_budget`] and `atomic_check`.
+///
+/// ⚠ This is a *floor* on the dock's capability, not a proven hardware maximum. Two explanations
+/// still fit the dark panels — the dock caps refresh, or vino's >655.35 MHz clock encoding (the
+/// unproven off72 high byte) is wrong — and `docs/HIGH-REFRESH.md` has never separated them. Raise
+/// [`HEAD_MAX_REFRESH_OVERRIDE`] rather than editing this constant when re-running that experiment:
+/// it costs an `echo`, and a lit panel is the evidence that would retire the limit.
+const DOCK_MAX_REFRESH_HZ: u32 = 120;
+
+/// Runtime override for [`DOCK_MAX_REFRESH_HZ`], in Hz; `0` = use the compiled-in figure. Backs
+/// `/sys/devices/vino/head_max_refresh`.
+///
+/// This is the knob for the open high-refresh experiment. `echo 165` restores 1920x1080@165 to the
+/// mode list — 342,144,000 px/s and ~381 MHz, so it fits the *proven* 16-bit clock field and needs
+/// no off72, which makes it the one test that separates "the dock caps refresh" from "vino's 24-bit
+/// clock encoding is wrong". `echo 200` restores everything the monitor offers. Global rather than
+/// per-device, matching [`PIXEL_BUDGET_OVERRIDE`]: vino drives one dock.
+static HEAD_MAX_REFRESH_OVERRIDE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Read/write accessors for [`HEAD_MAX_REFRESH_OVERRIDE`], for the sysfs attribute in `vino.rs`.
+pub(super) fn max_refresh_override() -> u32 {
+    HEAD_MAX_REFRESH_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed)
+}
+pub(super) fn set_max_refresh_override(v: u32) {
+    HEAD_MAX_REFRESH_OVERRIDE.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The per-head refresh ceiling in force right now (Hz): the sysfs override if set, else
+/// [`DOCK_MAX_REFRESH_HZ`].
+pub(super) fn max_refresh_hz() -> u32 {
+    let over = max_refresh_override();
+    if over != 0 {
+        over
+    } else {
+        DOCK_MAX_REFRESH_HZ
+    }
+}
+
+/// Is `vrefresh` (as DRM reports it, rounded to whole Hz) within the dock's refresh ceiling?
+///
+/// DRM's `drm_mode_vrefresh` rounds, so this monitor's 164.96 Hz mode arrives as 165 and its
+/// 119.998 Hz mode as 120: comparing rounded Hz with `<=` keeps the boundary mode that works and
+/// drops the ones that do not, with no epsilon to tune. A non-positive refresh (DRM returns a
+/// signed int and computes 0 for a degenerate timing) is treated as within the limit -- it carries
+/// no rate information, and `MAX_HEAD_CLOCK_KHZ` plus the dock budget still bound such a mode.
+pub(super) fn refresh_within_limit(vrefresh: i32) -> bool {
+    vrefresh <= 0 || (vrefresh as u32) <= max_refresh_hz()
+}
+
+/// Active pixel rate of a mode, in pixels/sec: `hdisplay * vdisplay * vrefresh`.
+///
+/// Deliberately the **active** rate, not the dot clock: it is the quantity DLM's declared limit is
+/// expressed in and the quantity its 180 Hz clamp lands on exactly, so comparing like with like is
+/// what makes [`DOCK_HEAD_PIXEL_RATE`] an equality rather than an approximation. Saturating
+/// throughout — a bogus mode must not wrap into a small rate and be admitted.
+pub(super) fn active_pixel_rate(hdisplay: u16, vdisplay: u16, vrefresh: i32) -> u32 {
+    u32::from(hdisplay)
+        .saturating_mul(u32::from(vdisplay))
+        .saturating_mul(vrefresh.max(0) as u32)
+}
+
 /// Heads whose downstream sink userspace has asked to have re-engaged, as a bitmask.
 ///
 /// [`VinoDrmData::reengage_head`] is the fix for a monitor replug -- the dock enables a head's sink
@@ -3529,20 +3614,36 @@ impl crtc::DriverCrtc for VinoCrtc {
         let (old, new) = check.take_old_new_state();
         let old_rate = if old.active() {
             let m = old.mode();
-            u32::from(m.hdisplay())
-                .saturating_mul(u32::from(m.vdisplay()))
-                .saturating_mul(m.vrefresh().max(0) as u32)
+            active_pixel_rate(m.hdisplay(), m.vdisplay(), m.vrefresh())
         } else {
             0
         };
         let new_rate = if new.active() {
             let m = new.mode();
-            u32::from(m.hdisplay())
-                .saturating_mul(u32::from(m.vdisplay()))
-                .saturating_mul(m.vrefresh().max(0) as u32)
+            active_pixel_rate(m.hdisplay(), m.vdisplay(), m.vrefresh())
         } else {
             0
         };
+        // Refresh ceiling, enforced here as well as in `mode_valid`, because pruning the mode list
+        // is not a limit: a client can commit a user-defined mode that was never advertised
+        // (`xrandr --newmode`, a modeline in a compositor config, `drm_mode_setcrtc` with its own
+        // timing). This is the check that actually stops the dock being driven at a rate it goes
+        // dark on, and it costs one comparison on the commit path.
+        //
+        // Only a commit that RAISES the refresh is rejected, exactly as the budget check below only
+        // examines a commit that raises the rate. Every page flip carries the CRTC state through
+        // here, so failing on the rate a head is already running would turn a ceiling lowered at
+        // runtime (`head_max_refresh`) into a frozen desktop -- and it would block the mode change
+        // back down, which is the one commit that fixes it.
+        let old_refresh = if old.active() { old.mode().vrefresh() } else { 0 };
+        let new_refresh = if new.active() { new.mode().vrefresh() } else { 0 };
+        if new_refresh > old_refresh && !refresh_within_limit(new_refresh) {
+            let limit = max_refresh_hz();
+            pr_warn!(
+                "vino: rejecting commit -- head {head} at {new_refresh} Hz exceeds the dock's refresh ceiling ({limit} Hz); raise /sys/devices/vino/head_max_refresh to retry\n"
+            );
+            return Err(EINVAL);
+        }
         if budget == 0 || new_rate <= old_rate {
             return Ok(());
         }
@@ -5788,10 +5889,20 @@ impl connector::DriverConnector for VinoConnector {
     }
 
     /// Prune modes whose pixel clock exceeds a single head's bandwidth ceiling
-    /// ([`MAX_HEAD_CLOCK_KHZ`], ~4K@60).
+    /// ([`MAX_HEAD_CLOCK_KHZ`], ~4K@60), whose refresh rate exceeds what the dock has ever been
+    /// shown to display ([`DOCK_MAX_REFRESH_HZ`]), or whose pixel rate exceeds the dock's budget.
     fn mode_valid(connector: &Connector<Self>, mode: &DisplayMode) -> ModeStatus {
         // Hard single-link ceiling (~4K@60) first.
         if mode.clock() > MAX_HEAD_CLOCK_KHZ {
+            return ModeStatus::ClockHigh;
+        }
+        // Refresh ceiling: do not advertise a rate this dock has never been shown to display. This
+        // monitor's EDID offers 2560x1440@165 and @180; DLM silently clamps such a mode to 120
+        // before it reaches the wire, and vino's two attempts at driving one for real went dark
+        // with the dock acking every byte. A mode the desktop offers and the dock blanks on is
+        // worse than an absent one. See [`DOCK_MAX_REFRESH_HZ`] for the measurements, why the limit
+        // is refresh and not pixel rate, and the sysfs escape hatch for re-running the experiment.
+        if !refresh_within_limit(mode.vrefresh()) {
             return ModeStatus::ClockHigh;
         }
         // Head 1 was clamped to 60 Hz here on 2026-07-25 because "allowing KWin to select 120 Hz on
@@ -5799,8 +5910,9 @@ impl connector::DriverConnector for VinoConnector {
         // misattribution: the dock stayed pre-activation because vino's EDID engage
         // (`id=0x16 sub=0x23`) carried a random byte in off23 and was rejected, so the downstream
         // sink was never enabled -- not because of the refresh rate. With that fixed both heads
-        // reach `2807a`/`2990d` at 1440p120, and the cross-head budget below is the only rate limit
-        // that belongs here.
+        // reach `2807a`/`2990d` at 1440p120. The two limits that do belong here are the refresh
+        // ceiling above (what the dock can display at all) and the cross-head budget below (what it
+        // can carry) -- neither of them a per-head special case.
         // Experiment: pin the head to 1280x720@60 (see `TEST_ONLY_720P60`).
         if TEST_ONLY_720P60 {
             let is_720p60 = mode.hdisplay() == 1280
@@ -5818,13 +5930,9 @@ impl connector::DriverConnector for VinoConnector {
         // a false rejection. See `docs/CROSS-HEAD-BANDWIDTH-DESIGN.md`.
         let data: &VinoDrmData = connector.drm_dev();
         let budget = data.dock_budget();
-        if budget != 0 {
-            let rate = u32::from(mode.hdisplay())
-                .saturating_mul(u32::from(mode.vdisplay()))
-                .saturating_mul(mode.vrefresh().max(0) as u32);
-            if rate > budget {
-                return ModeStatus::Bad;
-            }
+        let head_rate = active_pixel_rate(mode.hdisplay(), mode.vdisplay(), mode.vrefresh());
+        if budget != 0 && head_rate > budget {
+            return ModeStatus::Bad;
         }
         ModeStatus::Ok
     }
