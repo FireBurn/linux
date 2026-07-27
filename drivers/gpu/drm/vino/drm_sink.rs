@@ -871,14 +871,25 @@ impl VinoDrmData {
         })
     }
 
+    /// Publish the producers' stop flag and nothing else.
+    ///
+    /// `disconnect()` calls this *before* `IoWindow::close()`. The scanout and command workers each
+    /// hold an `Io` token for as long as they loop and re-read `shutting_down` every iteration, so
+    /// setting it early is what keeps them from holding `close()`'s wait open. Everything in
+    /// [`shutdown`](Self::shutdown) proper must wait until USB I/O is quiesced; this must not.
+    pub(super) fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.cp_timeline_exclusive.store(false, Ordering::Release);
+    }
+
     /// Stop deferred DRM work while the parent USB interface is still bound. `cmd_work` is
     /// embedded in this DRM device and each successful enqueue temporarily owns an
     /// `ARef<VinoDrmDevice>`; pending scanouts also retain compositor framebuffers. Quiesce both
     /// producers, reclaim any queued work pointer, and drop those framebuffers before the final
     /// device references disappear during devres teardown.
     pub(super) fn shutdown(&self) {
-        self.shutting_down.store(true, Ordering::Release);
-        self.cp_timeline_exclusive.store(false, Ordering::Release);
+        // Idempotent, and `disconnect()` has normally already done this: see `begin_shutdown`.
+        self.begin_shutdown();
         for mode in &self.modeset_requested {
             mode.store(0, Ordering::Release);
         }

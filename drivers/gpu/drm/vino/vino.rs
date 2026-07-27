@@ -4076,13 +4076,18 @@ impl usb::Driver for VinoDriver {
         intf: &'bound usb::Interface<Core<'_>>,
         data: Pin<&VinoBoundData<'bound>>,
     ) {
-        // Latch teardown BEFORE anything flushes the bring-up work, so the CP keepalive loop exits
-        // and cannot hang unload waiting on its `fsleep`.
+        // The order below is the one that survives a disconnect arriving *during* bring-up, which
+        // is what wedged `usb_hub_wq` for a whole boot on 2026-07-27 (see `SESSION_TEARDOWN`):
         //
-        // The latch is sticky and only `probe()` lifts it, because clearing `KEEPALIVE_RUN` here is
-        // not enough on its own: `BringUp::run` *sets* that flag, near the end of a bring-up that
-        // takes ~15 s, so a disconnect landing mid-bring-up cleared a flag the work item then put
-        // straight back. See `SESSION_TEARDOWN` for the boot that proves it.
+        //   1. latch teardown, so nothing the outgoing session runs can re-arm the keepalive;
+        //   2. stop the looping DRM producers (they poll `shutting_down` every iteration);
+        //   3. `cancel_sync` the bring-up work, which now drops out of its loops promptly;
+        //   4. only then `close()` the I/O window.
+        //
+        // Doing (4) before (3) is precisely the deadlock: `BringUp::run` holds one `Io` token for
+        // its entire body, `close()` waits for that token to be dropped, and the body was looping
+        // forever. Closing first was meant to release anything blocked in `recv()`, but every
+        // `recv`/`flush` in this driver is bounded by a timeout, so (3) terminates without it.
         //
         // Only the control interface owns the bring-up work and the keepalive; latching on any
         // other interface's unbind would leave a live session with no CP heartbeat, which makes the
@@ -4098,12 +4103,12 @@ impl usb::Driver for VinoDriver {
             VINO_IFACES.lock()[(number as usize) & 7] = None;
         }
 
-        // Close the USB I/O window first: new transfers are refused immediately, the persistent
-        // queues' URBs are cancelled, and this blocks until every in-flight transfer has finished.
-        // Everything below therefore runs with no USB I/O outstanding, which is what makes
-        // `IoWindow::new`'s safety contract hold.
-        if let Some(io) = data.io.as_ref() {
-            io.close();
+        // Publish the producers' stop flag before waiting on anything. This is only the flag: the
+        // teardown that must not run until USB I/O is quiesced (vblank timers, the device's
+        // self-reference cycles) still happens in `shutdown()` further down.
+        if let Some(reg) = data.registration.as_ref() {
+            let drm_data: &drm_sink::VinoDrmData = reg.device();
+            drm_data.begin_shutdown();
         }
 
         // Take the sole driver-owned bring-up handle. The queued work holds its own Arc until it
@@ -4119,6 +4124,15 @@ impl usb::Driver for VinoDriver {
         if let Some(work) = bringup.as_ref() {
             drop(work.work.cancel_sync());
         }
+
+        // Close the USB I/O window: new transfers are refused immediately, the persistent queues'
+        // URBs are cancelled, and this blocks until every in-flight transfer has finished.
+        // Everything below therefore runs with no USB I/O outstanding, which is what makes
+        // `IoWindow::new`'s safety contract hold.
+        if let Some(io) = data.io.as_ref() {
+            io.close();
+        }
+
         // Stop every producer. The DRM device itself is unregistered by `Registration`'s `Drop`
         // when the bound data is released -- the accepted registration teardown already calls
         // `drm_dev_unplug()`, so there is no driver-local force-unplug here any more.
