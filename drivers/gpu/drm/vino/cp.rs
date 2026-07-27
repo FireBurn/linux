@@ -1651,8 +1651,19 @@ pub(super) fn probe_reply_status(
                 continue;
             }
             let id = u16::from_le_bytes([inner[0], inner[1]]);
+            let sub = u16::from_le_bytes([inner[2], inner[3]]);
             let pad = u16::from_le_bytes([inner[6], inner[7]]);
             if id >= 0x400 || pad != 0 {
+                continue;
+            }
+            // ★ Only this probe's OWN reply class counts. Accepting any decodable frame let an
+            // unrelated message land here as a bogus answer -- HW-observed as
+            // `presence probe reply id=0x8b status=0x3334327c ready=false`, which flipped a healthy
+            // head to "absent", raised a downstream-change event, and set off a re-engage loop.
+            // A rich `id=0x44 sub=0x20` is the EDID handler answering; a generic `id=0x14` is the
+            // dock declining to route the probe, which is a real (negative) answer. Anything else
+            // is somebody else's mail: keep scanning, and report "no reply" rather than a wrong one.
+            if !(matches!(id, 0x44 | 0x194) && sub == 0x0020) && id != 0x14 {
                 continue;
             }
             // A short generic ack (the `id=0x14` the dock sends when it cannot route the probe)
