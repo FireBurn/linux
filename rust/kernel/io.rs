@@ -225,6 +225,30 @@ fn io_view<'a, IO: Io<'a>, U>(
     Ok(unsafe { IO::Backend::project_view(view, projected_ptr) })
 }
 
+/// Returns a byte-slice view for a given range, performing runtime bounds checks.
+#[inline]
+fn io_byte_slice<'a, IO>(
+    this: IO,
+    offset: usize,
+    len: usize,
+) -> Result<<IO::Backend as IoBackend>::View<'a, [u8]>>
+where
+    IO: Io<'a, Target = [u8]>,
+{
+    let view = this.as_view();
+    let ptr = IO::Backend::as_ptr(view);
+    let end = offset.checked_add(len).ok_or(EINVAL)?;
+
+    if end > ptr.len() {
+        return Err(EINVAL);
+    }
+
+    let projected_ptr =
+        core::ptr::slice_from_raw_parts_mut(ptr.cast::<u8>().wrapping_add(offset), len);
+    // SAFETY: The bounds check above proves that `projected_ptr` is a sub-slice of `ptr`.
+    Ok(unsafe { IO::Backend::project_view(view, projected_ptr) })
+}
+
 /// I/O backends.
 ///
 /// This is an abstract representation to be implemented by arbitrary I/O
@@ -638,6 +662,32 @@ pub trait Io<'a>: IoBase<'a> {
         unsafe {
             Self::Backend::copy_from_io(self.as_view(), data.as_mut_ptr());
         }
+    }
+
+    /// Copy bytes from `data` to a range of I/O memory.
+    ///
+    /// Returns [`EINVAL`] if `offset..offset + data.len()` is outside the I/O region.
+    #[inline]
+    fn try_copy_from_slice(self, offset: usize, data: &[u8]) -> Result
+    where
+        Self::Backend: IoCopyable,
+        Self: Io<'a, Target = [u8]>,
+    {
+        io_byte_slice(self, offset, data.len())?.copy_from_slice(data);
+        Ok(())
+    }
+
+    /// Copy a range of I/O memory to `data`.
+    ///
+    /// Returns [`EINVAL`] if `offset..offset + data.len()` is outside the I/O region.
+    #[inline]
+    fn try_copy_to_slice(self, offset: usize, data: &mut [u8]) -> Result
+    where
+        Self::Backend: IoCopyable,
+        Self: Io<'a, Target = [u8]>,
+    {
+        io_byte_slice(self, offset, data.len())?.copy_to_slice(data);
+        Ok(())
     }
 
     /// Fallible 8-bit read with runtime bounds check.
