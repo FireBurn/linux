@@ -332,6 +332,25 @@ pub(super) fn take_simulated_unplugs() -> u32 {
 
 static SIMULATE_UNPLUG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Heads whose presence probe is forced to report "absent" regardless of what the dock says.
+///
+/// Fault injection for the one path a cable cannot reach from here. On real hardware the dock
+/// answers a re-engaged head's probe with the generic `id=0x14` for a while -- long enough that the
+/// probe alone never recovers the head, which was the bug -- while in a *simulated* unplug it
+/// returns to `id=0x44` almost immediately and the probe path recovers the head before the
+/// recovered-EDID path is ever exercised. Pinning the probe negative reproduces the hardware's
+/// behaviour exactly, which is how that path was proven rather than assumed.
+///
+/// Test-only, written via `/sys/devices/vino/test_probe_absent`; `0` restores normal behaviour.
+static PROBE_FORCED_ABSENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub(super) fn probe_forced_absent() -> u32 {
+    PROBE_FORCED_ABSENT.load(Ordering::Relaxed)
+}
+pub(super) fn set_probe_forced_absent(mask: u32) {
+    PROBE_FORCED_ABSENT.store(mask, Ordering::Relaxed);
+}
+
 /// Request a re-engage of `head`'s downstream sink (sysfs writer side).
 pub(super) fn request_reengage(head: u32) {
     REENGAGE_REQUEST.fetch_or(1 << head, Ordering::Release);
@@ -2376,6 +2395,9 @@ impl VinoDrmData {
     /// treats `None` as "no change", and debounces `Some` transitions). Reuses the live session
     /// `ks/riv/counter` exactly like `send_cp`, so it stays in CP lockstep.
     pub(super) fn probe_head_present(&self, dev: &BoundInterface<'_>, head: u8) -> Option<bool> {
+        if probe_forced_absent() & (1u32 << head) != 0 {
+            return Some(false); // see `PROBE_FORCED_ABSENT`
+        }
         let mut guard = self.cp_link.lock();
         let link = (&mut *guard).as_mut()?;
         let msg = super::cp::get_edid_req_sub(link.counter, 0x0020, head).ok()?;

@@ -4352,6 +4352,7 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         kernel::sysfs::Attr::rw(c"record_sub_parity"),
         kernel::sysfs::Attr::wo(c"simulate_unplug"),
         kernel::sysfs::Attr::rw(c"record_band_order"),
+        kernel::sysfs::Attr::rw(c"test_probe_absent"),
     ];
 
     fn show(&self, name: &CStr, out: &mut kernel::sysfs::Writer<'_>) -> Result {
@@ -4371,6 +4372,11 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         if name == c"record_band_order" {
             let on = drm_sink::interlaced_bands();
             return out.write(if on { b"1\n" } else { b"0\n" });
+        }
+        if name == c"test_probe_absent" {
+            let v = drm_sink::probe_forced_absent();
+            let s = kernel::str::CString::try_from_fmt(kernel::prelude::fmt!("{v}\n"))?;
+            return out.write(s.to_bytes());
         }
         if name == c"blank_marker" {
             let v = drm_sink::blank_marker_state();
@@ -4416,6 +4422,17 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         // sequence can be exercised on demand, and it doubles as the manual recovery for a
         // replugged monitor that stayed dark. The work happens on the keepalive loop, which already
         // owns a live I/O token; see `drm_sink::REENGAGE_REQUEST`.
+        // Fault injection: pin a head's presence probe negative, reproducing the `id=0x14` the
+        // dock really answers after a re-engage. See `drm_sink::PROBE_FORCED_ABSENT`.
+        if name == c"test_probe_absent" {
+            let mask = match buf.first() {
+                Some(&b) if b.is_ascii_digit() => (b - b'0') as u32,
+                _ => return Err(EINVAL),
+            };
+            drm_sink::set_probe_forced_absent(mask);
+            pr_info!("vino: presence probe forced absent for head mask 0x{mask:x} via sysfs\n");
+            return Ok(());
+        }
         // Band order: 0 = raster (vino's shape), 1 = all even bands then all odd (DLM's
         // `ep0b_frame1` shape). Like the parity bit, no pixel decoder can see the difference.
         if name == c"record_band_order" {
