@@ -911,6 +911,16 @@ impl WorkItem for BringUp {
             let mut next_presence = Instant::<Monotonic>::now() + PRESENCE_PERIOD;
             let mut head_known = [false; VinoDriver::CP_SETUP_HEADS];
             let mut head_debounce = [0u8; VinoDriver::CP_SETUP_HEADS];
+            /// Consecutive undecodable presence replies that count as "this head has no monitor".
+            ///
+            /// The probe used to treat a missing reply as "no change", which makes a head that
+            /// stops answering entirely -- the shape a lost downstream sink could easily take --
+            /// indistinguishable from a healthy one. Silence is only evidence after it persists:
+            /// at `PRESENCE_PERIOD` = 2 s this is ~16 s of an unbroken CP link answering nothing
+            /// for this head, while a single dropped reply (or a probe that lands during a
+            /// mode-set, when the CP timeline is deliberately exclusive) still costs nothing.
+            const PRESENCE_SILENT_LIMIT: u8 = 8;
+            let mut head_silent = [0u8; VinoDriver::CP_SETUP_HEADS];
             for h in 0..VinoDriver::CP_SETUP_HEADS {
                 head_known[h] = data.head_present(h);
             }
@@ -954,8 +964,26 @@ impl WorkItem for BringUp {
                 if (now_p - next_presence).as_millis() >= 0 {
                     next_presence = now_p + PRESENCE_PERIOD;
                     for h in 0..VinoDriver::CP_SETUP_HEADS {
-                        let Some(present) = data.probe_head_present(dev, h as u8) else {
-                            continue; // no decodable reply this cycle -> treat as no change
+                        let present = match data.probe_head_present(dev, h as u8) {
+                            Some(p) => {
+                                head_silent[h] = 0;
+                                p
+                            }
+                            None => {
+                                head_silent[h] = head_silent[h].saturating_add(1);
+                                if head_silent[h] < PRESENCE_SILENT_LIMIT {
+                                    continue; // one dropped reply proves nothing
+                                }
+                                if head_known[h] {
+                                    dev_info!(
+                                        cdev,
+                                        "vino: head {h} presence probe silent for {} cycles -- \
+                                         treating as REMOVED\n",
+                                        head_silent[h]
+                                    );
+                                }
+                                false
+                            }
                         };
                         if present == head_known[h] {
                             head_debounce[h] = 0;
