@@ -4208,18 +4208,6 @@ module! {
     authors: ["Mike Lothian"],
     description: "DisplayLink DL3 (Vino) open driver",
     license: "GPL v2",
-    params: {
-        record_sub_bit4: u32 {
-            default: 1,
-            description: "Whether an EP08 image record sets bit 4 of `sub` on odd 16-row bands \
-                          (`sub = head | (((y/16)&1) << 4)`). Default 1 = the long-standing \
-                          behaviour, which matches DLM's steady-state frames. 0 sends `sub = head` \
-                          on every record, which is what DLM does on frame 0 and on its \
-                          field-ordered frames -- 48 of 96 records in `dlm-fullurb ep0b_frame1` \
-                          disagree with the parity rule. A/B knob for the one framing divergence \
-                          left open by the 2026-07-27 wire decode; see docs/WHT-CODEC.md.",
-        },
-    },
 }
 
 /// Build a minimal valid 128-byte EDID with a 1920x1080@60 detailed timing at base-block
