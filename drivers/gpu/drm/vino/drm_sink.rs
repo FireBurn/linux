@@ -275,6 +275,12 @@ const PROMPT_TRAINING_TAIL_MS: i64 = 400;
 /// training window -- nothing downstream needs settling -- so it does not reuse
 /// [`PROMPT_TRAINING_TAIL_MS`].
 const BLANK_PRESENT_MS: i64 = 120;
+
+/// How many distinct dock-push `(id, sub)` kinds [`VinoDrmData::drain_cp_pushes`] remembers before
+/// it stops being able to say "this one is new". A cold plug produces a handful
+/// (`0x4c/0`, `0x78/0x30`, `0x213/0x84`, `0x2/0x86`), so 16 leaves ample room for a hotplug or
+/// blank signal to stand out without an allocation on the keepalive path.
+const PUSH_KINDS: usize = 16;
 /// Absolute millisecond offsets from the **head-0** mode-set for the dual-head cold wake, decoded
 /// from `captures/dlm-coldplug-withmon-160457` — the only capture in the corpus that provably
 /// lights *both* panels of this dock from a physical cold plug.
@@ -836,6 +842,19 @@ pub(super) struct VinoDrmData {
     scanout_skip: [core::sync::atomic::AtomicU64; HEADS],
     /// Settle repaints this head may still arm. See [`SETTLE_REPAINTS`].
     settle_budget: [core::sync::atomic::AtomicU32; HEADS],
+    /// Distinct `(id << 16) | sub` values the dock has pushed unprompted, so
+    /// [`VinoDrmData::drain_cp_pushes`] can log each kind once instead of every occurrence. A fixed
+    /// set, not a growing one: the dock has only ever been observed pushing a handful of message
+    /// types, and a bounded array cannot allocate (or grow without bound) on the keepalive path.
+    /// Overflow simply means later kinds log every time, which is the safe direction for an
+    /// instrument whose whole purpose is to notice something new.
+    #[pin]
+    push_seen: Mutex<[Option<u32>; PUSH_KINDS]>,
+    /// Total unprompted pushes decoded, for the periodic "still the same traffic" line.
+    push_count: core::sync::atomic::AtomicU64,
+    /// Last inner message id each head's presence probe decoded, so a *changed* answer is logged
+    /// and a steady one is silent. See [`VinoDrmData::probe_head_present`].
+    presence_reply: [core::sync::atomic::AtomicU32; HEADS],
     /// Per-head video key delivered in the bring-up CP setup's `id=0x32` message (decoded dump:
     /// `captures/rr-out-sequence-20260716/cp-dialogue-decoded.txt`). ITS CRYPTOGRAPHIC ROLE IN
     /// EP08 IS NOT YET REVERSE-ENGINEERED -- only the wire slot it belongs in is proven, not
@@ -893,6 +912,9 @@ impl VinoDrmData {
             scanout_fails: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
             scanout_skip: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
             settle_budget: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
+            push_seen <- new_mutex!([const { None::<u32> }; PUSH_KINDS]),
+            push_count: core::sync::atomic::AtomicU64::new(0),
+            presence_reply: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
             video_keys <- new_mutex!([[0u8; 32]; HEADS]),
         })
     }
@@ -1034,6 +1056,34 @@ impl VinoDrmData {
             false
         };
         if changed {
+            // ★ Report the ramp's shape, because it decides where a measured brightness loss
+            // comes from. Decoding vino's own captured EP08 against a screenshot of the same head
+            // (2026-07-27, `scripts/codec-re/wire-render.py`) showed the wire is structurally
+            // perfect -- after an affine correction the whole 2560x1440 surface matches at mean 2.1
+            // / max 26, with zero strips over 32 -- but that correction is a *linear* 0.61/0.59/0.57
+            // per channel. Something is scaling every pixel to ~59%. If it is this LUT, these
+            // samples show it and the panel is correctly obeying a compositor request; if the LUT
+            // is identity or absent, the scale is already in the framebuffer KWin hands over and
+            // vino is not involved at all. Four points separate a linear scale from a gamma curve
+            // from identity, and a LUT change is rare enough to log in full.
+            match &cached {
+                Some(t) => pr_info!(
+                    "vino: head {head} gamma LUT programmed at in=64/128/192/255: r={}/{}/{}/{} g={}/{}/{}/{} b={}/{}/{}/{}\n",
+                    t[64],
+                    t[128],
+                    t[192],
+                    t[255],
+                    t[256 + 64],
+                    t[256 + 128],
+                    t[256 + 192],
+                    t[256 + 255],
+                    t[512 + 64],
+                    t[512 + 128],
+                    t[512 + 192],
+                    t[512 + 255]
+                ),
+                None => pr_info!("vino: head {head} gamma LUT cleared (identity)\n"),
+            }
             self.strip_hashes.lock()[head] = None;
             self.dirty_ttl.lock()[head] = None;
             self.owe_keyframe(head);
@@ -1889,7 +1939,37 @@ impl VinoDrmData {
             // `Ok(None)` is the queue's timeout: nothing pending, so the dock has nothing more to
             // say right now. Any error is treated the same -- this is best-effort drainage.
             match got {
-                Ok(Some(len)) if len > 0 => n += 1,
+                Ok(Some(len)) if len > 0 => {
+                    n += 1;
+                    // ★ These bytes used to be counted and thrown away, which is why two open
+                    // questions have no evidence behind them: what the dock says when a downstream
+                    // monitor is unplugged, and what it says when an output is blanked. Both are
+                    // dock-initiated, so this is the only place either could ever have been seen.
+                    // Decode the push and report each (id, sub) the first time it appears, plus
+                    // every 64th repeat -- a whole idle session is then a handful of lines, while a
+                    // hotplug shows up immediately as a new pair.
+                    if let Some((id, sub, ctr)) =
+                        super::cp::decode_in_lenient(&link.ks, &link.riv, &reply[..len])
+                    {
+                        let key = ((id as u32) << 16) | sub as u32;
+                        let known = self.push_seen.lock().iter().any(|k| *k == Some(key));
+                        let count = self.push_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        if !known {
+                            let mut seen = self.push_seen.lock();
+                            if let Some(slot) = seen.iter_mut().find(|s| s.is_none()) {
+                                *slot = Some(key);
+                            }
+                            drop(seen);
+                            pr_info!(
+                                "vino: dock push NEW id=0x{id:x} sub=0x{sub:x} ctr={ctr} len={len} (push #{count})\n"
+                            );
+                        } else if count % 64 == 0 {
+                            pr_info!(
+                                "vino: dock push id=0x{id:x} sub=0x{sub:x} ctr={ctr} (push #{count})\n"
+                            );
+                        }
+                    }
+                }
                 _ => break,
             }
         }
@@ -1995,8 +2075,22 @@ impl VinoDrmData {
                 _ => return None,
             },
         };
-        let (id, _sub, _ctr) = super::cp::decode_in_lenient(&link.ks, &link.riv, &reply[..got])?;
-        Some(matches!(id, 0x44 | 0x194 | 0x78))
+        let (id, sub, _ctr) = super::cp::decode_in_lenient(&link.ks, &link.riv, &reply[..got])?;
+        let present = matches!(id, 0x44 | 0x194 | 0x78);
+        // ★ Report what the dock actually answered, once per changed answer per head.
+        //
+        // This probe has never once reported a transition in a whole boot, and with no logging
+        // there were two indistinguishable explanations: the dock answers `0x44` whether or not a
+        // monitor is attached (so the discriminator is wrong), or it stops answering at all (so
+        // every cycle takes the `None` path in the caller and is read as "no change"). Those need
+        // opposite fixes. One unplug with this in place separates them.
+        let prev = self.presence_reply[head as usize].swap(id as u32, Ordering::Relaxed);
+        if prev != id as u32 {
+            pr_info!(
+                "vino: head {head} presence probe reply id=0x{id:x} sub=0x{sub:x} -> present={present} (was id=0x{prev:x})\n"
+            );
+        }
+        Some(present)
     }
 
     /// Whether head `head`'s presence bit is currently set (for the keepalive to seed its baseline
