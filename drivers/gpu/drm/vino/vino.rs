@@ -5362,6 +5362,76 @@ mod tests {
         assert_eq!(wht::quantize(wht::transform(&[y; wht::BLOCK])[0], 0), 1020);
     }
 
+    /// The quantisers divide by powers of two, and as of 2026-07-27 they do it with an arithmetic
+    /// shift rather than `div_euclid`/`/` -- because `i` is a runtime loop variable, so the divisor
+    /// was a runtime value and every one of the 64 coefficients per block per plane compiled to a
+    /// real `idiv`. Measured offline, that was 163 ns of the 256 ns `transform+quant` block cost,
+    /// more than the wavelet itself.
+    ///
+    /// The rewrite is only valid because floor division by `2^k` IS an arithmetic right shift, for
+    /// negative operands as well as positive. That identity is easy to state and easy to get wrong
+    /// (a *truncating* `/` is not the same thing on negatives), and a coefficient off by one is a
+    /// wire-visible codec change. So assert it directly, over the full coefficient range the
+    /// transform can produce, against the division the encoder used to perform.
+    #[test]
+    fn quantiser_shifts_match_division() {
+        use video::wht::{quantize, COEFFS};
+        // 8-bit input in the codec's x64 fixed point, summed over an 8x8 block and floor-divided by
+        // 64 by `transform`, bounds |coeff| well inside this; step past it on both signs anyway.
+        const LIMIT: i32 = 200_000;
+        // The luma table, restated here as DIVISORS so the test is not written against the same
+        // shift constants it is checking.
+        let step_bias = |i: usize| -> (i32, i32) {
+            match i {
+                0 | 1 | 2 => (16, 8),
+                3 => (32, 16),
+                4..=11 => (4, 2),
+                12..=15 => (8, 4),
+                16..=47 => (2, 0),
+                _ => (4, 2),
+            }
+        };
+        for i in 0..COEFFS {
+            let (step, bias) = step_bias(i);
+            for coeff in (-LIMIT..=LIMIT).step_by(37) {
+                let want = if bias == 0 {
+                    let q = coeff.abs() / step;
+                    if coeff < 0 {
+                        -q
+                    } else {
+                        q
+                    }
+                } else {
+                    (coeff + bias).div_euclid(step)
+                }
+                .clamp(-2048, 2047);
+                assert_eq!(quantize(coeff, i), want);
+            }
+        }
+        // Boundary cases the stride above can step over: every exact multiple and half-step of the
+        // coarsest divisor, on both signs, is where floor-vs-truncate actually differs.
+        for i in 0..COEFFS {
+            let (step, bias) = step_bias(i);
+            for m in -4i32..=4 {
+                for d in [-1, 0, 1, step / 2, -step / 2] {
+                    let coeff = m * step + d;
+                    let want = if bias == 0 {
+                        let q = coeff.abs() / step;
+                        if coeff < 0 {
+                            -q
+                        } else {
+                            q
+                        }
+                    } else {
+                        (coeff + bias).div_euclid(step)
+                    }
+                    .clamp(-2048, 2047);
+                    assert_eq!(quantize(coeff, i), want);
+                }
+            }
+        }
+    }
+
     #[test]
     fn wht_transform_haar_vectors() {
         // The 8x8 2-D Haar (Mallat) wavelet, byte-exact-verified against DLM (2026-06-23):

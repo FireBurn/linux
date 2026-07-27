@@ -233,35 +233,45 @@ pub(crate) mod wht {
     /// ground-truth `quant_leave` pre/post buffers** (captures/sig-library) -- the old
     /// controlled ramps first recovered positions 0..31; deterministic full-spectrum noise then
     /// exposed the retained LH/HH bands and distinguished every rounding rule through position 63.
-    fn step_bias(i: usize) -> (i32, i32) {
+    ///
+    /// **Returned as a SHIFT, not a divisor (2026-07-27).** Every step in this table is a power of
+    /// two, but `i` is a runtime loop variable, so the divisor was a runtime value and each of the
+    /// 64 coefficients per block per plane compiled to a real `idiv` -- tens of cycles apiece,
+    /// against 1-3 for a variable shift. Measured offline over 57,600 blocks of full-spectrum
+    /// content: the quantiser was 163 ns of the 256 ns `transform+quant` block cost, i.e. more than
+    /// the wavelet itself. The identity is exact and is pinned by
+    /// `quantiser_shifts_match_division` below: for `step = 2^k > 0`, `x.div_euclid(step)` is floor
+    /// division, which is precisely an arithmetic `x >> k` for negative `x` as well as positive,
+    /// and `x.abs() / step` on a non-negative value is `x.abs() >> k`.
+    fn step_bias(i: usize) -> (u32, i32) {
         match i {
-            0 => (16, 8),
-            1 | 2 => (16, 8),
-            3 => (32, 16),
-            4..=11 => (4, 2),
-            12..=15 => (8, 4),
-            16..=47 => (2, 0),
-            _ => (4, 2), // 48..=63
+            0 => (4, 8),
+            1 | 2 => (4, 8),
+            3 => (5, 16),
+            4..=11 => (2, 2),
+            12..=15 => (3, 4),
+            16..=47 => (1, 0),
+            _ => (2, 2), // 48..=63
         }
     }
 
     /// Quantize coefficient `coeff` at position `i`: `sign(coeff) * floor((|coeff| + bias) / step)`
     /// (byte-exact vs DLM, 25/25 library strips). Clamped to the 12-bit signed long-token range.
     pub(crate) fn quantize(coeff: i32, i: usize) -> i32 {
-        let (step, bias) = step_bias(i);
+        let (shift, bias) = step_bias(i);
         // DLM rounds the coarse 0..15 bands half-up on the signed value (ties toward
         // +infinity), not half-away from zero.  The finest HL band (16..31) truncates
         // toward zero.  Deterministic full-spectrum noise exposed both distinctions;
         // the old ramp vectors happened to land on exact divisors.
         let q = if bias == 0 {
-            let q = coeff.abs() / step;
+            let q = coeff.abs() >> shift;
             if coeff < 0 {
                 -q
             } else {
                 q
             }
         } else {
-            (coeff + bias).div_euclid(step)
+            (coeff + bias) >> shift
         };
         q.clamp(-2048, 2047)
     }
@@ -272,75 +282,59 @@ pub(crate) mod wht {
     /// `ll`/`hl`/`lh`/`hh` (row-major, stride `n/2`). Unnormalized -- `transform()` floor-divides
     /// the final coefficients by 64. Mirrors `scripts/wht-transform.py` (verified byte-exact).
     ///
-    /// **`#[inline(never)]` (2026-07-17, root cause of the `video.rs:294`/`encode_and_send_wht`
-    /// kernel stack overflow -- see `project_stack_overflow_root_cause_found_20260717` memory):**
-    /// LLVM was inlining this whole codec pipeline (`colour_frame_ep08` -> `colour_strip_blocks`
-    /// -> `colour_block` -> `transform` -> `haar2d`, called from a loop over every strip in a
-    /// frame) into a single function, summing every inlined callee's locals into ONE static stack
-    /// frame instead of reusing space between sequential calls. `CONFIG_VMAP_STACK` +
-    /// `CONFIG_SCHED_STACK_END_CHECK` caught it cleanly: `encode_and_send_wht`'s prologue alone
-    /// allocated 0x3ed8 (16,088) bytes -- on a 16KB kernel stack, several frames deep inside a
-    /// workqueue callback, that's a guaranteed overflow regardless of pixel content (explaining
-    /// why a userspace repro with an 8MB stack never reproduced it). Forcing this and the other
-    /// codec functions below to stay real, separate calls (each with its own small frame that is
-    /// entered/freed per call, not accumulated) fixes this by construction -- no logic changed.
-    #[inline(never)]
-    fn haar2d(
-        src: &[i32],
-        n: usize,
-        ll: &mut [i32],
-        hl: &mut [i32],
-        lh: &mut [i32],
-        hh: &mut [i32],
-    ) {
-        let h = n / 2;
-        // Diagnostic (2026-07-16, see `project_bringup_video_panic_20260716` memory): a live HW
-        // run hit `index out of bounds: the len is 0 but the index is 0` at this function's
-        // column-pass write below, but every call site in `transform()` was hand-verified to pass
-        // correctly-sized fixed arrays (never empty) -- so the exact call/size that actually
-        // failed was never pinned down. This makes any future recurrence self-diagnosing instead
-        // of a bare index panic: report `n`, the derived `h`, and every buffer's ACTUAL length
-        // against what this function requires, so the message alone says which call site (and
-        // which buffer) was wrong. Unconditional (not `debug_assert!`) so it fires regardless of
-        // build profile until the real cause is confirmed and this can be removed/downgraded.
-        assert!(
-            src.len() == n * n
-                && ll.len() == h * h
-                && hl.len() == h * h
-                && lh.len() == h * h
-                && hh.len() == h * h,
-            "vino: haar2d(n={n}, h={h}) buffer size mismatch -- src.len()={} (want {}), \
-             ll.len()={} hl.len()={} lh.len()={} hh.len()={} (want {} each)",
-            src.len(),
-            n * n,
-            ll.len(),
-            hl.len(),
-            lh.len(),
-            hh.len(),
-            h * h
-        );
-        // Row pass: L = row-lo, H = row-hi (each n rows x h cols).
-        let mut l = [0i32; PIXELS];
-        let mut hb = [0i32; PIXELS];
-        for r in 0..n {
-            for i in 0..h {
-                let (a, b) = (src[r * n + 2 * i], src[r * n + 2 * i + 1]);
-                l[r * h + i] = a + b;
-                hb[r * h + i] = a - b;
+    /// **Sizes are types, not arguments (2026-07-27).** This used to be one `n`-generic function
+    /// over `&[i32]` slices, called three times with `n` in {8,4,2}. That cost far more than it
+    /// looked: `n` and `h` were runtime values, so every one of the four indexed reads and four
+    /// indexed writes in the butterfly carried a bounds check, neither loop could be unrolled, and
+    /// both scratch rows were allocated (and zeroed) at the level-1 worst case `[i32; PIXELS]`
+    /// regardless of level -- 512 bytes of memset per call, at 144 calls per strip. It also needed
+    /// a runtime `assert!` with eight format arguments to restate what the call sites already
+    /// guaranteed. Measured at 2026-07-27: `blocks(transform+quant) = 945us` for a 32-strip delta,
+    /// i.e. ~625 ns per 8x8 transform -- roughly 1900 cycles for about 200 integer operations.
+    ///
+    /// Generating one function per level from fixed-size array types removes all of that at once:
+    /// the lengths are compile-time, so the bounds checks are provably redundant, the loops unroll,
+    /// and the scratch rows are exactly `n*h` (32, 8 and 2 words) instead of 64 each. The assert is
+    /// gone because the type system now states the invariant it was checking.
+    macro_rules! haar2d_level {
+        ($name:ident, $n:literal, $h:literal) => {
+            /// One separable 2-D Haar step for a single level; see the macro's documentation.
+            #[inline(always)]
+            fn $name(
+                src: &[i32; $n * $n],
+                ll: &mut [i32; $h * $h],
+                hl: &mut [i32; $h * $h],
+                lh: &mut [i32; $h * $h],
+                hh: &mut [i32; $h * $h],
+            ) {
+                // Row pass: L = row-lo, H = row-hi (each n rows x h cols).
+                let mut l = [0i32; $n * $h];
+                let mut hb = [0i32; $n * $h];
+                for r in 0..$n {
+                    for i in 0..$h {
+                        let (a, b) = (src[r * $n + 2 * i], src[r * $n + 2 * i + 1]);
+                        l[r * $h + i] = a + b;
+                        hb[r * $h + i] = a - b;
+                    }
+                }
+                // Column pass: LL/LH = col-lo/hi of L, HL/HH = col-lo/hi of H (each h x h).
+                for c in 0..$h {
+                    for i in 0..$h {
+                        let (a, b) = (l[2 * i * $h + c], l[(2 * i + 1) * $h + c]);
+                        ll[i * $h + c] = a + b;
+                        lh[i * $h + c] = a - b;
+                        let (a2, b2) = (hb[2 * i * $h + c], hb[(2 * i + 1) * $h + c]);
+                        hl[i * $h + c] = a2 + b2;
+                        hh[i * $h + c] = a2 - b2;
+                    }
+                }
             }
-        }
-        // Column pass: LL/LH = col-lo/hi of L, HL/HH = col-lo/hi of H (each h x h).
-        for c in 0..h {
-            for i in 0..h {
-                let (a, b) = (l[2 * i * h + c], l[(2 * i + 1) * h + c]);
-                ll[i * h + c] = a + b;
-                lh[i * h + c] = a - b;
-                let (a2, b2) = (hb[2 * i * h + c], hb[(2 * i + 1) * h + c]);
-                hl[i * h + c] = a2 + b2;
-                hh[i * h + c] = a2 - b2;
-            }
-        }
+        };
     }
+
+    haar2d_level!(haar2d_8, 8, 4);
+    haar2d_level!(haar2d_4, 4, 2);
+    haar2d_level!(haar2d_2, 2, 1);
 
     /// DLM's video transform (`FUN_007a7b60`), reverse-engineered + **verified byte-exact**
     /// (2026-06-23 ramps; completed 2026-07-22 with deterministic full-spectrum noise): an **8x8
@@ -351,7 +345,22 @@ pub(crate) mod wht {
     /// and HH 4x4 bands. Each level-1 band uses the same 2x2 Morton scan. A uniform block yields
     /// `DC = mean`, all AC = 0.
     ///
-    /// `#[inline(never)]`: see `haar2d`'s doc comment -- part of the kernel-stack-overflow fix.
+    /// **`#[inline(never)]` MUST STAY (2026-07-17, `project_stack_overflow_root_cause_found_20260717`).**
+    /// LLVM was inlining the whole codec pipeline (`colour_frame_ep08` -> `colour_strip_blocks` ->
+    /// `colour_block` -> `transform` -> the Haar levels, over a loop covering every strip in a
+    /// frame) into a single function, summing every inlined callee's locals into ONE static stack
+    /// frame instead of reusing space between sequential calls. `CONFIG_VMAP_STACK` +
+    /// `CONFIG_SCHED_STACK_END_CHECK` caught it: `encode_and_send_wht`'s prologue alone allocated
+    /// 0x3ed8 (16,088) bytes, a guaranteed overflow of the 16 KiB kernel stack several frames deep
+    /// inside a workqueue callback (and unreproducible in userspace with an 8 MB stack).
+    ///
+    /// **This boundary is the one that matters, and it is the only one that has to be here.** The
+    /// three Haar levels are deliberately `#[inline(always)]` INTO this function: that is what
+    /// makes their sizes compile-time constants, and it is bounded because they fold into a frame
+    /// this attribute then stops from folding any further. The whole of `transform` is ~230 words
+    /// of locals -- the 64-word result, four 16-word level-1 bands, four 4-word level-2 bands, four
+    /// 1-word level-3 bands and the levels' own 32/8/2-word scratch rows. Removing `inline(never)`
+    /// HERE reinstates the overflow; adding it to the levels reinstates the slow path.
     #[inline(never)]
     pub(crate) fn transform(block: &[i32; PIXELS]) -> [i32; COEFFS] {
         let sh = |x: i32| x >> 6; // arithmetic shift = floor division by 64 (matches DLM/`//64`)
@@ -359,7 +368,7 @@ pub(crate) mod wht {
         // Level 1: 8x8 -> three 4x4 detail bands. Smooth horizontal ramps only excite HL and left
         // its scan ambiguous; deterministic noise makes every position and all three bands unique.
         let (mut ll1, mut hl1, mut lh1, mut hh1) = ([0i32; 16], [0i32; 16], [0i32; 16], [0i32; 16]);
-        haar2d(block, DIM, &mut ll1, &mut hl1, &mut lh1, &mut hh1);
+        haar2d_8(block, &mut ll1, &mut hl1, &mut lh1, &mut hh1);
         // DLM scans every 4x4 level-one band in 2x2 Morton order.  A horizontal
         // ramp only distinguished this from row-major and led to the earlier
         // (incorrect) transpose; full-spectrum deterministic noise makes all 16
@@ -372,7 +381,7 @@ pub(crate) mod wht {
         }
         // Level 2: LL1 (4x4) -> 2x2 subbands; c[4..8]/[8..12]/[12..16].
         let (mut ll2, mut hl2, mut lh2, mut hh2) = ([0i32; 4], [0i32; 4], [0i32; 4], [0i32; 4]);
-        haar2d(&ll1, 4, &mut ll2, &mut hl2, &mut lh2, &mut hh2);
+        haar2d_4(&ll1, &mut ll2, &mut hl2, &mut lh2, &mut hh2);
         for i in 0..4 {
             c[4 + i] = sh(hl2[i]);
             c[8 + i] = sh(lh2[i]);
@@ -380,7 +389,7 @@ pub(crate) mod wht {
         }
         // Level 3: LL2 (2x2) -> 1x1 subbands; the DC c[0] and coarse c[1..4].
         let (mut ll3, mut hl3, mut lh3, mut hh3) = ([0i32; 1], [0i32; 1], [0i32; 1], [0i32; 1]);
-        haar2d(&ll2, 2, &mut ll3, &mut hl3, &mut lh3, &mut hh3);
+        haar2d_2(&ll2, &mut ll3, &mut hl3, &mut lh3, &mut hh3);
         c[0] = sh(ll3[0]);
         c[1] = sh(hl3[0]);
         c[2] = sh(lh3[0]);
@@ -589,26 +598,56 @@ pub(crate) mod wht {
     const CHROMA_AC_CMAX: u32 = 10;
 
     /// LSB-first bit accumulator for the AC-strip coder (no final padding, unlike [`Vlc`]).
+    ///
+    /// **Buffers into a 64-bit word (2026-07-27), the way [`Vlc`] always did.** This used to write
+    /// straight into `out` one bit at a time: each call did a `% 8`, a fallible `KVec::push` of a
+    /// zero byte on every eighth bit (a capacity check, and a geometric realloc whenever it was
+    /// hit), a `/ 8`, and a bounds-checked read-modify-write. Now a bit is an OR and an increment,
+    /// and `out` is touched once per eight bits. The bit order is unchanged -- bits fill each byte
+    /// LSB-first and bytes are emitted low-to-high out of the accumulator, which is exactly what the
+    /// old `|= b << (n % 8)` into successive bytes produced -- so the wire is byte-identical. The
+    /// final partial byte is zero-padded in its high bits, as before.
+    ///
+    /// The cost of this is that `out` is INCOMPLETE until [`Bits::finish`] runs. Nothing may read
+    /// `out` directly; `colour_strip` takes the three finished buffers up front.
     struct Bits {
         out: KVec<u8>,
-        n: usize,
+        /// Pending bits, LSB-first, valid in the low `nacc`.
+        acc: u64,
+        nacc: u32,
     }
 
     impl Bits {
         fn new() -> Self {
             Self {
                 out: KVec::new(),
-                n: 0,
+                acc: 0,
+                nacc: 0,
             }
         }
 
         fn bit(&mut self, b: u32) -> Result {
-            if self.n % 8 == 0 {
-                self.out.push(0, GFP_KERNEL)?;
+            self.acc |= ((b & 1) as u64) << self.nacc;
+            self.nacc += 1;
+            if self.nacc == 64 {
+                for k in 0..8 {
+                    self.out.push((self.acc >> (8 * k)) as u8, GFP_KERNEL)?;
+                }
+                self.acc = 0;
+                self.nacc = 0;
             }
-            self.out[self.n / 8] |= ((b & 1) as u8) << (self.n % 8);
-            self.n += 1;
             Ok(())
+        }
+
+        /// Flush the accumulator and yield the packed bytes. The tail byte keeps the old writer's
+        /// zero padding: `ceil(nacc / 8)` bytes are emitted, so a stream ending mid-byte pads that
+        /// byte's high bits with zeros and adds nothing beyond it.
+        fn finish(mut self) -> Result<KVec<u8>> {
+            let nbytes = self.nacc.div_ceil(8) as usize;
+            for k in 0..nbytes {
+                self.out.push((self.acc >> (8 * k)) as u8, GFP_KERNEL)?;
+            }
+            Ok(self.out)
         }
 
         /// The shared escape value code: a 0 is one `0` bit; else `unary(c) ++ [0-term IFF c<cmax]
@@ -743,22 +782,25 @@ pub(crate) mod wht {
     /// step 32; the final HH band (48..63) uses step 64. All use signed half-up rounding. The former flat
     /// step-16/truncate model was indistinguishable on the smooth horizontal ramps,
     /// but disagreed on essentially every textured colour block.
+    ///
+    /// Shifts rather than divisions, for the reason given on [`step_bias`]; steps 16/32/64 are
+    /// shifts 4/5/6 and `step / 2` is `1 << (shift - 1)`.
     fn quantize_chroma_ac(coeff: i32, i: usize) -> i32 {
-        let step = if matches!(i, 1 | 2 | 4..=11) {
-            16
+        let shift: u32 = if matches!(i, 1 | 2 | 4..=11) {
+            4
         } else if i >= 48 {
-            64
+            6
         } else {
-            32
+            5
         };
-        (coeff + step / 2).div_euclid(step)
+        (coeff + (1 << (shift - 1))) >> shift
     }
 
     /// Per-plane DC quantizer, round-half-up on the SIGNED value (toward +inf): luma (plane 0)
     /// step 16, chroma step 64. `+224/64 = 3.5 -> 4`; `-8416/64 = -131.5 -> -131`.
     fn quantize_dc_round(plane: usize, v: i32) -> i32 {
-        let step = if plane == 0 { 16 } else { 64 };
-        (v + step / 2).div_euclid(step)
+        let shift: u32 = if plane == 0 { 4 } else { 6 };
+        (v + (1 << (shift - 1))) >> shift
     }
 
     impl Bits {
@@ -917,9 +959,12 @@ pub(crate) mod wht {
             row1.colour_block_ac(&b.qcr, &b.qcb, &b.qy, b.lcr, b.lcb, b.ly)?;
         }
 
-        let r0 = round_even(row0.out.len());
-        let r1 = round_even(row1.out.len());
-        let main_b = round_even(main.out.len()) + 2;
+        // `Bits` buffers into a word, so `out` is only complete once finished -- take all three
+        // before any length is read.
+        let (main, row0, row1) = (main.finish()?, row0.finish()?, row1.finish()?);
+        let r0 = round_even(row0.len());
+        let r1 = round_even(row1.len());
+        let main_b = round_even(main.len()) + 2;
         let w18 = 16 + main_b;
         let w1c = w18 + r0;
         // The 2-byte tail overlaps the end of the row1 region (len = w1c + round_even(row1)).
@@ -937,9 +982,9 @@ pub(crate) mod wht {
         out[4..6].copy_from_slice(&y.to_le_bytes());
         out[10..12].copy_from_slice(&(w18 as u16).to_le_bytes());
         out[12..14].copy_from_slice(&(w1c as u16).to_le_bytes());
-        out[16..16 + main.out.len()].copy_from_slice(&main.out);
-        out[w18..w18 + row0.out.len()].copy_from_slice(&row0.out);
-        out[w1c..w1c + row1.out.len()].copy_from_slice(&row1.out);
+        out[16..16 + main.len()].copy_from_slice(&main);
+        out[w18..w18 + row0.len()].copy_from_slice(&row0);
+        out[w1c..w1c + row1.len()].copy_from_slice(&row1);
         // No forward-hint tail: on the EP08 wire the strip's last 2 bytes are the natural row1
         // bit-packing. The record framing carries the length as `strip_id == len`, so the in-strip
         // echo the sink hook showed is not transmitted on the wire. See `frame_records`.
@@ -986,12 +1031,19 @@ pub(crate) mod wht {
         for k in 0..STRIP_BLOCKS {
             let (bx, by) = (k % STRIP_BLOCKS_X, k / STRIP_BLOCKS_X);
             let (mut cr, mut cb, mut y) = ([0i32; PIXELS], [0i32; PIXELS], [0i32; PIXELS]);
+            // Fill strictly in index order (2026-07-27). This is the same assignment the previous
+            // `i = r * DIM + c` form made, but writing through a monotonically incremented `i` lets
+            // the compiler see that all `PIXELS` elements are initialised before any is read, so the
+            // three zeroing memsets of the declarations above are dead and get elided. With a
+            // computed index it could not prove coverage and kept 768 bytes of memset per block --
+            // 12 KiB per strip, on the hottest loop in the driver.
+            let mut i = 0usize;
             for r in 0..DIM {
                 for c in 0..DIM {
                     let (rr, gg, bb) = px(ox + bx * DIM + c, oy + by * DIM + r);
                     let (yv, cbv, crv) = colour(rr, gg, bb);
-                    let i = r * DIM + c;
                     (cr[i], cb[i], y[i]) = (crv, cbv, yv);
+                    i += 1;
                 }
             }
             blocks.push(colour_block(&cr, &cb, &y), GFP_KERNEL)?;
