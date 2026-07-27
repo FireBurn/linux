@@ -4066,6 +4066,39 @@ impl PixelSource {
     }
 }
 
+/// vino's own workqueue for the parallel strip encode.
+///
+/// The encode ran on `system_unbound`, where its CPU time is anonymous: the kernel composes worker
+/// thread names from the workqueue's, so shared-pool work appears only as
+/// `kworker/uN:M-events_unbound`, indistinguishable from every other user of that pool. On a queue
+/// of our own the same threads appear as **`kworker/uN:M-vino_encode`**, so `ps`/`top`/`perf`
+/// attribute the codec's cost to vino, and the fan-out no longer competes with unrelated work for
+/// the shared pool's concurrency budget.
+///
+/// `WQ_UNBOUND` because strip encoding is pure compute with no CPU affinity worth preserving --
+/// that property is what let the fan-out reach ~7.4x. Allocated once on first use and never
+/// destroyed: it is driver-wide, costs one `workqueue_struct`, and outliving every `EncodeChunk` is
+/// exactly what makes the join safe.
+///
+/// Falls back to `system_unbound` if the allocation ever fails, so a failure here costs the thread
+/// *name*, not the driver.
+fn encode_queue() -> Option<&'static workqueue::Queue> {
+    static ENCODE_WQ: kernel::sync::SetOnce<workqueue::OwnedQueue> =
+        kernel::sync::SetOnce::new();
+    if let Some(q) = ENCODE_WQ.as_ref() {
+        return Some(q);
+    }
+    // A concurrent racer may win the `SetOnce`; its queue is dropped and the winner's is used.
+    if let Ok(q) = workqueue::OwnedQueue::new(
+        kernel::c_str!("vino_encode"),
+        bindings::wq_flags_WQ_UNBOUND,
+        0,
+    ) {
+        let _ = ENCODE_WQ.populate(q);
+    }
+    ENCODE_WQ.as_ref().map(|q| &**q)
+}
+
 /// Encode a batch of strips from `src`, in the order given.
 fn encode_coords(src: &PixelSource, coords: &[(usize, usize)]) -> Result<KVec<KVec<u8>>> {
     let mut out = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
@@ -4169,7 +4202,12 @@ fn parallel_strip_encode(
         // `enqueue` gives the item back if it is already pending -- impossible for one allocated
         // a line ago, but if it ever happened, waiting on its completion would hang the scanout
         // worker forever. Record it and encode that chunk inline instead.
-        let ok = workqueue::system_unbound().enqueue(chunk.clone()).is_ok();
+        let ok = encode_queue()
+            .map_or_else(
+                || workqueue::system_unbound().enqueue(chunk.clone()),
+                |q| q.enqueue(chunk.clone()),
+            )
+            .is_ok();
         queued.push(ok, GFP_KERNEL)?;
         chunks.push(chunk, GFP_KERNEL)?;
         start = end;
