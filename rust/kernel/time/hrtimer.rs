@@ -404,7 +404,7 @@
 //! [`Arc`]: kernel::sync::Arc
 
 use super::{ClockSource, Delta, Instant};
-use crate::{prelude::*, types::Opaque};
+use crate::{interrupt::LocalInterruptDisabled, prelude::*, types::Opaque};
 use core::{marker::PhantomData, ptr::NonNull};
 use pin_init::PinInit;
 
@@ -900,6 +900,11 @@ pub trait HrTimerMode: private::Sealed {
     type Expires: HrTimerExpires;
 }
 
+/// A timer mode whose callback runs with local interrupts disabled.
+///
+/// This trait is sealed by [`HrTimerMode`].
+pub trait HardHrTimerMode: HrTimerMode {}
+
 /// Timer that expires at a fixed point in time.
 pub struct AbsoluteMode<C: ClockSource>(PhantomData<C>);
 
@@ -982,6 +987,7 @@ impl<C: ClockSource> HrTimerMode for AbsoluteHardMode<C> {
     type Clock = C;
     type Expires = Instant<C>;
 }
+impl<C: ClockSource> HardHrTimerMode for AbsoluteHardMode<C> {}
 
 /// Timer with relative expiration, handled in hard irq context.
 pub struct RelativeHardMode<C: ClockSource>(PhantomData<C>);
@@ -991,6 +997,7 @@ impl<C: ClockSource> HrTimerMode for RelativeHardMode<C> {
     type Clock = C;
     type Expires = Delta;
 }
+impl<C: ClockSource> HardHrTimerMode for RelativeHardMode<C> {}
 
 /// Timer with absolute expiration, pinned to CPU and handled in hard irq context.
 pub struct AbsolutePinnedHardMode<C: ClockSource>(PhantomData<C>);
@@ -1000,6 +1007,7 @@ impl<C: ClockSource> HrTimerMode for AbsolutePinnedHardMode<C> {
     type Clock = C;
     type Expires = Instant<C>;
 }
+impl<C: ClockSource> HardHrTimerMode for AbsolutePinnedHardMode<C> {}
 
 /// Timer with relative expiration, pinned to CPU and handled in hard irq context.
 pub struct RelativePinnedHardMode<C: ClockSource>(PhantomData<C>);
@@ -1009,6 +1017,7 @@ impl<C: ClockSource> HrTimerMode for RelativePinnedHardMode<C> {
     type Clock = C;
     type Expires = Delta;
 }
+impl<C: ClockSource> HardHrTimerMode for RelativePinnedHardMode<C> {}
 
 /// Privileged smart-pointer for a [`HrTimer`] callback context.
 ///
@@ -1064,6 +1073,16 @@ impl<'a, T: HasHrTimer<T>> HrTimerCallbackContext<'a, T> {
     /// current time of the base clock for the [`HrTimer`].
     pub fn forward_now(&mut self, duration: Delta) -> u64 {
         self.forward(HrTimerInstant::<T>::now(), duration)
+    }
+
+    /// Returns proof that local interrupts are disabled for a hard timer callback.
+    pub fn local_interrupt_disabled(&self) -> &LocalInterruptDisabled
+    where
+        T::TimerMode: HardHrTimerMode,
+    {
+        // SAFETY: `Self` can only be constructed while running this timer's callback, and the
+        // `HardHrTimerMode` bound guarantees that the callback runs in hard interrupt context.
+        unsafe { LocalInterruptDisabled::assume_disabled() }
     }
 }
 
