@@ -562,8 +562,31 @@ pub(crate) mod wht {
         0x01, // main frame
     ];
 
-    /// Max AC magnitude category (the maximum category omits the unary 0-terminator).
+    /// Max LUMA AC magnitude category (the maximum category omits the unary 0-terminator).
     const AC_CMAX: u32 = 9;
+
+    /// Max CHROMA AC magnitude category -- **higher than luma's**, so a category-9 chroma
+    /// coefficient still carries the unary 0-terminator that luma's omits.
+    ///
+    /// Recovered 2026-07-27 against DLM on high-chroma content, the one regime the old corpus never
+    /// contained: every captured DLM sample was wallpaper, video or synthetic ramps, all smooth,
+    /// so no chroma AC coefficient had ever reached `|q| >= 256` and the chroma codebook's maximum
+    /// was simply assumed to equal luma's. It does not.
+    ///
+    /// The consequence was a **one-bit desync**: vino omitted the terminator, the dock read the
+    /// following offset bit as the terminator, and the rest of that block row decoded as garbage.
+    /// Only blocks with very large chroma AC reach it -- i.e. tiny saturated images -- which is
+    /// exactly why the artifact appeared on picture thumbnails while wallpaper, video and flat
+    /// icons were perfect, and why it survived a full keyframe (it is an encoding fault, present
+    /// in every encoding of such a block, not a stale-content fault).
+    ///
+    /// Proof: painting a purpose-built high-chroma test card through DLM and diffing its wire
+    /// against this encoder for the identical source pixels gives **3600/3600 strips byte-exact**
+    /// with this constant and 3594/3600 without, with all six failures being chroma-plane blocks
+    /// holding a `|q| >= 256` coefficient and all 43 luma-only such blocks matching either way.
+    /// ⚠ 10, 11 and 12 are indistinguishable on that corpus (its largest `|q|` is 434, category 9);
+    /// the smallest value consistent with the oracle is taken.
+    const CHROMA_AC_CMAX: u32 = 10;
 
     /// LSB-first bit accumulator for the AC-strip coder (no final padding, unlike [`Vlc`]).
     struct Bits {
@@ -783,7 +806,8 @@ pub(crate) mod wht {
         }
 
         /// One block's colour AC: present planes in (Cr, Cb, Y) order, positions `1..=last`,
-        /// run-bit `0` for an insignificant coefficient else the magnitude escape (cmax `AC_CMAX`).
+        /// run-bit `0` for an insignificant coefficient else the magnitude escape. Chroma and luma
+        /// use DIFFERENT codebook maxima (`CHROMA_AC_CMAX` / `AC_CMAX`) -- see `CHROMA_AC_CMAX`.
         fn colour_block_ac(
             &mut self,
             qcr: &[i32; COEFFS],
@@ -793,12 +817,14 @@ pub(crate) mod wht {
             lcb: usize,
             ly: usize,
         ) -> Result {
-            for &(q, last) in &[(qcr, lcr), (qcb, lcb), (qy, ly)] {
+            for &(q, last, cmax) in
+                &[(qcr, lcr, CHROMA_AC_CMAX), (qcb, lcb, CHROMA_AC_CMAX), (qy, ly, AC_CMAX)]
+            {
                 for i in 1..=last {
                     if q[i] == 0 {
                         self.bit(0)?;
                     } else {
-                        self.esc(q[i], AC_CMAX)?;
+                        self.esc(q[i], cmax)?;
                     }
                 }
             }
