@@ -1014,6 +1014,11 @@ impl WorkItem for BringUp {
                                 p
                             }
                             None => {
+                                // A head vino blanked is silent because vino asked it to be. Only
+                                // the dock's own silence is evidence of an unplug.
+                                if data.is_self_blanked(h) {
+                                    continue;
+                                }
                                 head_silent[h] = head_silent[h].saturating_add(1);
                                 if head_silent[h] < PRESENCE_SILENT_LIMIT {
                                     continue; // one dropped reply proves nothing
@@ -4236,6 +4241,7 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         kernel::sysfs::Attr::rw(c"probe_loop_tripped"),
         kernel::sysfs::Attr::rw(c"dock_pixel_budget"),
         kernel::sysfs::Attr::wo(c"reengage"),
+        kernel::sysfs::Attr::rw(c"blank_marker"),
     ];
 
     fn show(&self, name: &CStr, out: &mut kernel::sysfs::Writer<'_>) -> Result {
@@ -4245,6 +4251,11 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         }
         if name == c"dock_pixel_budget" {
             let v = drm_sink::pixel_budget_override();
+            let s = kernel::str::CString::try_from_fmt(kernel::prelude::fmt!("{v}\n"))?;
+            return out.write(s.to_bytes());
+        }
+        if name == c"blank_marker" {
+            let v = drm_sink::blank_marker_state();
             let s = kernel::str::CString::try_from_fmt(kernel::prelude::fmt!("{v}\n"))?;
             return out.write(s.to_bytes());
         }
@@ -4287,6 +4298,20 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         // sequence can be exercised on demand, and it doubles as the manual recovery for a
         // replugged monitor that stayed dark. The work happens on the keepalive loop, which already
         // owns a live I/O token; see `drm_sink::REENGAGE_REQUEST`.
+        // Candidate `id=0x16 sub=0x2e` off23 state for the blank path, or 0 to disable. The whole
+        // point is to sweep it without a rebuild; see `drm_sink::BLANK_MARKER_STATE`.
+        if name == c"blank_marker" {
+            let v = match buf.first() {
+                Some(&b) if b.is_ascii_digit() => (b - b'0') as u32,
+                _ => return Err(EINVAL),
+            };
+            if v > 7 {
+                return Err(EINVAL);
+            }
+            drm_sink::set_blank_marker_state(v);
+            pr_info!("vino: blank_marker candidate set to 2e({v}) via sysfs\n");
+            return Ok(());
+        }
         if name == c"reengage" {
             let head = match buf.first() {
                 Some(&b) if b.is_ascii_digit() => (b - b'0') as u32,

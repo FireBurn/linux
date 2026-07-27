@@ -222,6 +222,46 @@ pub(super) fn take_downstream_event() -> bool {
     DOWNSTREAM_EVENT.swap(false, Ordering::Acquire)
 }
 
+/// Candidate `id=0x16 sub=0x2e` off23 state to try when blanking a head, or `0` for none.
+///
+/// **Why a knob and not a constant.** `blank_head` drives the panel to black, which is a real
+/// improvement over leaving a frozen desktop lit, but it does not put the downstream DP link into
+/// power-save -- so the panels do not actually *sleep*. The message that would is not RE'd, and the
+/// decrypted corpus provably cannot settle it: across a DLM output toggle it carries only
+/// `0x14/0x0c`, `0x16/0x75`, `0x16/0x2e` and `0x16/0x2f`, and the off23 sequence a toggle produces
+/// (`2f:1,2e:3` -> `2f:1,2e:0` -> `2f:0,2e:0`) is byte-identical to an ordinary mode-set bracket's.
+///
+/// What changed on 2026-07-27 is that there is now an **oracle**. A physical monitor unplug showed
+/// the dock reporting downstream state in the presence probe's status word: `0x2711 ready=true`
+/// with a sink attached, `0x2001 ready=false` without. So a candidate "sink down" command can be
+/// sent and the answer read back, instead of judged by squinting at a panel.
+///
+/// The search space is small -- `2e` off23 is only ever observed as `0` or `3`, so the untried
+/// states are `1` and `2` -- and this is the safe place to try them: it fires only on a CRTC
+/// disable, the head is being turned off anyway, and the matching enable re-runs the full bracket
+/// and mode-set, so a wrong value is undone by the next DPMS-on. Sweep it from userspace with
+/// `/sys/devices/vino/blank_marker` rather than rebuilding per candidate.
+///
+/// **`2e(1)` is the answer, HW-verified 2026-07-27.** Sending it makes the dock stop answering that
+/// head's presence probe -- byte for byte the signature a physically unplugged monitor produces --
+/// and a DPMS-on brings the head back at its native mode with no re-enumeration and no EDID loss.
+/// That is the downstream sink going down, which is what the panels needed in order to sleep rather
+/// than merely show black. It is the default here for that reason; `0` disables the marker and
+/// restores the black-only blank, and `2`..`7` remain available for further sweeps.
+///
+/// ⚠ It is only safe together with [`VinoDrmData::self_blanked`]: without that, the silence vino
+/// has just caused reads back as an unplug and the presence watcher drops the output from the
+/// compositor ~3 s later. That is exactly what the first run of this experiment did.
+static BLANK_MARKER_STATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// Read/write accessors for [`BLANK_MARKER_STATE`], for the sysfs attribute in `vino.rs`.
+pub(super) fn blank_marker_state() -> u32 {
+    BLANK_MARKER_STATE.load(Ordering::Relaxed)
+}
+pub(super) fn set_blank_marker_state(v: u32) {
+    BLANK_MARKER_STATE.store(v, Ordering::Relaxed);
+}
+
 /// Request a re-engage of `head`'s downstream sink (sysfs writer side).
 pub(super) fn request_reengage(head: u32) {
     REENGAGE_REQUEST.fetch_or(1 << head, Ordering::Release);
@@ -905,6 +945,16 @@ pub(super) struct VinoDrmData {
     /// Last inner message id each head's presence probe decoded, so a *changed* answer is logged
     /// and a steady one is silent. See [`VinoDrmData::probe_head_present`].
     presence_reply: [core::sync::atomic::AtomicU32; HEADS],
+    /// Heads vino has itself taken down via [`VinoDrmData::blank_head`], as a bitmask.
+    ///
+    /// A downed sink and an unplugged monitor look **identical** from the host: the dock stops
+    /// answering that head's presence probe either way. Measured 2026-07-27 -- sending the
+    /// candidate power-down marker made the watcher declare `monitor REMOVED at runtime` three
+    /// seconds later and KWin dropped the output, which is emphatically not what DPMS-off should
+    /// do. So the presence watcher has to know which silences vino asked for.
+    ///
+    /// Set by `blank_head`, cleared by `atomic_enable` (the CRTC coming back) and by a re-engage.
+    self_blanked: core::sync::atomic::AtomicU32,
     /// Per-head video key delivered in the bring-up CP setup's `id=0x32` message (decoded dump:
     /// `captures/rr-out-sequence-20260716/cp-dialogue-decoded.txt`). ITS CRYPTOGRAPHIC ROLE IN
     /// EP08 IS NOT YET REVERSE-ENGINEERED -- only the wire slot it belongs in is proven, not
@@ -965,6 +1015,7 @@ impl VinoDrmData {
             push_seen <- new_mutex!([const { None::<u32> }; PUSH_KINDS]),
             push_count: core::sync::atomic::AtomicU64::new(0),
             presence_reply: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
+            self_blanked: core::sync::atomic::AtomicU32::new(0),
             video_keys <- new_mutex!([[0u8; 32]; HEADS]),
         })
     }
@@ -1293,6 +1344,23 @@ impl VinoDrmData {
         // unmeasured about a true downstream power-down.
         self.stream_marker(dev, head, 0x2f, 0);
         self.stream_marker(dev, head, 0x2e, 0);
+        // Optional experiment: a candidate downstream power-down state, wrapped in its own
+        // transaction the way every measured bracket wraps a state change. Off by default; see
+        // `BLANK_MARKER_STATE` for the search space and for how to tell a hit from a miss.
+        let candidate = blank_marker_state();
+        if candidate != 0 {
+            // From here the dock will stop answering this head's presence probe, exactly as it does
+            // for a real unplug. Claim the silence before causing it.
+            self.set_self_blanked(head_i, true);
+            self.stream_marker(dev, head, 0x2f, 1);
+            self.stream_marker(dev, head, 0x2e, candidate as u8);
+            self.poll_status(dev);
+            self.stream_marker(dev, head, 0x2f, 0);
+            pr_info!(
+                "vino: head {head} blank marker candidate 2e({candidate}) sent -- watch this \
+                 head's next presence status word\n"
+            );
+        }
         pr_info!("vino: head {head} blanked on the dock ({sent} black presentation(s))\n");
         Ok(())
     }
@@ -2098,6 +2166,7 @@ impl VinoDrmData {
     /// `1920x1440@60` fallback instead of its native `2560x1440@120`. The fetch is already being
     /// sent; what was missing is reading the answer back, so drain for it and re-cache.
     pub(super) fn reengage_head(&self, dev: &VinoDrmDevice, io: &BoundInterface<'_>, head: u8) {
+        self.set_self_blanked(head as usize, false);
         let step = |id: u16, build: &dyn Fn(u16) -> Result<KVec<u8>>, gap_ms: i64| {
             let _ = self.send_cp(io, id, 0, |ctr| build(ctr));
             fsleep(Delta::from_millis(gap_ms));
@@ -2211,6 +2280,20 @@ impl VinoDrmData {
             );
         }
         Some(present)
+    }
+
+    /// Whether vino itself took `head`'s sink down, so the presence watcher can tell its own
+    /// blank apart from a real unplug. See [`VinoDrmData::self_blanked`].
+    pub(super) fn is_self_blanked(&self, head: usize) -> bool {
+        self.self_blanked.load(Ordering::Acquire) & (1u32 << head) != 0
+    }
+
+    fn set_self_blanked(&self, head: usize, on: bool) {
+        if on {
+            self.self_blanked.fetch_or(1u32 << head, Ordering::Release);
+        } else {
+            self.self_blanked.fetch_and(!(1u32 << head), Ordering::Release);
+        }
     }
 
     /// Whether head `head`'s presence bit is currently set (for the keepalive to seed its baseline
@@ -3331,6 +3414,9 @@ impl crtc::DriverCrtc for VinoCrtc {
         let new = commit.take_new_state();
         // Cache this head's gamma ramp for the scanout to apply.
         data.update_gamma(head as usize, new.gamma_lut());
+        // Whatever this head's sink state was, the enable path re-runs the full bracket and
+        // mode-set, so any silence from here is the dock's news, not vino's.
+        data.set_self_blanked(head as usize, false);
         let timing = super::cp::timing_from_drm_mode(new.mode());
         pr_info!(
             "vino: KMS CRTC enable -- head {} display ON, mode {}x{}@{} (scanout begins)\n",
