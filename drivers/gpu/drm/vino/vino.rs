@@ -925,6 +925,22 @@ impl WorkItem for BringUp {
             /// a false positive: the CP timeline is exclusive there and this loop is paused, so no
             /// cycle elapses at all.
             const PRESENCE_SILENT_LIMIT: u8 = 3;
+            /// How often to retry the sink re-engage on a head believed to have no monitor.
+            ///
+            /// Reacting to the dock's replug announcement is not enough on its own, because the
+            /// announcement is not reliably identifiable. Across two physical replugs the dock sent
+            /// completely different things: once an unprompted `id=0x44 sub=0x20`, once
+            /// `id=0x88 sub=0xc` followed by `id=0x3 sub=0x82` -- and the id field of those 176/192
+            /// byte pushes is not even stable enough to key on (`0x83`, `0x88`, `0x8b`, `0x91`,
+            /// `0x92` all appear for what is evidently one message class).
+            ///
+            /// What *is* reliable is that the dock only answers a head's presence probe once its
+            /// sink is re-engaged. So poll with re-engage attempts instead of waiting to be told.
+            /// A monitor that is genuinely absent costs seven CP messages every few seconds, which
+            /// is far below the ordinary keepalive rate; a monitor that came back is picked up
+            /// within one period.
+            const REENGAGE_RETRY: Delta = Delta::from_millis(4000);
+            let mut next_reengage = [Instant::<Monotonic>::now(); VinoDriver::CP_SETUP_HEADS];
             let mut head_silent = [0u8; VinoDriver::CP_SETUP_HEADS];
             for h in 0..VinoDriver::CP_SETUP_HEADS {
                 head_known[h] = data.head_present(h);
@@ -1006,6 +1022,20 @@ impl WorkItem for BringUp {
                     next_presence = Instant::<Monotonic>::now() + PRESENCE_PERIOD;
                     next_heartbeat = Instant::<Monotonic>::now() + HEARTBEAT_PERIOD;
                 }
+                // Keep trying to bring an absent head's sink back. See `REENGAGE_RETRY`.
+                {
+                    let now_r = Instant::<Monotonic>::now();
+                    for h in 0..VinoDriver::CP_SETUP_HEADS {
+                        if head_known[h] || (now_r - next_reengage[h]).as_millis() < 0 {
+                            continue;
+                        }
+                        next_reengage[h] = Instant::<Monotonic>::now() + REENGAGE_RETRY;
+                        dev_info!(cdev, "vino: head {h} absent -- retrying the sink re-engage\n");
+                        data.reengage_head(drm_dev, dev, h as u8);
+                        head_silent[h] = 0;
+                        next_presence = Instant::<Monotonic>::now();
+                    }
+                }
                 // Stage 2: periodic per-head monitor presence re-check -- brought forward the
                 // moment the dock says the downstream topology moved. Waiting out the period after
                 // an explicit announcement is what let a replug sit unhandled until the dock gave
@@ -1079,6 +1109,7 @@ impl WorkItem for BringUp {
                         }
                         head_debounce[h] = 0;
                         head_known[h] = present;
+                        next_reengage[h] = Instant::<Monotonic>::now() + REENGAGE_RETRY;
                         if present {
                             data.set_connected(drm_dev, h);
                             dev_info!(
