@@ -200,7 +200,7 @@ use crate::{
     time::Jiffies,
     types::Opaque,
 };
-use core::{marker::PhantomData, ptr::NonNull};
+use core::{marker::PhantomData, ops::Deref, ptr::NonNull};
 
 /// Creates a [`Work`] initialiser with the given name and a newly-created lock class.
 #[macro_export]
@@ -251,6 +251,59 @@ pub struct Queue(Opaque<bindings::workqueue_struct>);
 unsafe impl Send for Queue {}
 // SAFETY: Accesses to workqueues used by [`Queue`] are thread-safe.
 unsafe impl Sync for Queue {}
+
+/// An owned workqueue, allocated by Rust and destroyed on drop.
+///
+/// Unlike the `system*` queues, which are C globals that live forever, this is a queue a driver
+/// allocates for itself. The main reason to want one is a **name**: the kernel composes worker
+/// thread names from the workqueue's, so a queue called `foo` shows up in `ps`/`top` as
+/// `kworker/uN:M-foo`. That makes a driver's own CPU time attributable instead of anonymous inside
+/// the shared system pool, and it isolates that work from everything else sharing the pool.
+///
+/// Dereferences to [`Queue`], so it is used exactly like the system queues.
+pub struct OwnedQueue(NonNull<bindings::workqueue_struct>);
+
+// SAFETY: Accesses to workqueues are thread-safe, exactly as for `Queue`.
+unsafe impl Send for OwnedQueue {}
+// SAFETY: Accesses to workqueues are thread-safe, exactly as for `Queue`.
+unsafe impl Sync for OwnedQueue {}
+
+impl OwnedQueue {
+    /// Allocates a new workqueue named `name`.
+    ///
+    /// `max_active` bounds the number of work items that may execute concurrently per CPU; `0`
+    /// selects the kernel's default. `flags` is the usual `WQ_*` mask -- `WQ_UNBOUND` for work that
+    /// should be free to run on any CPU (which is what a compute fan-out wants), `WQ_FREEZABLE`,
+    /// `WQ_MEM_RECLAIM`, and so on.
+    ///
+    /// The name is copied by the C side into the workqueue's own storage, so `name` does not have
+    /// to outlive this call.
+    pub fn new(name: &CStr, flags: u32, max_active: i32) -> Result<Self> {
+        // SAFETY: `name` is a valid NUL-terminated C string for the duration of the call, and the
+        // helper only formats it into the workqueue's own name storage.
+        let ptr = unsafe { bindings::alloc_workqueue(name.as_char_ptr(), flags, max_active) };
+        Ok(Self(NonNull::new(ptr).ok_or(ENOMEM)?))
+    }
+}
+
+impl Deref for OwnedQueue {
+    type Target = Queue;
+
+    fn deref(&self) -> &Queue {
+        // SAFETY: The pointer is non-null and valid for as long as `self` lives, and `Queue` is
+        // `#[repr(transparent)]` over the same C type.
+        unsafe { Queue::from_raw(self.0.as_ptr()) }
+    }
+}
+
+impl Drop for OwnedQueue {
+    fn drop(&mut self) {
+        // SAFETY: The pointer came from `alloc_workqueue` and has not been destroyed before now.
+        // `destroy_workqueue` drains and flushes the queue first, so any work item still pending
+        // has run (and released its `Arc`/`KBox`) before the queue goes away.
+        unsafe { bindings::destroy_workqueue(self.0.as_ptr()) };
+    }
+}
 
 impl Queue {
     /// Use the provided `struct workqueue_struct` with Rust.

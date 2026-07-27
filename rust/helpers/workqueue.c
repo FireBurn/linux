@@ -14,3 +14,13 @@ __rust_helper void rust_helper_init_work_with_key(struct work_struct *work,
 	INIT_LIST_HEAD(&work->entry);
 	work->func = func;
 }
+
+/*
+ * `alloc_workqueue()` is variadic (the name is a format string), so bindgen cannot generate a
+ * callable binding for it. Wrap it with a fixed `"%s"` format so Rust can pass a plain name.
+ */
+__rust_helper struct workqueue_struct *
+rust_helper_alloc_workqueue(const char *name, unsigned int flags, int max_active)
+{
+	return alloc_workqueue("%s", flags, max_active, name);
+}
