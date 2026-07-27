@@ -968,6 +968,15 @@ impl WorkItem for BringUp {
                 // rather than in the sysfs write because this loop already owns a live `Io` token
                 // and the CP dialogue; see `drm_sink::REENGAGE_REQUEST` for why the path needs a
                 // trigger that does not depend on presence detection working first.
+                let simulated = drm_sink::take_simulated_unplugs();
+                if simulated != 0 {
+                    for h in 0..VinoDriver::CP_SETUP_HEADS {
+                        if simulated & (1 << h) != 0 {
+                            dev_info!(cdev, "vino: head {h} simulated unplug -- dropping the sink\n");
+                            data.drop_sink(dev, h as u8);
+                        }
+                    }
+                }
                 let requested = drm_sink::take_reengage_requests();
                 if requested != 0 {
                     for h in 0..VinoDriver::CP_SETUP_HEADS {
@@ -4268,6 +4277,7 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         kernel::sysfs::Attr::wo(c"reengage"),
         kernel::sysfs::Attr::rw(c"blank_marker"),
         kernel::sysfs::Attr::rw(c"record_sub_parity"),
+        kernel::sysfs::Attr::wo(c"simulate_unplug"),
     ];
 
     fn show(&self, name: &CStr, out: &mut kernel::sysfs::Writer<'_>) -> Result {
@@ -4351,6 +4361,20 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
             }
             drm_sink::set_blank_marker_state(v);
             pr_info!("vino: blank_marker candidate set to 2e({v}) via sysfs\n");
+            return Ok(());
+        }
+        // Drop a head's sink without claiming the silence, so the removal path sees exactly what a
+        // physical unplug produces. See `drm_sink::request_simulated_unplug`.
+        if name == c"simulate_unplug" {
+            let head = match buf.first() {
+                Some(&b) if b.is_ascii_digit() => (b - b'0') as u32,
+                _ => return Err(EINVAL),
+            };
+            if head as usize >= VinoDriver::CP_SETUP_HEADS {
+                return Err(EINVAL);
+            }
+            drm_sink::request_simulated_unplug(head);
+            pr_info!("vino: head {head} simulated unplug queued via sysfs\n");
             return Ok(());
         }
         if name == c"reengage" {
@@ -4551,7 +4575,7 @@ mod tests {
     fn black_training_frame_matches_captured_1440p_size() -> Result {
         // Corrected Vino captures repeatedly measured a 205,696-byte first write:
         // 2,560-byte ARM + 203,040-byte black image + 96-byte frame trailer.
-        let frame = video::wht::black_frame_ep08(2560, 1440, 0)?;
+        let frame = video::wht::black_frame_ep08(2560, 1440, 0, true)?;
         let image_len = frame.iter().map(|part| part.len()).sum::<usize>();
         assert_eq!(image_len, 203_040);
         assert_eq!(2_560 + image_len + video::wht::frame_trailer(0, 0).len(), 205_696);

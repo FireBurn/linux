@@ -1032,6 +1032,7 @@ pub(crate) mod wht {
         width: usize,
         height: usize,
         head: u8,
+        band_parity: bool,
     ) -> Result<KVec<KVec<u8>>> {
         if width % STRIP_W != 0 || height % STRIP_H != 0 {
             return Err(kernel::error::code::EINVAL);
@@ -1060,7 +1061,7 @@ pub(crate) mod wht {
             }
             sy += STRIP_H;
         }
-        frame_records(&strips, head, true)
+        frame_records(&strips, head, band_parity)
     }
 
     /// Encode ONE 64x16 strip whose top-left output pixel is `(sx, sy)`.

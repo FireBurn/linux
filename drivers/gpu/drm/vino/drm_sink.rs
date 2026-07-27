@@ -285,6 +285,27 @@ pub(super) fn set_band_parity_bit(on: bool) {
     BAND_PARITY_BIT.store(u32::from(on), Ordering::Relaxed);
 }
 
+/// Take `head`'s downstream sink down the way a real unplug does, WITHOUT claiming the silence.
+///
+/// The blank path downs the sink too, but records the head in [`VinoDrmData::self_blanked`] so the
+/// presence watcher knows the silence was vino's doing. This deliberately does not, which makes it
+/// indistinguishable from a physically unplugged monitor -- the dock stops answering that head's
+/// probe either way, which is the whole reason the two are hard to tell apart.
+///
+/// That gives the unplug/replug work an oracle that does not need a person at the keyboard: down a
+/// head, watch the removal fire, re-engage it, watch it come back with its real EDID and native
+/// mode. Written via `/sys/devices/vino/simulate_unplug`.
+pub(super) fn request_simulated_unplug(head: u32) {
+    SIMULATE_UNPLUG.fetch_or(1 << head, Ordering::Release);
+}
+
+/// Take the pending simulated-unplug mask, clearing it (keepalive side).
+pub(super) fn take_simulated_unplugs() -> u32 {
+    SIMULATE_UNPLUG.swap(0, Ordering::Acquire)
+}
+
+static SIMULATE_UNPLUG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// Request a re-engage of `head`'s downstream sink (sysfs writer side).
 pub(super) fn request_reengage(head: u32) {
     REENGAGE_REQUEST.fetch_or(1 << head, Ordering::Release);
@@ -394,6 +415,9 @@ const BLANK_PRESENT_MS: i64 = 120;
 /// (`0x4c/0`, `0x78/0x30`, `0x213/0x84`, `0x2/0x86`), so 16 leaves ample room for a hotplug or
 /// blank signal to stand out without an allocation on the keepalive path.
 const PUSH_KINDS: usize = 16;
+
+/// `edid_target` sentinel: nobody is waiting for an EDID.
+const NO_EDID_TARGET: u32 = u32::MAX;
 /// Absolute millisecond offsets from the **head-0** mode-set for the dual-head cold wake, decoded
 /// from `captures/dlm-coldplug-withmon-160457` — the only capture in the corpus that provably
 /// lights *both* panels of this dock from a physical cold plug.
@@ -968,6 +992,15 @@ pub(super) struct VinoDrmData {
     /// Last inner message id each head's presence probe decoded, so a *changed* answer is logged
     /// and a steady one is silent. See [`VinoDrmData::probe_head_present`].
     presence_reply: [core::sync::atomic::AtomicU32; HEADS],
+    /// Head currently expecting an EDID from a re-engage, or [`NO_EDID_TARGET`].
+    ///
+    /// The EDID arrives as an `id=0x194` push, and during a re-engage it lands in `send_cp`'s
+    /// own lockstep drain rather than in `drain_cp_pushes`. This says "somebody is waiting for
+    /// one", so that drain can stash it instead of discarding it.
+    edid_target: core::sync::atomic::AtomicU32,
+    /// The blob that drain caught, handed back to [`VinoDrmData::reengage_head`].
+    #[pin]
+    edid_caught: Mutex<Option<KVec<u8>>>,
     /// Heads vino has itself taken down via [`VinoDrmData::blank_head`], as a bitmask.
     ///
     /// A downed sink and an unplugged monitor look **identical** from the host: the dock stops
@@ -1038,6 +1071,8 @@ impl VinoDrmData {
             push_seen <- new_mutex!([const { None::<u32> }; PUSH_KINDS]),
             push_count: core::sync::atomic::AtomicU64::new(0),
             presence_reply: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
+            edid_target: core::sync::atomic::AtomicU32::new(NO_EDID_TARGET),
+            edid_caught <- new_mutex!(None),
             self_blanked: core::sync::atomic::AtomicU32::new(0),
             video_keys <- new_mutex!([[0u8; 32]; HEADS]),
         })
@@ -1356,7 +1391,7 @@ impl VinoDrmData {
             & !(super::video::wht::STRIP_W - 1);
         let h_pad = (timing.vactive as usize + super::video::wht::STRIP_H - 1)
             & !(super::video::wht::STRIP_H - 1);
-        let frames = super::video::wht::black_frame_ep08(w_pad, h_pad, head)?;
+        let frames = super::video::wht::black_frame_ep08(w_pad, h_pad, head, band_parity_bit())?;
         // Present for long enough to reach every dock buffer. The dock is multi-buffered and a
         // single presentation lands in one buffer only -- the same reason `DAMAGE_REPEATS` exists
         // -- so a one-shot blank leaves the other buffer holding the frozen desktop and the panel
@@ -1386,6 +1421,14 @@ impl VinoDrmData {
         }
         pr_info!("vino: head {head} blanked on the dock ({sent} black presentation(s))\n");
         Ok(())
+    }
+
+    /// Send only the sink-down marker for `head`, with no blanking and no `self_blanked` claim.
+    pub(super) fn drop_sink(&self, dev: &BoundInterface<'_>, head: u8) {
+        self.stream_marker(dev, head, 0x2f, 1);
+        self.stream_marker(dev, head, 0x2e, 1);
+        self.poll_status(dev);
+        self.stream_marker(dev, head, 0x2f, 0);
     }
 
     /// Emit a run of DLM's `(2f, 2e)` marker pairs for one head, polling between pairs.
@@ -1727,7 +1770,7 @@ impl VinoDrmData {
                 & !(super::video::wht::STRIP_W - 1);
             let h_pad = (timing.vactive as usize + super::video::wht::STRIP_H - 1)
                 & !(super::video::wht::STRIP_H - 1);
-            prompts[head] = super::video::wht::black_frame_ep08(w_pad, h_pad, head as u8).ok();
+            prompts[head] = super::video::wht::black_frame_ep08(w_pad, h_pad, head as u8, band_parity_bit()).ok();
             keys[head] = key;
             valid |= 1u32 << head;
         }
@@ -2034,10 +2077,29 @@ impl VinoDrmData {
         // DLM always posts one 4096-byte EP84 URB. Keep the request length identical even when the
         // expected acknowledgement is short; larger logical replies are naturally fragmented.
         let mut reply = KVec::from_elem(0u8, 4096, GFP_KERNEL)?;
-        if let Some(q) = link.ep84_q.as_mut() {
-            let _ = q.recv(dev.io(), &mut reply, super::cp_reply_timeout());
+        let got = if let Some(q) = link.ep84_q.as_mut() {
+            match q.recv(dev.io(), &mut reply, super::cp_reply_timeout()) {
+                Ok(Some(n)) => n,
+                _ => 0,
+            }
         } else {
-            let _ = dev.ctrl_recv(&mut reply, super::cp_reply_timeout(), GFP_KERNEL);
+            dev.ctrl_recv(&mut reply, super::cp_reply_timeout(), GFP_KERNEL)
+                .unwrap_or(0)
+        };
+        // ★ Catch an EDID passing through (2026-07-27). This drain exists to keep the channel
+        // moving and deliberately does not parse what it reads -- but the real EDID only ever
+        // arrives as an `id=0x194` push, and during a re-engage that push lands *here*, as the
+        // reply to one of the sequence's own sends. `reengage_head`'s separate drain therefore
+        // always came up empty and the head returned with no EDID at all, on synthesised fallback
+        // modes. Stash it when a head is expecting one; the cost on every other send is a length
+        // check against an atomic that is `NO_EDID_TARGET` all but a few milliseconds per replug.
+        let target = self.edid_target.load(Ordering::Relaxed);
+        if target != NO_EDID_TARGET && got > 16 {
+            if let Ok(Some(blob)) =
+                super::cp::parse_edid_from_reply(&link.ks, &link.riv, &reply[..got])
+            {
+                *self.edid_caught.lock() = Some(blob);
+            }
         }
         Ok(())
     }
@@ -2194,6 +2256,8 @@ impl VinoDrmData {
             let _ = self.send_cp(io, id, 0, |ctr| build(ctr));
             fsleep(Delta::from_millis(gap_ms));
         };
+        self.edid_target.store(head as u32, Ordering::Release);
+        *self.edid_caught.lock() = None;
         step(0x15, &|c| super::cp::get_edid_req_sub(c, 0x0020, head), 117);
         step(0x15, &|c| super::cp::get_edid_req_sub(c, 0x0020, head), 115);
         step(0x16, &|c| super::cp::edid_readiness_kick(c, head), 107);
@@ -2201,7 +2265,9 @@ impl VinoDrmData {
         step(0x16, &|c| super::cp::edid_engage_req(c, head), 118);
         step(0x16, &|c| super::cp::edid_engage_req(c, head), 107);
         step(0x15, &|c| super::cp::post_edid_query(c, head), 11);
-        match self.drain_for_edid(io, head) {
+        let caught = self.edid_caught.lock().take();
+        self.edid_target.store(NO_EDID_TARGET, Ordering::Release);
+        match caught.or_else(|| self.drain_for_edid(io, head)) {
             Some(blob) => {
                 let n = blob.len();
                 self.set_edid(dev, head as usize, blob);
@@ -2862,7 +2928,7 @@ impl WorkItem for VinoDrmData {
                                 - 1)
                                 & !(super::video::wht::STRIP_H - 1);
                             let prompt =
-                                super::video::wht::black_frame_ep08(w_pad, h_pad, head).ok();
+                                super::video::wht::black_frame_ep08(w_pad, h_pad, head, band_parity_bit()).ok();
                             if prompt.is_none() {
                                 pr_info!(
                                     "vino: prompt head={} black-frame preparation failed; continuing with real keyframe\n",
@@ -4847,7 +4913,7 @@ fn encode_and_send_wht(
                     & !(super::video::wht::STRIP_W - 1);
                 let h_pad = (h + super::video::wht::STRIP_H - 1)
                     & !(super::video::wht::STRIP_H - 1);
-                let prompt = super::video::wht::black_frame_ep08(w_pad, h_pad, head).ok();
+                let prompt = super::video::wht::black_frame_ep08(w_pad, h_pad, head, band_parity_bit()).ok();
                 data.begin_cp_timeline();
                 if !wake {
                     data.modeset_bracket_pre(dev, head);
