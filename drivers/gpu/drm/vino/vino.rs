@@ -1003,6 +1003,31 @@ impl WorkItem for BringUp {
                 // up and re-enumerated itself; see `drm_sink::DOWNSTREAM_EVENT`.
                 if drm_sink::take_downstream_event() {
                     next_presence = Instant::<Monotonic>::now();
+                    // ★ Break the replug deadlock (measured 2026-07-27, second unplug test).
+                    //
+                    // A head whose monitor came back stays silent, because the dock will not answer
+                    // its presence probe until the downstream sink is re-engaged -- and vino would
+                    // not re-engage until the probe said the monitor was back. Neither side moves,
+                    // and ~17 s later the dock gives up and re-enumerates the whole device, which
+                    // is why a replug tore down the *other* screen too and restarted both.
+                    //
+                    // So when the dock reports a topology change, optimistically re-engage every
+                    // head currently believed absent, then let the probe below settle it. If the
+                    // monitor really is gone the sequence is harmless -- the dock stays silent and
+                    // the head stays disconnected -- and the trigger is edge-driven, so this cannot
+                    // spin.
+                    for h in 0..VinoDriver::CP_SETUP_HEADS {
+                        if head_known[h] {
+                            continue;
+                        }
+                        dev_info!(
+                            cdev,
+                            "vino: head {h} absent and the dock reports a downstream change -- \
+                             re-engaging speculatively\n"
+                        );
+                        data.reengage_head(drm_dev, dev, h as u8);
+                        head_silent[h] = 0;
+                    }
                 }
                 let now_p = Instant::<Monotonic>::now();
                 if (now_p - next_presence).as_millis() >= 0 {
