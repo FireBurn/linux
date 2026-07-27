@@ -459,6 +459,22 @@ impl<T: DriverPlane> UnregisteredPlane<T> {
         // registration is exactly what this helper is for.
         unsafe { bindings::drm_plane_enable_fb_damage_clips(self.as_raw()) }
     }
+
+    /// Attaches the `pixel blend mode` property to this plane.
+    ///
+    /// `supported_modes` is a bitmask of `BIT(DRM_MODE_BLEND_*)`; `DRM_MODE_BLEND_PREMULTI` must
+    /// always be included. Any plane that advertises a pixel format with an alpha channel is
+    /// required to have this property -- `drm_mode_config_validate()` `WARN`s at registration
+    /// otherwise, because userspace has no way to know how the alpha will be interpreted.
+    ///
+    /// Call this during [`KmsDriver::create_objects`](crate::drm::kms::KmsDriver::create_objects),
+    /// before the device is registered.
+    pub fn create_blend_mode_property(&self, supported_modes: BlendModes) -> Result {
+        // SAFETY: `as_raw()` is a valid, not-yet-registered plane.
+        to_result(unsafe {
+            bindings::drm_plane_create_blend_mode_property(self.as_raw(), supported_modes.bits())
+        })
+    }
 }
 
 /// A trait implemented by any type that acts as a [`struct drm_plane`] interface.
