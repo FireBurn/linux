@@ -5061,57 +5061,20 @@ mod tests {
         Ok(())
     }
 
-    // ── Removed 2026-07-26: `wht_solid_strip_byte_exact` and
-    //    `wht_general_strip_and_frame_forward_hint`.
+    // ── Removed 2026-07-27: the LEGACY LUMA ENCODERS and their tests.
     //
-    // Both covered the LEGACY LUMA encoders (`solid_strip`, `strip`, `ac_strip`, `encode_frame`),
-    // which have no production call sites -- live scanout runs the colour path
-    // (`colour_strip`/`colour_frame_ep08`), verified 3600/3600 byte-exact against DLM on hardware.
+    // `solid_strip`, `strip`, `ac_strip` and `encode_frame` were the achromatic codec -- the first
+    // half of the RE, cracked on greyscale content before colour was understood. `colour_strip`
+    // superseded them completely: it codes uniform strips too, and the live scanout path called
+    // none of the four. What remained was ~300 lines of dead code plus tests whose DLM-captured
+    // ground truth no longer described any executing path.
     //
-    // Their value was that the expected byte vectors were DLM-CAPTURED GROUND TRUTH for the
-    // 2026-06-23 grammar. That ground truth no longer describes the current implementation: the
-    // solid vectors had drifted in three independent ways (a stale trailing `L-2` length echo that
-    // `solid_strip` deliberately stopped writing once `frame_records` carried the length, one
-    // differing escape byte, and an odd 59-byte `red` vector against a always-even strip length),
-    // and `strip`/`solid_strip` no longer agree in the body at all.
-    //
-    // Regenerating the vectors from the implementation would convert ground-truth tests into
-    // tautologies -- asserting dead code equals itself -- so they were removed rather than
-    // "fixed". To restore real coverage, re-derive the vectors from a luma capture
-    // (`scripts/wht-strip-encoder.py`, `captures/codec-grammar-20260623`); better still, delete the
-    // legacy luma encoders themselves, since nothing calls them.
-    #[test]
-    fn wht_ac_strip_byte_exact() {
-        // The uniform AC-strip encoder, byte-exact vs DLM (sig-library-20260623, 25/25 strips). The
-        // significance coder is a variable-length LAST-significant-position tree; positions 1..32
-        // reduce to the previously recovered 00111110 ++ 5-bit(32-last) form. The AC stream
-        // run/magnitude-codes coeffs 1..last with the DLM-matched quantizer.
-        use video::wht::{ac_strip, COEFFS};
-        // s_L3HL: c3 = [128, -64, 0..]; last=1 (qAC[1]=-4). 70-byte strip.
-        let mut c = [0i32; COEFFS];
-        c[0] = 128;
-        c[1] = -64;
-        let l3hl = ac_strip(&c, 0x40, 0x10).unwrap();
-        let want = [
-            0x01, 0x28, 0x40, 0x00, 0x10, 0x00, 0, 0, 0, 0, 0x34, 0x00, 0x3c, 0x00, 0, 0, 0x7c,
-            0x9f, 0xef, 0xf3, 0x7d, 0xbe, 0xcf, 0xf7, 0xf9, 0x3e, 0xdf, 0xe7, 0xfb, 0x7c, 0x9f,
-            0xef, 0xf3, 0x7d, 0xbe, 0xcf, 0xf7, 0xf9, 0x3e, 0xdf, 0xe7, 0xfb, 0x3c, 0x04, 0, 0, 0,
-            0, 0, 0, 0, 0, 0x87, 0xc3, 0xe1, 0x70, 0x38, 0x1c, 0x0e, 0x00, 0x87, 0xc3, 0xe1, 0x70,
-            0x38, 0x1c, 0x0e, 0x00, 0x44, 0x00,
-        ];
-        assert_eq!(&*l3hl, &want);
-        // s_L2HL: c3 = [128, 0,0,0, -16,-16,-16,-16, 0..]; last=7 (deadzone pos3 untouched -> last
-        // stays in the L2-HL band). 118-byte strip; spot-check length + w18/w1c framing.
-        let mut c2 = [0i32; COEFFS];
-        c2[0] = 128;
-        for i in 4..8 {
-            c2[i] = -16;
-        }
-        let l2hl = ac_strip(&c2, 0x40, 0x10).unwrap();
-        assert_eq!(l2hl.len(), 118);
-        assert_eq!(&l2hl[10..14], &[0x34, 0x00, 0x54, 0x00]); // w18=52, w1c=84
-        assert_eq!(&l2hl[116..118], &[0x74, 0x00]); // tail = L-2 = 116
-    }
+    // The shared machinery they exercised is still covered, and by better tests: `transform` by
+    // `wht_transform_uniform`/`wht_transform_haar_vectors`, the escape coder by
+    // `wht_vlc_codebook_byte_exact`/`wht_coeff_magnitude_code`, the significance extent by
+    // `wht_chroma_last_is_exact`. Stronger than any of them, `scripts/codec-re/colour_decode.py`
+    // now decodes the live grammar end to end and is validated against a real DLM capture
+    // (3597/3600 strips) -- a round-trip check the byte-vector tests could never be.
 
     #[test]
     fn wht_magnitude_category() {
