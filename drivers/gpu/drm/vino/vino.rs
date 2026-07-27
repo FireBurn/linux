@@ -907,19 +907,24 @@ impl WorkItem for BringUp {
             // each head on a slow cadence and reflect changes to its connector (with the same
             // readiness wait on a fresh connect, and a full teardown on removal). Debounced so a
             // single mis-decoded reply cannot flap a connector.
-            const PRESENCE_PERIOD: Delta = Delta::from_secs(2);
+            const PRESENCE_PERIOD: Delta = Delta::from_millis(1000);
             let mut next_presence = Instant::<Monotonic>::now() + PRESENCE_PERIOD;
             let mut head_known = [false; VinoDriver::CP_SETUP_HEADS];
             let mut head_debounce = [0u8; VinoDriver::CP_SETUP_HEADS];
             /// Consecutive undecodable presence replies that count as "this head has no monitor".
             ///
             /// The probe used to treat a missing reply as "no change", which makes a head that
-            /// stops answering entirely -- the shape a lost downstream sink could easily take --
-            /// indistinguishable from a healthy one. Silence is only evidence after it persists:
-            /// at `PRESENCE_PERIOD` = 2 s this is ~16 s of an unbroken CP link answering nothing
-            /// for this head, while a single dropped reply (or a probe that lands during a
-            /// mode-set, when the CP timeline is deliberately exclusive) still costs nothing.
-            const PRESENCE_SILENT_LIMIT: u8 = 8;
+            /// stops answering entirely indistinguishable from a healthy one. **That is exactly
+            /// what a lost monitor looks like** -- measured 2026-07-27 on a physical unplug: the
+            /// dock does not switch to a "no sink" reply, it simply stops answering this head's
+            /// probe while the *other* head's status word moves. Silence is the signal, so it only
+            /// has to outlast a dropped reply, not stand in for missing evidence.
+            ///
+            /// Three cycles at a 1 s period is ~3 s, against the ~16 s the first measurement (8 x
+            /// 2 s) took to disconnect the output. A probe landing during a mode-set cannot produce
+            /// a false positive: the CP timeline is exclusive there and this loop is paused, so no
+            /// cycle elapses at all.
+            const PRESENCE_SILENT_LIMIT: u8 = 3;
             let mut head_silent = [0u8; VinoDriver::CP_SETUP_HEADS];
             for h in 0..VinoDriver::CP_SETUP_HEADS {
                 head_known[h] = data.head_present(h);
