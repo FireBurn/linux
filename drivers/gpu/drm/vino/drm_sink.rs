@@ -200,6 +200,28 @@ pub(super) fn set_pixel_budget_override(v: u32) {
 /// attribute group, which is the kind of lifetime shortcut this driver has been removing.
 static REENGAGE_REQUEST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Set when the dock says something that means "the downstream topology moved".
+///
+/// Measured 2026-07-27 from a physical unplug/replug. The dock announces a replug by **pushing an
+/// unprompted `id=0x44 sub=0x20`** -- the EDID-handler reply, arriving with no probe outstanding --
+/// and vino ignored it, so nothing re-engaged the head. 18 s later the dock gave up and
+/// re-enumerated itself, and *that* is what relit the panel. "The replug does not light it back
+/// up" and "after a few minutes everything reloaded" are both this one miss.
+///
+/// It also moves the *other* head's probe status word (`0x2711 ready=true` ->
+/// `0x2001 ready=false` and back), measured ~2 s after the event versus ~14 s for the push, so
+/// both raise this and whichever arrives first wins.
+///
+/// Raised by [`VinoDrmData::drain_cp_pushes`] and [`VinoDrmData::probe_head_present`], consumed by
+/// the keepalive, which re-probes presence immediately instead of waiting out its period.
+static DOWNSTREAM_EVENT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Take the pending downstream-topology event, clearing it (keepalive side).
+pub(super) fn take_downstream_event() -> bool {
+    DOWNSTREAM_EVENT.swap(false, Ordering::Acquire)
+}
+
 /// Request a re-engage of `head`'s downstream sink (sysfs writer side).
 pub(super) fn request_reengage(head: u32) {
     REENGAGE_REQUEST.fetch_or(1 << head, Ordering::Release);
@@ -1996,6 +2018,13 @@ impl VinoDrmData {
                                 "vino: dock push id=0x{id:x} sub=0x{sub:x} ctr={ctr} (push #{count})\n"
                             );
                         }
+                        // An EDID-handler reply arriving with no probe outstanding is the dock
+                        // reporting that a downstream sink changed -- it is the *only* thing it
+                        // sent between a measured monitor replug and its own give-up reset. Treat
+                        // it as "re-probe now" rather than waiting out the presence period.
+                        if matches!(id, 0x44 | 0x194) {
+                            DOWNSTREAM_EVENT.store(true, Ordering::Release);
+                        }
                     }
                 }
                 _ => break,
@@ -2121,6 +2150,12 @@ impl VinoDrmData {
         let cell = ((id as u32) << 16) | (status & 0xffff);
         let prev = self.presence_reply[head as usize].swap(cell, Ordering::Relaxed);
         if prev != cell {
+            // The dock moves the *other* head's status word too when a sink appears or disappears,
+            // and it does so sooner than it pushes anything. `prev == 0` is this head's first ever
+            // reply, which is bring-up, not an event.
+            if prev != 0 {
+                DOWNSTREAM_EVENT.store(true, Ordering::Release);
+            }
             pr_info!(
                 "vino: head {head} presence probe reply id=0x{id:x} status=0x{status:08x} ready={ready} -> present={present} (was 0x{prev:08x})\n"
             );

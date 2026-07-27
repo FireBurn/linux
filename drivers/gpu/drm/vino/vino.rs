@@ -992,7 +992,13 @@ impl WorkItem for BringUp {
                     next_presence = Instant::<Monotonic>::now() + PRESENCE_PERIOD;
                     next_heartbeat = Instant::<Monotonic>::now() + HEARTBEAT_PERIOD;
                 }
-                // Stage 2: periodic per-head monitor presence re-check.
+                // Stage 2: periodic per-head monitor presence re-check -- brought forward the
+                // moment the dock says the downstream topology moved. Waiting out the period after
+                // an explicit announcement is what let a replug sit unhandled until the dock gave
+                // up and re-enumerated itself; see `drm_sink::DOWNSTREAM_EVENT`.
+                if drm_sink::take_downstream_event() {
+                    next_presence = Instant::<Monotonic>::now();
+                }
                 let now_p = Instant::<Monotonic>::now();
                 if (now_p - next_presence).as_millis() >= 0 {
                     next_presence = now_p + PRESENCE_PERIOD;
