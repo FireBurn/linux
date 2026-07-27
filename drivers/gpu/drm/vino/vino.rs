@@ -526,6 +526,38 @@ static CP_ENGAGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// time out and hard-reset the moment it stops, so this must run for the life of the device.
 static KEEPALIVE_RUN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Sticky "this binding is going away" flag: set by `disconnect()` on the control interface,
+/// cleared only by a fresh `probe()` of it.
+///
+/// `KEEPALIVE_RUN` on its own cannot stop the keepalive, because `BringUp::run` *sets* it -- twice,
+/// and both stores happen near the end of a bring-up that takes ~15 s. A disconnect landing while
+/// bring-up is still running therefore cleared a flag the work item then put straight back. That is
+/// exactly what wedged the machine on 2026-07-27: the dock reset mid-EDID-fetch, `disconnect()`
+/// cleared `KEEPALIVE_RUN` at t=45.7 s, `BringUp::run` re-armed it at t=53.2 s and looped forever,
+/// and `IoWindow::close()` -- which waits for the `Io` token that loop holds for its whole body --
+/// never returned. `usb_hub_wq` stayed blocked in `hub_event` for the rest of the boot, so the
+/// dock's USB3 half could never re-enumerate.
+///
+/// Being sticky is the whole point: nothing the outgoing session runs can un-set it.
+static SESSION_TEARDOWN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arms the CP keepalive, unless this binding has already begun tearing down.
+fn keepalive_arm() {
+    use core::sync::atomic::Ordering::SeqCst;
+    if !SESSION_TEARDOWN.load(SeqCst) {
+        KEEPALIVE_RUN.store(true, SeqCst);
+    }
+}
+
+/// The condition every keepalive/readiness loop spins on. Re-reading `SESSION_TEARDOWN` here, and
+/// not only in [`keepalive_arm`], is what closes the race for good: an arm that slips past the
+/// check there still drops out on the loop's very next iteration.
+fn keepalive_running() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    KEEPALIVE_RUN.load(Relaxed) && !SESSION_TEARDOWN.load(Relaxed)
+}
+
 static BRINGUP_COMPLETE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -821,17 +853,16 @@ impl WorkItem for BringUp {
             // its panel; the WARM case worked only because the link was already up. Run the same
             // readiness poll here, BEFORE notifying userspace, so KWin's mode-set lands on a
             // downstream the dock has finished bringing up. Harmless on a warm plug (link already
-            // ready -> the poll just idles). Bounded, and breaks on `disconnect()` clearing
-            // KEEPALIVE_RUN, so `cancel_work_sync` can never hang unload for the full window.
+            // ready -> the poll just idles). Bounded, and `keepalive_running()` also breaks it the
+            // instant `disconnect()` latches `SESSION_TEARDOWN`, so `cancel_sync` can never hang
+            // unload for the full window -- not even when the disconnect beat this poll to it.
             if CP_ENGAGED.load(core::sync::atomic::Ordering::SeqCst) {
                 let data: &drm_sink::VinoDrmData = drm_dev;
-                KEEPALIVE_RUN.store(true, core::sync::atomic::Ordering::SeqCst);
+                keepalive_arm();
                 let start = Instant::<Monotonic>::now();
                 let window = Delta::from_millis(1300);
                 let mut polls = 0u32;
-                while Instant::<Monotonic>::now() - start < window
-                    && KEEPALIVE_RUN.load(core::sync::atomic::Ordering::Relaxed)
-                {
+                while Instant::<Monotonic>::now() - start < window && keepalive_running() {
                     let _ = data.send_cp(dev, 0x14, 0, |ctr| cp::device_query_req(ctr, 0x000c));
                     polls += 1;
                     fsleep(Delta::from_millis(15));
@@ -883,8 +914,8 @@ impl WorkItem for BringUp {
             for h in 0..VinoDriver::CP_SETUP_HEADS {
                 head_known[h] = data.head_present(h);
             }
-            KEEPALIVE_RUN.store(true, core::sync::atomic::Ordering::SeqCst);
-            while KEEPALIVE_RUN.load(core::sync::atomic::Ordering::Relaxed) {
+            keepalive_arm();
+            while keepalive_running() {
                 // The modeset worker reproduces one short DLM control/video timeline from an
                 // absolute mode-set anchor. Do not race an independent poll/heartbeat/presence
                 // transaction into that sequence; resume immediately after its closing markers.
@@ -953,7 +984,7 @@ impl WorkItem for BringUp {
                             // userspace, so KWin's mode-set lands on a settled downstream link.
                             let rs = Instant::<Monotonic>::now();
                             while (Instant::<Monotonic>::now() - rs).as_millis() < 1300
-                                && KEEPALIVE_RUN.load(core::sync::atomic::Ordering::Relaxed)
+                                && keepalive_running()
                             {
                                 let _ = data
                                     .send_cp(dev, 0x14, 0, |ctr| cp::device_query_req(ctr, 0x000c));
@@ -3858,6 +3889,9 @@ impl usb::Driver for VinoDriver {
             cdev,
             "vino: bound DisplayLink D6000 -- plaintext session bring-up\n"
         );
+        // A fresh binding of the control interface is the ONLY thing that lifts the teardown latch;
+        // see `SESSION_TEARDOWN`. Cleared here, before anything can arm the keepalive.
+        SESSION_TEARDOWN.store(false, core::sync::atomic::Ordering::SeqCst);
 
         // Phase 3: register a real DRM/KMS device on the control interface so the dock
         // shows up as a mode-settable `card`/`renderD` node (atomic KMS via the simple
@@ -4042,9 +4076,22 @@ impl usb::Driver for VinoDriver {
         intf: &'bound usb::Interface<Core<'_>>,
         data: Pin<&VinoBoundData<'bound>>,
     ) {
-        // Stop the CP keepalive loop BEFORE anything flushes the bring-up work, so it cannot hang
-        // unload waiting on the loop's fsleep.
-        KEEPALIVE_RUN.store(false, core::sync::atomic::Ordering::SeqCst);
+        // Latch teardown BEFORE anything flushes the bring-up work, so the CP keepalive loop exits
+        // and cannot hang unload waiting on its `fsleep`.
+        //
+        // The latch is sticky and only `probe()` lifts it, because clearing `KEEPALIVE_RUN` here is
+        // not enough on its own: `BringUp::run` *sets* that flag, near the end of a bring-up that
+        // takes ~15 s, so a disconnect landing mid-bring-up cleared a flag the work item then put
+        // straight back. See `SESSION_TEARDOWN` for the boot that proves it.
+        //
+        // Only the control interface owns the bring-up work and the keepalive; latching on any
+        // other interface's unbind would leave a live session with no CP heartbeat, which makes the
+        // dock time out and hard-reset.
+        let control = intf.number() == Some(0);
+        if control {
+            SESSION_TEARDOWN.store(true, core::sync::atomic::Ordering::SeqCst);
+            KEEPALIVE_RUN.store(false, core::sync::atomic::Ordering::SeqCst);
+        }
         let dev: &device::Device<Core<'_>> = intf.as_ref();
         // Drop this interface from the `remove_all` table (idempotent with a concurrent remove_all).
         if let Some(number) = intf.number() {
