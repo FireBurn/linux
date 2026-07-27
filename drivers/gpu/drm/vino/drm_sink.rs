@@ -688,25 +688,6 @@ pub(super) struct VinoDrmData {
     /// hash table and cleared with it.
     #[pin]
     dirty_ttl: Mutex<[Option<KVVec<u8>>; HEADS]>,
-    /// Hash of the ENCODED body of each strip, as last put on the wire.
-    ///
-    /// ★ **Measured 2026-07-27.** `strip_hashes` fingerprints the *source pixels*, and a source
-    /// difference that the codec's own quantisers throw away still reads as damage. Decoding vino's
-    /// captured EP08 traffic showed what that costs: on a settled desktop, consecutive frames of
-    /// 2224 strips / 1.5 MB were **2221/2224 byte-identical to the frame before them** -- the whole
-    /// transmission bar three strips was a re-send of bytes the dock already had.
-    ///
-    /// Comparing the encoded body closes that gap exactly, because it asks the only question the
-    /// wire cares about. The encode still happens (it is what produces the bytes to compare), so
-    /// this buys transmission, not CPU -- and transmission is what `phase` measures as `wire=`,
-    /// 11-19 ms of a 34-50 ms frame.
-    ///
-    /// ⚠ A strip that still owes a retransmission is NEVER suppressed: [`dirty_ttl`] exists because
-    /// one presentation reaches only one of the dock's buffers, so "the dock already has these
-    /// bytes" is true of one buffer and false of the other. Suppression applies only to strips whose
-    /// ledger is clear.
-    #[pin]
-    sent_strip_hashes: Mutex<[Option<KVVec<u64>>; HEADS]>,
     /// Set once the dock engages the CP cipher (`wsub=0x45` acks > 0); EP08 scanout is gated on it.
     /// Per device, so a second connected dock does not share one dock's engagement state.
     cp_engaged: core::sync::atomic::AtomicBool,
@@ -866,7 +847,6 @@ impl VinoDrmData {
             gamma <- new_mutex!([None; HEADS]),
             strip_hashes <- new_mutex!([const { None }; HEADS]),
             dirty_ttl <- new_mutex!([const { None }; HEADS]),
-            sent_strip_hashes <- new_mutex!([const { None }; HEADS]),
             cp_engaged: core::sync::atomic::AtomicBool::new(false),
             cp_timeline_exclusive: core::sync::atomic::AtomicBool::new(false),
             modeset_active: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
@@ -962,7 +942,6 @@ impl VinoDrmData {
         *self.shadow.lock() = [const { [const { None }; SHADOW_SLOTS] }; HEADS];
         *self.strip_hashes.lock() = [const { None }; HEADS];
         *self.dirty_ttl.lock() = [const { None }; HEADS];
-        *self.sent_strip_hashes.lock() = [const { None }; HEADS];
         // Cancel the queued drain and reclaim the `ARef<VinoDrmDevice>` the enqueue handed to
         // the workqueue, if it was still pending. Dropping it here releases the self-reference
         // that would otherwise keep this device alive until the work ran.
@@ -987,7 +966,6 @@ impl VinoDrmData {
         *self.shadow.lock() = [const { [const { None }; SHADOW_SLOTS] }; HEADS];
         *self.strip_hashes.lock() = [const { None }; HEADS];
         *self.dirty_ttl.lock() = [const { None }; HEADS];
-        *self.sent_strip_hashes.lock() = [const { None }; HEADS];
         *self.video_q.lock() = [const { None }; HEADS];
         *self.video_staging.lock() = [const { None }; HEADS];
         *self.cp_link.lock() = None;
@@ -1021,7 +999,6 @@ impl VinoDrmData {
         if changed {
             self.strip_hashes.lock()[head] = None;
             self.dirty_ttl.lock()[head] = None;
-            self.sent_strip_hashes.lock()[head] = None;
             self.owe_keyframe(head);
         }
     }
@@ -1580,7 +1557,6 @@ impl VinoDrmData {
             self.owe_keyframe(head);
             self.strip_hashes.lock()[head] = None;
             self.dirty_ttl.lock()[head] = None;
-            self.sent_strip_hashes.lock()[head] = None;
             sent |= bit;
         }
 
@@ -2523,7 +2499,6 @@ impl WorkItem for VinoDrmData {
                                 data.owe_keyframe(head_i);
                                 data.strip_hashes.lock()[head_i] = None;
                                 data.dirty_ttl.lock()[head_i] = None;
-                    data.sent_strip_hashes.lock()[head_i] = None;
                                 data.modeset_bracket_post_open(dev, head, mode_anchor);
                                 let prompt_started = prompt.as_ref().is_some_and(|frames| {
                                     match data.submit_prompt_training(
@@ -3113,7 +3088,6 @@ impl crtc::DriverCrtc for VinoCrtc {
         data.sustain_until.lock()[head as usize] = None;
         data.strip_hashes.lock()[head as usize] = None;
         data.dirty_ttl.lock()[head as usize] = None;
-        data.sent_strip_hashes.lock()[head as usize] = None;
         pr_info!("vino: KMS CRTC disable -- head {head} display OFF (scanout stopped)\n");
     }
 
@@ -4092,69 +4066,6 @@ impl PixelSource {
     }
 }
 
-/// Drop every strip whose encoded body is byte-for-byte what the dock was last sent, unless that
-/// strip still owes a retransmission.
-///
-/// See [`VinoDrmData::sent_strip_hashes`] for the measurement that motivates this. `coords` is
-/// parallel to `strips` (both come from `damage_strip_coords`/`all_strip_coords` order), and the
-/// surviving strips keep that order, so [`frame_records`](super::video::wht::frame_records)'s
-/// "x-ordered within each Y band" contract still holds -- removing entries from an ordered list
-/// cannot reorder it.
-fn suppress_unchanged_strips(
-    data: &VinoDrmData,
-    head_i: usize,
-    w_pad: usize,
-    h_pad: usize,
-    full: bool,
-    coords: &[(usize, usize)],
-    strips: KVec<KVec<u8>>,
-) -> Result<KVec<KVec<u8>>> {
-    let tiles_x = w_pad / super::video::wht::STRIP_W;
-    let tiles = tiles_x * (h_pad / super::video::wht::STRIP_H);
-    if tiles == 0 || coords.len() != strips.len() {
-        return Ok(strips);
-    }
-    let mut sent = data.sent_strip_hashes.lock();
-    let ttl = data.dirty_ttl.lock();
-    let mut kept: KVec<KVec<u8>> = KVec::with_capacity(strips.len(), GFP_KERNEL)?;
-    for (i, s) in strips.into_iter().enumerate() {
-        let (sx, sy) = coords[i];
-        let idx = (sy / super::video::wht::STRIP_H) * tiles_x + sx / super::video::wht::STRIP_W;
-        // A strip mid-way through paying its retransmit debt has to go out even when its bytes are
-        // unchanged: the repeat is what reaches the dock's *other* buffer.
-        let owes = ttl[head_i]
-            .as_ref()
-            .and_then(|d| d.get(idx))
-            .is_some_and(|&d| d > 0);
-        let h = xxhash::xxh64(&s, idx as u64);
-        let table = match sent[head_i].as_mut() {
-            Some(t) if t.len() > idx => t,
-            _ => {
-                // No table yet (or the geometry moved): send everything and start one.
-                let mut fresh: KVVec<u64> = KVVec::new();
-                if fresh.resize(tiles, 0, GFP_KERNEL).is_err() {
-                    kept.push(s, GFP_KERNEL)?;
-                    continue;
-                }
-                sent[head_i] = Some(fresh);
-                kept.push(s, GFP_KERNEL)?;
-                continue;
-            }
-        };
-        // ⚠ A KEYFRAME is never suppressed. Its entire job is to rewrite the surface
-        // unconditionally -- it is the one frame that resynchronises a dock buffer whose contents
-        // vino cannot know, and `dirty_ttl` is not even populated on the full path, so every strip
-        // would look debt-free. Suppressing it turned a 4,495,744-byte keyframe into 1,248 bytes
-        // on the first HW run of this change, which is precisely the frame that must not shrink.
-        if !full && !owes && table[idx] == h && h != 0 {
-            continue; // the dock already has these exact bytes, in both of its buffers
-        }
-        table[idx] = h;
-        kept.push(s, GFP_KERNEL)?;
-    }
-    Ok(kept)
-}
-
 /// Encode a batch of strips from `src`, in the order given.
 fn encode_coords(src: &PixelSource, coords: &[(usize, usize)]) -> Result<KVec<KVec<u8>>> {
     let mut out = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
@@ -4510,7 +4421,6 @@ fn encode_and_send_wht(
                     data.owe_keyframe(head_i);
                     data.strip_hashes.lock()[head_i] = None;
                     data.dirty_ttl.lock()[head_i] = None;
-                    data.sent_strip_hashes.lock()[head_i] = None;
                     data.modeset_bracket_post_open(dev, head, mode_anchor);
                     let prompt_started = prompt.as_ref().is_some_and(|frames| {
                         match data.submit_prompt_training(
@@ -4691,23 +4601,11 @@ fn encode_and_send_wht(
             };
             match parallel_strip_encode(src, &coords)? {
                 Some(strips) => {
-                    // ★ Drop strips whose ENCODED BODY the dock already has (2026-07-27).
-                    //
-                    // Damage is selected on a hash of the *source pixels*, so a difference the
-                    // codec's own quantisers discard still costs a full transmission. Decoding
-                    // vino's captured wire put a number on it: consecutive settled-desktop frames
-                    // of 2224 strips / 1.5 MB were 2221/2224 byte-identical to the frame before.
-                    //
-                    // Compare the bytes themselves -- the only thing the wire cares about --
-                    // keeping any strip that still owes a retransmission, because a strip the dock
-                    // "already has" is in one of its two buffers, not both. See `sent_strip_hashes`.
-                    let strips = suppress_unchanged_strips(data, head_i, w_pad, h_pad, full, &coords, strips)?;
                     let n = ENCODE_LOG_PAR.fetch_add(1, Ordering::Relaxed) + 1;
                     if n <= 2 || n % 32 == 0 {
                         pr_info!(
-                            "vino: parallel encode head={head} strips={} sent={} chunks={}\n",
+                            "vino: parallel encode head={head} strips={} chunks={}\n",
                             coords.len(),
-                            strips.len(),
                             (coords.len() / ENCODE_MIN_STRIPS_PER_CHUNK)
                                 .min(ENCODE_MAX_WORK_ITEMS)
                         );
