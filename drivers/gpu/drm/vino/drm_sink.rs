@@ -635,6 +635,33 @@ struct StripHashState {
     w_pad: usize,
     h_pad: usize,
     hashes: KVVec<u64>,
+    /// ★ The encoded wire body of each strip, parallel to `hashes` (empty = not cached).
+    ///
+    /// **Why this exists (2026-07-27).** `DAMAGE_REPEATS` charges every changed strip three
+    /// transmissions, so a strip is re-selected on the two frames after the one it changed on --
+    /// and it was re-ENCODED all three times. That multiplier is directly visible in the live log:
+    /// `parallel encode head=0 strips=1904`, `1616`, `1984`, `1872` on a desktop whose genuine
+    /// per-frame deltas are 8-32 strips.
+    ///
+    /// But a strip re-sent purely to pay down debt has, by definition, an unchanged hash -- that is
+    /// the very test that decided it did not need re-selecting on its own account. Identical
+    /// pixels at an identical `(x, y)` produce an identical body, because [`colour_strip`] is a
+    /// pure function of exactly those. So the second and third transmissions can re-use the bytes
+    /// from the first and skip the codec entirely.
+    ///
+    /// Validity is tied to `tag` and to identity rotation (see [`StripHashState::tag`]); every
+    /// existing path that clears `strip_hashes` -- mode-set, disable, geometry change, transport
+    /// failure -- therefore clears this too, with no new invalidation points to keep in step.
+    bodies: KVec<KVec<u8>>,
+    /// Everything other than the strip's own pixels that its encoded bytes depend on.
+    ///
+    /// The hash covers the raw framebuffer, so a change that alters the ENCODED output without
+    /// altering the source pixels would otherwise serve a stale body. Gamma is exactly that: a new
+    /// LUT re-maps every pixel on the way into the codec while leaving the framebuffer identical,
+    /// and although a gamma change owes a keyframe, a keyframe re-selects every strip rather than
+    /// invalidating anything, so the reuse test would still hit. Rotation is the same hazard, and
+    /// is handled by only ever caching under identity rotation.
+    tag: u64,
 }
 
 /// The DRM driver marker type.
@@ -5347,6 +5374,16 @@ fn encode_and_send_wht(
     // Parallel encode when this frame is vino's own snapshot under identity rotation. 98.4% of the
     // encode is independent per-strip work, so this is the whole lever; the serial path below stays
     // as the fallback for rotation, live-buffer frames and frames too small to be worth splitting.
+    // What the encoded bytes depend on besides the strip pixels themselves; see
+    // `StripHashState::tag`. Identity rotation is a precondition of caching at all, so it needs no
+    // representation here.
+    let gamma_tag = match &gamma {
+        Some(t) => xxhash::xxh64(&t[..], 0x9e37_79b1_85eb_ca87),
+        None => 0,
+    };
+    // Strips carried over verbatim from the previous frame's encode, and the strips actually
+    // handed to the codec; kept for the post-send cache publish below.
+    let mut encoded: Option<(KVec<(usize, usize)>, KVec<KVec<u8>>)> = None;
     let parallel = match par_src.filter(|_| identity) {
         Some(src) => {
             let coords = if full {
@@ -5354,23 +5391,83 @@ fn encode_and_send_wht(
             } else {
                 super::video::wht::damage_strip_coords(w_pad, h_pad, &content_damage)?
             };
-            match parallel_strip_encode(src, &coords)? {
-                Some(strips) => {
+            // ★ Re-use the bytes for any selected strip whose content has not moved since it was
+            // last encoded (see `StripHashState::bodies`). Split the selection into hits and
+            // misses here, encode only the misses, and re-interleave in the original order --
+            // `frame_records` requires strips x-ordered within each Y band, so order is
+            // load-bearing and the merge below restores it exactly.
+            let tiles_x = w_pad / super::video::wht::STRIP_W;
+            let mut reuse: KVec<Option<KVec<u8>>> = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
+            let mut misses: KVec<(usize, usize)> = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
+            {
+                let cache = data.strip_hashes.lock();
+                let usable = cache[head_i].as_ref().filter(|c| {
+                    c.w_pad == w_pad && c.h_pad == h_pad && c.tag == gamma_tag
+                });
+                for &(sx, sy) in coords.iter() {
+                    let idx = (sy / super::video::wht::STRIP_H) * tiles_x
+                        + sx / super::video::wht::STRIP_W;
+                    let hit = usable.and_then(|c| {
+                        // Same pixels as when this body was produced, and a body was kept.
+                        let same = c.hashes.get(idx).zip(content_hashes.as_ref()?.get(idx));
+                        let body = c.bodies.get(idx)?;
+                        (same.is_some_and(|(a, b)| a == b) && !body.is_empty()).then_some(body)
+                    });
+                    match hit {
+                        Some(body) => {
+                            let mut copy: KVec<u8> = KVec::with_capacity(body.len(), GFP_KERNEL)?;
+                            copy.extend_from_slice(body, GFP_KERNEL)?;
+                            reuse.push(Some(copy), GFP_KERNEL)?;
+                        }
+                        None => {
+                            reuse.push(None, GFP_KERNEL)?;
+                            misses.push((sx, sy), GFP_KERNEL)?;
+                        }
+                    }
+                }
+            }
+            let fresh = match parallel_strip_encode(src, &misses)? {
+                Some(s) => Some(s),
+                // Too few misses to be worth splitting: encode them here rather than dropping to
+                // the whole-frame serial path, which would re-encode the cache hits as well.
+                None if !misses.is_empty() => Some(encode_coords(src, &misses)?),
+                None => Some(KVec::new()),
+            };
+            match fresh {
+                Some(fresh) if fresh.len() == misses.len() => {
+                    let mut strips: KVec<KVec<u8>> =
+                        KVec::with_capacity(coords.len(), GFP_KERNEL)?;
+                    let mut next = fresh.into_iter();
+                    let mut reused = 0usize;
+                    for slot in reuse {
+                        match slot {
+                            Some(body) => {
+                                reused += 1;
+                                strips.push(body, GFP_KERNEL)?;
+                            }
+                            None => strips.push(next.next().ok_or(EINVAL)?, GFP_KERNEL)?,
+                        }
+                    }
                     let n = ENCODE_LOG_PAR.fetch_add(1, Ordering::Relaxed) + 1;
                     if n <= 2 || n % 32 == 0 {
                         pr_info!(
-                            "vino: parallel encode head={head} strips={} chunks={}\n",
+                            "vino: parallel encode head={head} strips={} ({reused} reused, {} encoded) chunks={}\n",
                             coords.len(),
-                            (coords.len() / ENCODE_MIN_STRIPS_PER_CHUNK)
+                            misses.len(),
+                            (misses.len() / ENCODE_MIN_STRIPS_PER_CHUNK)
                                 .min(ENCODE_MAX_WORK_ITEMS)
                         );
                     }
-                    Some((
-                        super::video::wht::frame_records(&strips, head, band_parity_bit(), interlaced_bands())?,
-                        seq0.wrapping_add(1),
-                    ))
+                    let records = super::video::wht::frame_records(
+                        &strips,
+                        head,
+                        band_parity_bit(),
+                        interlaced_bands(),
+                    )?;
+                    encoded = Some((coords, strips));
+                    Some((records, seq0.wrapping_add(1)))
                 }
-                None => None,
+                _ => None,
             }
         }
         None => None,
@@ -5774,11 +5871,64 @@ fn encode_and_send_wht(
             }
         }
     }
-    data.strip_hashes.lock()[head_i] = content_hashes.map(|hashes| StripHashState {
-        w_pad,
-        h_pad,
-        hashes,
-    });
+    // Publish the content shadow, and with it the encoded body of every strip this frame carried,
+    // so the retransmissions `DAMAGE_REPEATS` owes can re-use the bytes instead of re-running the
+    // codec (see `StripHashState::bodies`). Bodies for strips this frame did NOT touch are carried
+    // forward from the previous state -- they are still what the dock holds, and a later debt pass
+    // may select them. Best-effort throughout: a failed allocation costs a cache miss, never a
+    // frame, so the hashes are published either way.
+    {
+        let mut state = data.strip_hashes.lock();
+        let carried = state[head_i]
+            .take()
+            .filter(|c| c.w_pad == w_pad && c.h_pad == h_pad && c.tag == gamma_tag)
+            .map(|c| (c.bodies, c.hashes));
+        state[head_i] = content_hashes.map(|hashes| {
+            let (mut bodies, old) = match carried {
+                Some((b, h)) => (b, Some(h)),
+                None => (KVec::new(), None),
+            };
+            // A carried body is only still valid if that strip's content has not moved since it
+            // was encoded. Every strip whose hash changes IS selected for this frame and so is
+            // overwritten below -- but do not rely on that invariant holding as the selection
+            // logic evolves: a body left paired with a newer hash would be served as a cache hit
+            // and paint stale pixels the dock would then keep, with nothing scheduled to repair
+            // it. Cheap to make airtight, and the failure it prevents is permanent corruption.
+            if let Some(old) = &old {
+                if old.len() == bodies.len() && old.len() == hashes.len() {
+                    for i in 0..bodies.len() {
+                        if old[i] != hashes[i] {
+                            bodies[i] = KVec::new();
+                        }
+                    }
+                }
+            }
+            if bodies.len() != hashes.len() {
+                bodies = KVec::new();
+                let _ = bodies.reserve(hashes.len(), GFP_KERNEL);
+                while bodies.len() < hashes.len() && bodies.push(KVec::new(), GFP_KERNEL).is_ok() {}
+            }
+            if bodies.len() == hashes.len() {
+                if let Some((coords, strips)) = encoded {
+                    let tiles_x = w_pad / super::video::wht::STRIP_W;
+                    for (&(sx, sy), body) in coords.iter().zip(strips) {
+                        let idx = (sy / super::video::wht::STRIP_H) * tiles_x
+                            + sx / super::video::wht::STRIP_W;
+                        if let Some(slot) = bodies.get_mut(idx) {
+                            *slot = body;
+                        }
+                    }
+                }
+            }
+            StripHashState {
+                w_pad,
+                h_pad,
+                hashes,
+                bodies,
+                tag: gamma_tag,
+            }
+        });
+    }
     // A full keyframe was accepted -- this head may now send damage deltas until the next mode-set.
     if full {
         data.keyframe_pending
