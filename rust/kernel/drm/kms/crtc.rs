@@ -856,6 +856,12 @@ pub trait RawCrtcState: AsRawCrtcState {
         unsafe { (*self.as_raw()).active }
     }
 
+    /// Returns whether the mode or enable state changed in this atomic state.
+    fn mode_changed(&self) -> bool {
+        // SAFETY: The atomic-state API serializes access to this state, including its bitfields.
+        unsafe { (*self.as_raw()).mode_changed() }
+    }
+
     /// Return the display mode programmed into this CRTC state.
     fn mode(&self) -> &DisplayMode {
         // SAFETY: `mode` is embedded in the CRTC state and therefore has the same lifetime. The
