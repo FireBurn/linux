@@ -267,6 +267,14 @@ const PROMPT_CLOSE_2E_MS: i64 = 125;
 const PROMPT_KEEPALIVE_QUIESCE_MS: i64 = 40;
 const PROMPT_TRAINING_OPEN_MS: i64 = 0;
 const PROMPT_TRAINING_TAIL_MS: i64 = 400;
+/// How long [`VinoDrmData::blank_head`] keeps presenting black when a CRTC is disabled.
+///
+/// It only has to outlast the dock's buffer rotation, which `DAMAGE_REPEATS` puts at three
+/// presentations; a black frame is ~200 KB and presents in a couple of milliseconds, so this is
+/// generous by an order of magnitude and still finishes well inside a DPMS transition. It is not a
+/// training window -- nothing downstream needs settling -- so it does not reuse
+/// [`PROMPT_TRAINING_TAIL_MS`].
+const BLANK_PRESENT_MS: i64 = 120;
 /// Absolute millisecond offsets from the **head-0** mode-set for the dual-head cold wake, decoded
 /// from `captures/dlm-coldplug-withmon-160457` — the only capture in the corpus that provably
 /// lights *both* panels of this dock from a physical cold plug.
@@ -412,6 +420,24 @@ enum KmsCmd {
         head: u8,
         x: u16,
         y: u16,
+    },
+    /// The CRTC was disabled (DPMS off, output disable, session leave). Take the head's stream
+    /// down on the dock instead of just going quiet locally.
+    ///
+    /// **What this fixes:** `atomic_disable` used to update driver state only and send the dock
+    /// nothing at all. The dock therefore kept its downstream pixel clock running against the
+    /// framebuffer it happened to be holding, so blanking the session left the panel lit showing a
+    /// frozen desktop -- which is what "the monitors don't sleep when the laptop panel does" is.
+    ///
+    /// **What it does NOT do yet.** This drives the head to black and closes DLM's stream bracket;
+    /// it does not put the downstream DP link into power-save, because the message that does that
+    /// is not RE'd yet. The whole decrypted corpus contains only four OUT message types across a
+    /// DLM output toggle (`0x14/0x0c`, `0x16/0x75`, `0x16/0x2e`, `0x16/0x2f`) and the `0x2e`/`0x2f`
+    /// off23 sequence a toggle produces is byte-identical to the one an ordinary mode-set bracket
+    /// produces, so the corpus cannot separate them. One DLM blank captured with
+    /// `vino-re/frida/decode-modeset-live.py` closes it.
+    Blank {
+        head: u8,
     },
 }
 
@@ -1133,6 +1159,42 @@ impl VinoDrmData {
         let _ = self.send_cp(dev, 0x16, 0, |ctr| {
             super::cp::stream_marker(ctr, head, sub, st)
         });
+    }
+
+    /// Drive `head` to black on the dock, then close DLM's stream bracket for it.
+    ///
+    /// Runs on the command worker for [`KmsCmd::Blank`], i.e. after `atomic_disable` has already
+    /// zeroed this head's mode generation. That zero is what makes the write legal: every video
+    /// path gates on `modeset_requested == modeset_active == want`, and passing `want = 0` matches
+    /// exactly the disabled state and nothing else -- so a re-enable racing this blank flips both
+    /// atomics to a real key and the submit loop drops out with `ENODEV` instead of painting black
+    /// over the freshly enabled mode.
+    ///
+    /// The dock's stream itself is still configured (vino never told it otherwise), so the black
+    /// frames are an ordinary accepted write, not a write onto a torn-down pipe.
+    fn blank_head(&self, dev: &BoundInterface<'_>, head: u8) -> Result {
+        let head_i = head as usize;
+        let Some(timing) = self.last_timing.lock()[head_i] else {
+            // Never modeset, so there is nothing lit to blank.
+            return Ok(());
+        };
+        let w_pad = (timing.hactive as usize + super::video::wht::STRIP_W - 1)
+            & !(super::video::wht::STRIP_W - 1);
+        let h_pad = (timing.vactive as usize + super::video::wht::STRIP_H - 1)
+            & !(super::video::wht::STRIP_H - 1);
+        let frames = super::video::wht::black_frame_ep08(w_pad, h_pad, head)?;
+        // Present for long enough to reach every dock buffer. The dock is multi-buffered and a
+        // single presentation lands in one buffer only -- the same reason `DAMAGE_REPEATS` exists
+        // -- so a one-shot blank leaves the other buffer holding the frozen desktop and the panel
+        // alternates between black and stale content.
+        let sent = self.submit_prompt_training(dev, head, 0, &frames, BLANK_PRESENT_MS, false)?;
+        // Close the stream the way every DLM bracket ends. This is the only marker state the
+        // corpus proves for "done driving this head"; see `KmsCmd::Blank` for what is still
+        // unmeasured about a true downstream power-down.
+        self.stream_marker(dev, head, 0x2f, 0);
+        self.stream_marker(dev, head, 0x2e, 0);
+        pr_info!("vino: head {head} blanked on the dock ({sent} black presentation(s))\n");
+        Ok(())
     }
 
     /// Emit a run of DLM's `(2f, 2e)` marker pairs for one head, polling between pairs.
@@ -2430,7 +2492,12 @@ impl WorkItem for VinoDrmData {
             // a concurrent scanout frame there would interleave records on the wire and would have
             // its `video_q` slot double-opened. Cursor-only batches deliberately skip this: they
             // never touch video, and a mouse in motion produces a continuous stream of them.
-            let has_modeset = cmds.iter().any(|c| matches!(c, KmsCmd::ModeSet { .. }));
+            // `Blank` writes the head's video endpoint for the same reason `ModeSet` does, so it
+            // needs the same exclusion against the scanout workers -- otherwise a frame already in
+            // flight interleaves its records with the blanking frames on the wire.
+            let has_modeset = cmds
+                .iter()
+                .any(|c| matches!(c, KmsCmd::ModeSet { .. } | KmsCmd::Blank { .. }));
             if has_modeset {
                 data.cmd_busy.store(true, core::sync::atomic::Ordering::SeqCst);
                 data.wait_for_video_idle();
@@ -2573,6 +2640,7 @@ impl WorkItem for VinoDrmData {
                     KmsCmd::CursorMove { head, x, y } => {
                         data.send_cp(dev, 0x1a, 0, |ctr| super::cp::cursor_move(ctr, head, x, y))
                     }
+                    KmsCmd::Blank { head } => data.blank_head(dev, head),
                 };
                 if let Err(e) = res {
                     pr_info!("vino: async KMS command failed ({e:?})\n");
@@ -3100,6 +3168,12 @@ impl crtc::DriverCrtc for VinoCrtc {
         data.strip_hashes.lock()[head as usize] = None;
         data.dirty_ttl.lock()[head as usize] = None;
         pr_info!("vino: KMS CRTC disable -- head {head} display OFF (scanout stopped)\n");
+        // Stopping locally is not enough: the dock goes on scanning out whatever it last received,
+        // so a DPMS-off left the panel lit on a frozen desktop. Queue the dock-side take-down for
+        // the command worker -- this callback must not block on USB (see `KmsCmd`). It is queued
+        // last, after the mode generation has been zeroed, because `blank_head` keys its write on
+        // exactly that zero.
+        data.queue_cmd(dev, KmsCmd::Blank { head });
     }
 
     /// Arm the page-flip completion event to be sent by the next vblank tick, so userspace is paced
