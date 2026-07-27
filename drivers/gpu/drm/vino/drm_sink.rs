@@ -1405,7 +1405,21 @@ impl VinoDrmData {
         // Optional experiment: a candidate downstream power-down state, wrapped in its own
         // transaction the way every measured bracket wraps a state change. Off by default; see
         // `BLANK_MARKER_STATE` for the search space and for how to tell a hit from a miss.
-        let candidate = blank_marker_state();
+        // ⛔ Do NOT take the sink down for a head whose monitor has gone away.
+        //
+        // `atomic_disable` fires for both a DPMS-off and a monitor removal, and they need opposite
+        // treatment. Sending the power-down marker at a sink that is already gone is pointless, and
+        // -- far worse -- it sets `self_blanked`, which tells the presence watcher to ignore that
+        // head's silence from then on. A replug could then never be detected on that head at all.
+        // HW-observed on a physical unplug: `blank marker candidate 2e(1) sent` immediately after
+        // `monitor REMOVED at runtime`, after which nothing could bring the head back and the dock
+        // gave up and re-enumerated 13 s later, taking the *other* screen down with it.
+        let candidate = if self.head_present(head_i) {
+            blank_marker_state()
+        } else {
+            pr_info!("vino: head {head} blank skips the sink marker -- its monitor is already gone\n");
+            0
+        };
         if candidate != 0 {
             // From here the dock will stop answering this head's presence probe, exactly as it does
             // for a real unplug. Claim the silence before causing it.
