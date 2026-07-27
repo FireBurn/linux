@@ -976,7 +976,7 @@ impl WorkItem for BringUp {
                         }
                         dev_info!(cdev, "vino: head {h} sink re-engage requested via sysfs\n");
                         data.set_connected(drm_dev, h);
-                        data.reengage_head(dev, h as u8);
+                        data.reengage_head(drm_dev, dev, h as u8);
                         // The same downstream readiness wait a fresh bring-up uses, so a mode-set
                         // following the hotplug lands on a settled link rather than a
                         // mid-negotiation one. Bounded, and it drops out at once if the session is
@@ -1051,7 +1051,7 @@ impl WorkItem for BringUp {
                             // engage (`id=0x16 sub=0x23`) establishes, and without re-running it the
                             // dock accepts the replug's mode-set and every video byte while leaving
                             // the panel dark -- see `VinoDrmData::reengage_head`.
-                            data.reengage_head(dev, h as u8);
+                            data.reengage_head(drm_dev, dev, h as u8);
                             // Same downstream readiness wait as a fresh bring-up before notifying
                             // userspace, so KWin's mode-set lands on a settled downstream link.
                             let rs = Instant::<Monotonic>::now();

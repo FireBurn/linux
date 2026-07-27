@@ -2085,13 +2085,21 @@ impl VinoDrmData {
     /// replug recovered only because full bring-up re-runs the engage.
     ///
     /// So repeat bring-up's per-head sequence -- probe, kick, fetch, engage, post-EDID query -- at
-    /// bring-up's measured spacing. Every message is fire-and-forget: the dock's CP reply to each is
-    /// a contentless generic ack, so there is nothing to wait for here (that property is exactly what
-    /// hid the off23 bug for a month). Errors are ignored; a dropped message just leaves the head
-    /// dark as before, and the next presence cycle tries again.
-    pub(super) fn reengage_head(&self, dev: &BoundInterface<'_>, head: u8) {
+    /// bring-up's measured spacing. The control messages are fire-and-forget: the dock's CP reply to
+    /// each is a contentless generic ack, so there is nothing to wait for (that property is exactly
+    /// what hid the off23 bug for a month). Errors are ignored; a dropped message just leaves the
+    /// head dark as before, and the next presence cycle tries again.
+    ///
+    /// **The EDID is not optional, though (fixed 2026-07-27).** `set_disconnected` clears the
+    /// cached blob -- it has to, or a head that lost its monitor keeps advertising a phantom output
+    /// from stale modes -- so a re-engage that only re-enables the sink brings the head back with
+    /// *no* EDID. First HW run of this function did exactly that: DP-2 returned as a new connector
+    /// (fresh UUID, so KWin treated it as a different display) advertising the synthesised
+    /// `1920x1440@60` fallback instead of its native `2560x1440@120`. The fetch is already being
+    /// sent; what was missing is reading the answer back, so drain for it and re-cache.
+    pub(super) fn reengage_head(&self, dev: &VinoDrmDevice, io: &BoundInterface<'_>, head: u8) {
         let step = |id: u16, build: &dyn Fn(u16) -> Result<KVec<u8>>, gap_ms: i64| {
-            let _ = self.send_cp(dev, id, 0, |ctr| build(ctr));
+            let _ = self.send_cp(io, id, 0, |ctr| build(ctr));
             fsleep(Delta::from_millis(gap_ms));
         };
         step(0x15, &|c| super::cp::get_edid_req_sub(c, 0x0020, head), 117);
@@ -2101,6 +2109,48 @@ impl VinoDrmData {
         step(0x16, &|c| super::cp::edid_engage_req(c, head), 118);
         step(0x16, &|c| super::cp::edid_engage_req(c, head), 107);
         step(0x15, &|c| super::cp::post_edid_query(c, head), 11);
+        match self.drain_for_edid(io, head) {
+            Some(blob) => {
+                let n = blob.len();
+                self.set_edid(dev, head as usize, blob);
+                pr_info!("vino: head {head} EDID re-cached after re-engage ({n} bytes)\n");
+            }
+            None => pr_warn!(
+                "vino: head {head} re-engaged but no EDID came back -- it will come up on \
+                 fallback modes\n"
+            ),
+        }
+    }
+
+    /// Drain EP84 looking for the `id=0x194` EDID the fetch above asks for, and return it.
+    ///
+    /// The real EDID only ever arrives as that push (never inside `id=0x4c`/`0x78`), and it can
+    /// land a few messages after the fetch, so this reads a bounded run of replies rather than just
+    /// the next one. Bounded twice over -- attempt count and per-read timeout -- because it runs on
+    /// the keepalive, which must not stall.
+    fn drain_for_edid(&self, dev: &BoundInterface<'_>, head: u8) -> Option<KVec<u8>> {
+        let _ = head;
+        let mut guard = self.cp_link.lock();
+        let link = (&mut *guard).as_mut()?;
+        let mut reply = KVec::from_elem(0u8, 4096, GFP_KERNEL).ok()?;
+        for _ in 0..24 {
+            let got = match link.ep84_q.as_mut() {
+                Some(q) => match q.recv(dev.io(), &mut reply, Delta::from_millis(8)) {
+                    Ok(Some(n)) if n > 16 => n,
+                    _ => continue,
+                },
+                None => match dev.ctrl_recv(&mut reply, Delta::from_millis(8), GFP_KERNEL) {
+                    Ok(n) if n > 16 => n,
+                    _ => continue,
+                },
+            };
+            if let Ok(Some(blob)) =
+                super::cp::parse_edid_from_reply(&link.ks, &link.riv, &reply[..got])
+            {
+                return Some(blob);
+            }
+        }
+        None
     }
 
     /// Stage 2 (runtime monitor hotplug): probe whether head `head` currently has a monitor.
