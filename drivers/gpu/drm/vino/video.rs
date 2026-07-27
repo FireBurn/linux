@@ -1516,7 +1516,17 @@ pub(crate) mod wht {
             let mut record: KVec<u8> = KVec::new();
             record.extend_from_slice(&[0u8; 8 + PREFIX], GFP_KERNEL)?; // TLV(8) + prefix(8)
             record[4..8].copy_from_slice(&4u32.to_le_bytes()); // type = 4
-            let sub = head as u16 | (((y0 / STRIP_H as u16) & 1) << 4);
+            // Bit 4 on odd 16-row bands. DLM's steady-state frames do this, but its frame 0 and
+            // its field-ordered frames (all even bands, then all odd) leave it clear on every
+            // record -- see docs/WHT-CODEC.md. Kept as the `record_sub_bit4` module parameter so
+            // that divergence can be A/B'd against the hardware in one reload; the default is the
+            // long-standing behaviour, so this changes nothing unless it is asked to.
+            let parity = if *crate::module_parameters::record_sub_bit4.value() != 0 {
+                (y0 / STRIP_H as u16) & 1
+            } else {
+                0
+            };
+            let sub = head as u16 | (parity << 4);
             record[8..10].copy_from_slice(&sub.to_le_bytes());
             let mut n = 0usize;
             while i < strips.len() && strip_y(&strips[i]) == y0 {
