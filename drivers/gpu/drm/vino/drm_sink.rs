@@ -2075,19 +2075,26 @@ impl VinoDrmData {
                 _ => return None,
             },
         };
-        let (id, sub, _ctr) = super::cp::decode_in_lenient(&link.ks, &link.riv, &reply[..got])?;
+        // Read the reply's downstream STATUS, not just its header. The probe used to ask only
+        // whether the inner id was an EDID-handler id -- a one-bit view of a message that carries
+        // the dock's actual per-head state at inner 22..26 (see `cp::probe_reply_status`). That is
+        // why this watcher has never once reported a transition in a whole boot: the evidence was
+        // decrypted and then discarded, three bytes before the part that matters.
+        let (id, status, ready) =
+            super::cp::probe_reply_status(&link.ks, &link.riv, &reply[..got])?;
+        // A head with no monitor cannot be routed to an EDID handler, so the dock answers the
+        // generic `id=0x14` rather than the rich `id=0x44` -- the same substitution it makes for a
+        // wrong head selector, which is how the EDID head-selector bug was found. Keep that as the
+        // primary discriminator and let the status word refine it.
         let present = matches!(id, 0x44 | 0x194 | 0x78);
-        // ★ Report what the dock actually answered, once per changed answer per head.
-        //
-        // This probe has never once reported a transition in a whole boot, and with no logging
-        // there were two indistinguishable explanations: the dock answers `0x44` whether or not a
-        // monitor is attached (so the discriminator is wrong), or it stops answering at all (so
-        // every cycle takes the `None` path in the caller and is read as "no change"). Those need
-        // opposite fixes. One unplug with this in place separates them.
-        let prev = self.presence_reply[head as usize].swap(id as u32, Ordering::Relaxed);
-        if prev != id as u32 {
+        // One line per *changed* answer per head, so a steady link is silent and an unplug is
+        // unmissable. Both fields are packed into the same cell: the id alone cannot distinguish a
+        // dock that keeps saying `0x44` from one whose downstream state has moved underneath it.
+        let cell = ((id as u32) << 16) | (status & 0xffff);
+        let prev = self.presence_reply[head as usize].swap(cell, Ordering::Relaxed);
+        if prev != cell {
             pr_info!(
-                "vino: head {head} presence probe reply id=0x{id:x} sub=0x{sub:x} -> present={present} (was id=0x{prev:x})\n"
+                "vino: head {head} presence probe reply id=0x{id:x} status=0x{status:08x} ready={ready} -> present={present} (was 0x{prev:08x})\n"
             );
         }
         Some(present)

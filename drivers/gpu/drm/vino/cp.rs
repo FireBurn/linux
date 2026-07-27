@@ -1611,6 +1611,64 @@ pub(super) fn parse_edid_from_reply(
     }
     Ok(None)
 }
+/// Decode a probe reply far enough to report **what the dock said about this head**, not merely
+/// that it said something.
+///
+/// [`decode_in_lenient`] stops at the header, and the runtime presence watcher was built on that:
+/// it asked only whether the inner id was one of the EDID-handler ids. That is a one-bit view of a
+/// reply that carries real downstream state. [`edid_poll_ready`] already documents where it lives:
+/// inner bytes 22..26 are a status code that toggles between `0x6101` (idle / no attempt yet) and
+/// `0x2711` (actively negotiating) with session phase, and `inner[26] & 0x80` is the EDID-ready
+/// bit. A head that has lost its monitor must move somewhere in that space, and nothing in the
+/// driver was in a position to see it.
+///
+/// Returns `(id, status, ready)` for any decryptable reply -- `status` is the LE u32 at inner
+/// 22..26, `ready` the readiness bit -- or `None` if the frame does not decrypt at all, which the
+/// caller must keep distinguishable from "decrypted, and here is what it says".
+pub(super) fn probe_reply_status(
+    ks: &[u8; 16],
+    out_riv: &[u8; 8],
+    wire: &[u8],
+) -> Option<(u16, u32, bool)> {
+    if wire.len() <= 16 || u16::from_le_bytes([wire[8], wire[9]]) != 0x45 {
+        return None;
+    }
+    let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
+    let body = &wire[16..];
+    let raw = in_riv(out_riv);
+    let mut flipped = raw;
+    flipped[7] ^= 0x01;
+    for base in [raw, flipped] {
+        for h in 0..2u8 {
+            let mut riv = base;
+            if h == 1 {
+                riv[0] ^= 0x80;
+            }
+            let Ok(inner) = open_in(ks, &riv, seq, body) else {
+                continue;
+            };
+            if inner.len() < 8 {
+                continue;
+            }
+            let id = u16::from_le_bytes([inner[0], inner[1]]);
+            let pad = u16::from_le_bytes([inner[6], inner[7]]);
+            if id >= 0x400 || pad != 0 {
+                continue;
+            }
+            // A short generic ack (the `id=0x14` the dock sends when it cannot route the probe)
+            // carries no status region at all; report zeros rather than refusing to decode, so the
+            // caller still learns the id.
+            let status = if inner.len() >= 26 {
+                u32::from_le_bytes([inner[22], inner[23], inner[24], inner[25]])
+            } else {
+                0
+            };
+            let ready = inner.len() >= 27 && inner[26] & 0x80 != 0;
+            return Some((id, status, ready));
+        }
+    }
+    None
+}
 /// Decode an `id=0x0044 sub=0x0020` EDID-readiness probe reply (dock's answer to
 /// [`get_edid_req_sub`]'s `sub=0x20`) and report whether the dock's downstream DDC/EDID read has
 /// actually finished. **Found 2026-07-17 (2nd pass)**, superseding [`edid_poll_progress`]'s
