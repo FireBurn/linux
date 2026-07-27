@@ -4540,6 +4540,9 @@ fn snapshot_to_shadow(
     let tiles_x = w_pad / sw;
     let tiles_y = h_pad / sh;
 
+    // A freshly allocated surface holds zeros, not the previous frame, so nothing in it may be
+    // treated as already up to date however its stored hashes compare.
+    let mut fresh = false;
     if !matches!(slot, Some(s) if s.w == w && s.h == h) {
         let mut pixels: KVVec<u8> = KVVec::new();
         pixels.resize(need, 0, GFP_KERNEL)?;
@@ -4551,6 +4554,7 @@ fn snapshot_to_shadow(
             pixels,
             hashes,
         });
+        fresh = true;
     }
     let shadow = slot.as_mut().ok_or(kernel::error::code::ENOMEM)?;
     if shadow.hashes.len() != tiles_x * tiles_y {
@@ -4569,35 +4573,61 @@ fn snapshot_to_shadow(
     // bound and parallelises across the encoder's workqueue exactly as the strip encode did, whereas
     // a slow *hash* would not have been fixed by folding it in here at all. Two `ktime` reads per
     // band (~90 at 1440p) cost well under 10 us against the 14.7 MB being timed.
-    let mut copy_ns: i64 = 0;
-    let mut hash_ns: i64 = 0;
+    let mut copied = 0usize;
     for ty in 0..tiles_y {
         let sy = ty * sh;
         let y_end = (sy + sh).min(h);
-        let t_copy = Instant::<Monotonic>::now();
-        for y in sy..y_end {
-            // SAFETY: `y < h` and the XRGB8888 pitch covers every visible pixel of the validated
-            // mapping, so this row lies inside the mapped framebuffer (`pitch * h` bytes).
-            let s = unsafe { core::slice::from_raw_parts(src.add(y * pitch), row) };
-            shadow.pixels[y * row..y * row + row].copy_from_slice(s);
-        }
-        let t_hash = Instant::<Monotonic>::now();
-        copy_ns += (t_hash - t_copy).as_nanos();
         for tx in 0..tiles_x {
             let sx = tx * sw;
             let x_end = (sx + sw).min(w);
+            // ★ Hash from the SOURCE, then copy only what moved (2026-07-27).
+            //
+            // This used to copy the whole surface and then hash it out of the destination. That is
+            // 14.7 MB read plus 14.7 MB written at 1440p, per head, per frame period, on KWin's own
+            // atomic-commit thread -- measured at `copy 1153-4226us` against a 8.33 ms budget at
+            // 120 Hz. The read cannot be avoided (the hash needs every pixel), but the WRITE is
+            // almost entirely waste: a desktop changes a few percent of its strips per frame.
+            //
+            // The objection recorded here previously was that a partial copy needs "second hash
+            // bookkeeping that could drift out of step". It does not: each slot's `hashes` describe
+            // the pixels THAT SLOT currently holds, so a tile whose freshly computed source hash
+            // equals the stored one is already byte-identical in the slot and copying it is a no-op
+            // by definition. There is no second ledger -- the hash IS the ledger, and it is the
+            // same one the damage selector consumes.
+            //
+            // Hashing from the source is bit-identical to hashing the copy: the destination row is
+            // a verbatim copy of the source row and both are indexed at the same `sx..x_end`, so
+            // the same bytes are fed to `xxh64` in the same order with the same per-tile seed.
             let mut hash = 0x9e37_79b1_85eb_ca87u64
                 ^ (sx as u64).rotate_left(17)
                 ^ (sy as u64).rotate_left(43);
             if sx < x_end {
                 for y in sy..y_end {
-                    let off = y * row + sx * 4;
-                    hash = xxhash::xxh64(&shadow.pixels[off..off + (x_end - sx) * 4], hash);
+                    // SAFETY: `y < h` and `x_end <= w`, and the XRGB8888 pitch covers every visible
+                    // pixel of the validated mapping, so this span lies inside the mapped
+                    // framebuffer (`pitch * h` bytes).
+                    let s = unsafe {
+                        core::slice::from_raw_parts(src.add(y * pitch + sx * 4), (x_end - sx) * 4)
+                    };
+                    hash = xxhash::xxh64(s, hash);
                 }
             }
-            shadow.hashes[ty * tiles_x + tx] = hash;
+            let idx = ty * tiles_x + tx;
+            if (fresh || shadow.hashes[idx] != hash) && sx < x_end {
+                copied += 1;
+                shadow.hashes[idx] = hash;
+                let n = (x_end - sx) * 4;
+                for y in sy..y_end {
+                    let off = y * row + sx * 4;
+                    // SAFETY: as above -- the source span is inside the mapped framebuffer, and
+                    // `off + n <= row * h == need`, the destination allocation's length.
+                    let s = unsafe { core::slice::from_raw_parts(src.add(y * pitch + sx * 4), n) };
+                    shadow.pixels[off..off + n].copy_from_slice(s);
+                }
+            } else {
+                shadow.hashes[idx] = hash;
+            }
         }
-        hash_ns += (Instant::<Monotonic>::now() - t_hash).as_nanos();
     }
     // The fold moves hashing OFF the scanout worker (which gates frame rate) and ONTO the atomic
     // commit path, so the cost here has to be watched: this path must stay bounded, and it is the
@@ -4605,12 +4635,16 @@ fn snapshot_to_shadow(
     let n = SNAPSHOT_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     if n <= 2 || n % 64 == 0 {
         pr_info!(
-            "vino: snapshot+hash {}x{} took {}us (copy {}us hash {}us, n={n})\n",
+            // The copy/hash split this used to report needed a timestamp pair per band; with the
+            // copy now decided per TILE that would be 7200 `ktime` reads per snapshot, which costs
+            // more than the thing being measured. The tile count is the better signal anyway --
+            // it says directly how much of the surface was written, which is the quantity the
+            // partial copy exists to reduce.
+            "vino: snapshot+hash {}x{} took {}us ({copied}/{} tiles copied, n={n})\n",
             w,
             h,
             (Instant::<Monotonic>::now() - t0).as_micros_ceil(),
-            copy_ns / 1000,
-            hash_ns / 1000
+            tiles_x * tiles_y
         );
     }
     Ok(())
