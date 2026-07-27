@@ -209,9 +209,14 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
     /// Create a new `UnregisteredDevice` for a `drm::Driver`.
     ///
     /// This can be used to create a [`Registration`](kernel::drm::Registration).
+    ///
+    /// `module` must be the module that owns the driver implementation, i.e. `&THIS_MODULE`. It is
+    /// stamped into this device's `file_operations::owner` so that an open `/dev/dri/cardN` file
+    /// descriptor pins the module, exactly as `DEFINE_DRM_GEM_*_FOPS()` does in C.
     pub fn new(
         dev: &T::ParentDevice<device::Bound>,
         data: impl PinInit<T::Data, Error>,
+        module: &'static ThisModule,
     ) -> Result<Self> {
         // `__drm_dev_alloc` uses `kmalloc()` to allocate memory, hence ensure a `kmalloc()`
         // compatible `Layout`.
@@ -254,8 +259,37 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
             unsafe { bindings::drm_dev_put(drm_dev) };
         })?;
 
-        // SAFETY: `drm_dev` is still private to this function.
-        unsafe { (*drm_dev).driver = const { &Self::VTABLE } };
+        // Give this device its own `file_operations`/`drm_driver` pair so that the owning module
+        // can be stamped into the fops. `fops->owner` is what makes `fops_get()` in
+        // `drm_stub_open()` take a module reference for every open DRM file: without it nothing
+        // pins the module, and unloading the driver while a compositor still has
+        // `/dev/dri/cardN` in a poll set frees the `file_operations` out from under
+        // `do_sys_poll()`, which then faults on `f_op->poll`.
+        //
+        // SAFETY: `raw_drm` is a valid pointer to `Self`, still private to this function, and
+        // both fields are plain data that need no drop.
+        let raw_fops = unsafe { Opaque::cast_into(ptr::addr_of!((*raw_drm.as_ptr()).fops)) };
+        // SAFETY: `raw_fops` is valid, aligned and points at uninitialized memory we own.
+        unsafe {
+            raw_fops.write(bindings::file_operations {
+                owner: module.as_ptr(),
+                ..Self::GEM_FOPS
+            })
+        };
+
+        // SAFETY: as above, for the per-device `drm_driver` copy.
+        let raw_vtable = unsafe { Opaque::cast_into(ptr::addr_of!((*raw_drm.as_ptr()).vtable)) };
+        // SAFETY: `raw_vtable` is valid, aligned and points at uninitialized memory we own.
+        unsafe {
+            raw_vtable.write(bindings::drm_driver {
+                fops: raw_fops,
+                ..Self::VTABLE
+            })
+        };
+
+        // SAFETY: `drm_dev` is still private to this function; `raw_vtable` lives inside the DRM
+        // device allocation and so outlives every use of `drm_device::driver`.
+        unsafe { (*drm_dev).driver = raw_vtable };
 
         // SAFETY: `raw_drm` is valid; no concurrent access before registration.
         unsafe { (*raw_drm.as_ptr()).registration_data = UnsafeCell::new(NonNull::dangling()) };
@@ -278,12 +312,20 @@ impl<T: drm::Driver> UnregisteredDevice<T> {
 ///
 /// * `self.dev` is a valid instance of a `struct device`.
 /// * The data layout of `Self` remains the same across all implementations of `C`.
+/// * `self.vtable` and `self.fops` are initialized before the device is registered and are never
+///   mutated afterwards; `self.dev.driver` points at `self.vtable`, whose `fops` points at
+///   `self.fops`.
 /// * Any invariants for `C` also apply.
 #[repr(C)]
 pub struct Device<T: drm::Driver, C: DeviceContext = Normal> {
     dev: Opaque<bindings::drm_device>,
     data: T::Data,
     pub(super) registration_data: UnsafeCell<NonNull<T::RegistrationData<'static>>>,
+    /// Per-device copy of the driver vtable, so that `fops` below can be referenced from it.
+    vtable: Opaque<bindings::drm_driver>,
+    /// Per-device copy of the DRM file operations, carrying the owning module in `owner` so that
+    /// an open DRM file descriptor pins the module.
+    fops: Opaque<bindings::file_operations>,
     _ctx: PhantomData<C>,
 }
 
