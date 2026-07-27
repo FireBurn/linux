@@ -283,6 +283,32 @@ pub(super) fn band_parity_bit() -> bool {
 }
 pub(super) fn set_band_parity_bit(on: bool) {
     BAND_PARITY_BIT.store(u32::from(on), Ordering::Relaxed);
+    FRAMING_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+/// Whether records are emitted as all-even-bands-then-all-odd (DLM's `ep0b_frame1` shape) rather
+/// than raster. The other half of the framing divergence, and invisible to a pixel decoder for the
+/// same reason: `colour_decode.py` places each strip by its own (x, y), so the image reconstructs
+/// identically whatever order the records arrive in. The dock consumes them as a stream.
+static INTERLACED_BANDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub(super) fn interlaced_bands() -> bool {
+    INTERLACED_BANDS.load(Ordering::Relaxed) != 0
+}
+pub(super) fn set_interlaced_bands(on: bool) {
+    INTERLACED_BANDS.store(u32::from(on), Ordering::Relaxed);
+    FRAMING_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+/// Bumped whenever a framing knob changes, so the scanout path can force a keyframe.
+///
+/// Without this a flip only reaches the strips that happen to change next, and the panel shows a
+/// mixture of both framings -- which is useless for an A/B whose only oracle is a person looking at
+/// it. Comparing against a per-head copy makes the very next frame a full one.
+static FRAMING_GENERATION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+pub(super) fn framing_generation() -> u32 {
+    FRAMING_GENERATION.load(Ordering::Acquire)
 }
 
 /// Take `head`'s downstream sink down the way a real unplug does, WITHOUT claiming the silence.
@@ -992,6 +1018,9 @@ pub(super) struct VinoDrmData {
     /// Last inner message id each head's presence probe decoded, so a *changed* answer is logged
     /// and a steady one is silent. See [`VinoDrmData::probe_head_present`].
     presence_reply: [core::sync::atomic::AtomicU32; HEADS],
+    /// Framing generation each head has already emitted a keyframe for. See
+    /// [`framing_generation`].
+    framing_seen: [core::sync::atomic::AtomicU32; HEADS],
     /// Head currently expecting an EDID from a re-engage, or [`NO_EDID_TARGET`].
     ///
     /// The EDID arrives as an `id=0x194` push, and during a re-engage it lands in `send_cp`'s
@@ -1071,6 +1100,7 @@ impl VinoDrmData {
             push_seen <- new_mutex!([const { None::<u32> }; PUSH_KINDS]),
             push_count: core::sync::atomic::AtomicU64::new(0),
             presence_reply: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
+            framing_seen: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
             edid_target: core::sync::atomic::AtomicU32::new(NO_EDID_TARGET),
             edid_caught <- new_mutex!(None),
             self_blanked: core::sync::atomic::AtomicU32::new(0),
@@ -1391,7 +1421,7 @@ impl VinoDrmData {
             & !(super::video::wht::STRIP_W - 1);
         let h_pad = (timing.vactive as usize + super::video::wht::STRIP_H - 1)
             & !(super::video::wht::STRIP_H - 1);
-        let frames = super::video::wht::black_frame_ep08(w_pad, h_pad, head, band_parity_bit())?;
+        let frames = super::video::wht::black_frame_ep08(w_pad, h_pad, head, band_parity_bit(), interlaced_bands())?;
         // Present for long enough to reach every dock buffer. The dock is multi-buffered and a
         // single presentation lands in one buffer only -- the same reason `DAMAGE_REPEATS` exists
         // -- so a one-shot blank leaves the other buffer holding the frozen desktop and the panel
@@ -1784,7 +1814,7 @@ impl VinoDrmData {
                 & !(super::video::wht::STRIP_W - 1);
             let h_pad = (timing.vactive as usize + super::video::wht::STRIP_H - 1)
                 & !(super::video::wht::STRIP_H - 1);
-            prompts[head] = super::video::wht::black_frame_ep08(w_pad, h_pad, head as u8, band_parity_bit()).ok();
+            prompts[head] = super::video::wht::black_frame_ep08(w_pad, h_pad, head as u8, band_parity_bit(), interlaced_bands()).ok();
             keys[head] = key;
             valid |= 1u32 << head;
         }
@@ -2264,7 +2294,14 @@ impl VinoDrmData {
     /// (fresh UUID, so KWin treated it as a different display) advertising the synthesised
     /// `1920x1440@60` fallback instead of its native `2560x1440@120`. The fetch is already being
     /// sent; what was missing is reading the answer back, so drain for it and re-cache.
-    pub(super) fn reengage_head(&self, dev: &VinoDrmDevice, io: &BoundInterface<'_>, head: u8) {
+    /// Returns whether a valid EDID came back, which is the strongest presence signal there is --
+    /// see the caller in `vino.rs` for why the probe's id is not.
+    pub(super) fn reengage_head(
+        &self,
+        dev: &VinoDrmDevice,
+        io: &BoundInterface<'_>,
+        head: u8,
+    ) -> bool {
         self.set_self_blanked(head as usize, false);
         let step = |id: u16, build: &dyn Fn(u16) -> Result<KVec<u8>>, gap_ms: i64| {
             let _ = self.send_cp(io, id, 0, |ctr| build(ctr));
@@ -2286,11 +2323,15 @@ impl VinoDrmData {
                 let n = blob.len();
                 self.set_edid(dev, head as usize, blob);
                 pr_info!("vino: head {head} EDID re-cached after re-engage ({n} bytes)\n");
+                true
             }
-            None => pr_warn!(
-                "vino: head {head} re-engaged but no EDID came back -- it will come up on \
-                 fallback modes\n"
-            ),
+            None => {
+                pr_warn!(
+                    "vino: head {head} re-engaged but no EDID came back -- no monitor, or it is \
+                     not ready yet\n"
+                );
+                false
+            }
         }
     }
 
@@ -2942,7 +2983,7 @@ impl WorkItem for VinoDrmData {
                                 - 1)
                                 & !(super::video::wht::STRIP_H - 1);
                             let prompt =
-                                super::video::wht::black_frame_ep08(w_pad, h_pad, head, band_parity_bit()).ok();
+                                super::video::wht::black_frame_ep08(w_pad, h_pad, head, band_parity_bit(), interlaced_bands()).ok();
                             if prompt.is_none() {
                                 pr_info!(
                                     "vino: prompt head={} black-frame preparation failed; continuing with real keyframe\n",
@@ -4927,7 +4968,7 @@ fn encode_and_send_wht(
                     & !(super::video::wht::STRIP_W - 1);
                 let h_pad = (h + super::video::wht::STRIP_H - 1)
                     & !(super::video::wht::STRIP_H - 1);
-                let prompt = super::video::wht::black_frame_ep08(w_pad, h_pad, head, band_parity_bit()).ok();
+                let prompt = super::video::wht::black_frame_ep08(w_pad, h_pad, head, band_parity_bit(), interlaced_bands()).ok();
                 data.begin_cp_timeline();
                 if !wake {
                     data.modeset_bracket_pre(dev, head);
@@ -5020,7 +5061,14 @@ fn encode_and_send_wht(
         != 0;
     // `TEST_FORCE_FULL_FRAMES`: never send a damage delta, so the dock always receives a complete
     // frame rather than a partial update onto content it may never have displayed.
-    let mut full = owes_keyframe || !identity || TEST_FORCE_FULL_FRAMES;
+    // A framing knob moved: the whole surface has to go out under the new framing, or the panel
+    // shows a mixture of both and the A/B says nothing. See `framing_generation`.
+    let framing = framing_generation();
+    let framing_changed = data.framing_seen[head_i].swap(framing, Ordering::AcqRel) != framing;
+    if framing_changed {
+        pr_info!("vino: head {head} framing changed -- forcing a keyframe under the new shape\n");
+    }
+    let mut full = owes_keyframe || !identity || framing_changed || TEST_FORCE_FULL_FRAMES;
     // Non-64x16-aligned modes (e.g. 1920x1080, 1080%16=8) are padded up to the next strip multiple
     // and encoded as full bands -- exactly DLM's shape (1080p pcap = 68 bands = 1088 rows for a 1080p
     // mode-set). The mode-set carries the real w/h, so the dock displays only that and ignores the
@@ -5137,7 +5185,7 @@ fn encode_and_send_wht(
                         );
                     }
                     Some((
-                        super::video::wht::frame_records(&strips, head, band_parity_bit())?,
+                        super::video::wht::frame_records(&strips, head, band_parity_bit(), interlaced_bands())?,
                         seq0.wrapping_add(1),
                     ))
                 }
@@ -5149,7 +5197,15 @@ fn encode_and_send_wht(
     let (frames, next_seq) = match parallel {
         Some(r) => r,
         None if full => {
-            super::video::wht::colour_frame_ep08(w_pad, h_pad, seq0, head, band_parity_bit(), px)?
+            super::video::wht::colour_frame_ep08(
+                w_pad,
+                h_pad,
+                seq0,
+                head,
+                band_parity_bit(),
+                interlaced_bands(),
+                px,
+            )?
         }
         None => super::video::wht::colour_frame_ep08_damage(
             w_pad,
@@ -5158,6 +5214,7 @@ fn encode_and_send_wht(
             head,
             &content_damage,
             band_parity_bit(),
+            interlaced_bands(),
             px,
         )?,
     };

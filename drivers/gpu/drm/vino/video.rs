@@ -997,6 +997,7 @@ pub(crate) mod wht {
         seq0: u32,
         head: u8,
         band_parity: bool,
+        interlaced: bool,
         mut px: impl FnMut(usize, usize) -> (u8, u8, u8),
     ) -> Result<(KVec<KVec<u8>>, u32)> {
         if width % STRIP_W != 0 || height % STRIP_H != 0 {
@@ -1014,7 +1015,7 @@ pub(crate) mod wht {
             }
             sy += STRIP_H;
         }
-        Ok((frame_records(&strips, head, band_parity)?, seq0.wrapping_add(1)))
+        Ok((frame_records(&strips, head, band_parity, interlaced)?, seq0.wrapping_add(1)))
     }
 
     /// Build a valid all-black WHT frame without sampling or transforming a framebuffer.
@@ -1033,6 +1034,7 @@ pub(crate) mod wht {
         height: usize,
         head: u8,
         band_parity: bool,
+        interlaced: bool,
     ) -> Result<KVec<KVec<u8>>> {
         if width % STRIP_W != 0 || height % STRIP_H != 0 {
             return Err(kernel::error::code::EINVAL);
@@ -1061,7 +1063,7 @@ pub(crate) mod wht {
             }
             sy += STRIP_H;
         }
-        frame_records(&strips, head, band_parity)
+        frame_records(&strips, head, band_parity, interlaced)
     }
 
     /// Encode ONE 64x16 strip whose top-left output pixel is `(sx, sy)`.
@@ -1156,6 +1158,7 @@ pub(crate) mod wht {
         head: u8,
         clips: &[(usize, usize, usize, usize)],
         band_parity: bool,
+        interlaced: bool,
         mut px: impl FnMut(usize, usize) -> (u8, u8, u8),
     ) -> Result<(KVec<KVec<u8>>, u32)> {
         if width % STRIP_W != 0 || height % STRIP_H != 0 {
@@ -1174,7 +1177,7 @@ pub(crate) mod wht {
             packs_us += (t2 - t1).as_micros_ceil();
         }
         let t3 = Instant::<Monotonic>::now();
-        let records = frame_records(&strips, head, band_parity)?;
+        let records = frame_records(&strips, head, band_parity, interlaced)?;
         // ★ Is the encode cost in the per-strip work (which parallelises across CPUs, since strips
         // are independent) or in the serial framing? This split is what decides whether threading
         // is the right lever -- see the phase log in `drm_sink.rs`.
@@ -1223,6 +1226,7 @@ pub(crate) mod wht {
         strips: &[KVec<u8>],
         head: u8,
         band_parity_bit: bool,
+        interlaced_bands: bool,
     ) -> Result<KVec<KVec<u8>>> {
         const PREFIX: usize = 8;
         const STRIDE_CAP: usize = 0x0ff0;
@@ -1232,9 +1236,32 @@ pub(crate) mod wht {
         const CHUNK: usize = 0x4000;
         let mut frames: KVec<KVec<u8>> = KVec::new();
         let mut chunk: KVec<u8> = KVec::new();
+        // ★ Band ORDER is the other half of the framing divergence from DLM, and like `sub` bit 4
+        // it is invisible to any pixel decoder -- `colour_decode.py` places each strip by its own
+        // (x, y), so the image reconstructs identically whatever order the records arrive in. The
+        // dock consumes them as a stream.
+        //
+        // DLM's `ep0b_frame1` sends **all even bands, then all odd** -- interlaced fields -- while
+        // its `ep08` steady-state frames are raster. vino has only ever emitted raster. Selecting
+        // between them is a permutation of the strip order; within a band, x order is preserved,
+        // which `frame_records` relies on.
+        let mut order: KVec<usize> = KVec::with_capacity(strips.len(), GFP_KERNEL)?;
+        if interlaced_bands {
+            for pass in 0..2u16 {
+                for (n, s) in strips.iter().enumerate() {
+                    if (strip_y(s) / STRIP_H as u16) & 1 == pass {
+                        order.push(n, GFP_KERNEL)?;
+                    }
+                }
+            }
+        } else {
+            for n in 0..strips.len() {
+                order.push(n, GFP_KERNEL)?;
+            }
+        }
         let mut i = 0usize;
-        while i < strips.len() {
-            let y0 = strip_y(&strips[i]);
+        while i < order.len() {
+            let y0 = strip_y(&strips[order[i]]);
             let mut record: KVec<u8> = KVec::new();
             record.extend_from_slice(&[0u8; 8 + PREFIX], GFP_KERNEL)?; // TLV(8) + prefix(8)
             record[4..8].copy_from_slice(&4u32.to_le_bytes()); // type = 4
@@ -1257,8 +1284,8 @@ pub(crate) mod wht {
             let sub = head as u16 | (parity << 4);
             record[8..10].copy_from_slice(&sub.to_le_bytes());
             let mut n = 0usize;
-            while i < strips.len() && strip_y(&strips[i]) == y0 {
-                let s = &strips[i];
+            while i < order.len() && strip_y(&strips[order[i]]) == y0 {
+                let s = &strips[order[i]];
                 let projected = record.len() + 2 + s.len();
                 let projected_aligned = (projected + 15) & !15;
                 if n > 0 && projected_aligned > STRIDE_CAP {

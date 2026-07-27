@@ -941,6 +941,16 @@ impl WorkItem for BringUp {
             /// within one period.
             const REENGAGE_RETRY: Delta = Delta::from_millis(4000);
             let mut next_reengage = [Instant::<Monotonic>::now(); VinoDriver::CP_SETUP_HEADS];
+            /// How long after a head is brought back to ignore a negative presence probe.
+            ///
+            /// The dock answers `id=0x14` -- which this code reads as "no monitor" -- for a head
+            /// whose EDID handler is not engaged, and there is a window right after a re-engage
+            /// where that is still true even though the monitor is plainly there and its EDID has
+            /// just been read. Without a grace period the two-cycle debounce would tear the head
+            /// straight back down and the whole thing would oscillate.
+            const PRESENCE_GRACE: Delta = Delta::from_millis(10_000);
+            let mut presence_grace =
+                [Instant::<Monotonic>::now(); VinoDriver::CP_SETUP_HEADS];
             let mut head_silent = [0u8; VinoDriver::CP_SETUP_HEADS];
             for h in 0..VinoDriver::CP_SETUP_HEADS {
                 head_known[h] = data.head_present(h);
@@ -1031,7 +1041,34 @@ impl WorkItem for BringUp {
                         }
                         next_reengage[h] = Instant::<Monotonic>::now() + REENGAGE_RETRY;
                         dev_info!(cdev, "vino: head {h} absent -- retrying the sink re-engage\n");
-                        data.reengage_head(drm_dev, dev, h as u8);
+                        // ★ A recovered EDID IS the presence signal (measured 2026-07-27, third
+                        // physical replug).
+                        //
+                        // The probe's id is not. With the monitor physically back and its EDID
+                        // reading out perfectly -- `EDID re-cached after re-engage (384 bytes)`,
+                        // valid magic, right length -- the dock still answered the presence probe
+                        // with the generic `id=0x14`, which this code read as "no monitor". So the
+                        // head was re-engaged successfully over and over and never marked present,
+                        // the retry never stopped, and ~20 s later the dock gave up and
+                        // re-enumerated, taking the other screen with it. `0x44` versus `0x14` is
+                        // not about whether a monitor is attached; it is about whether the dock's
+                        // EDID handler is currently engaged for that head.
+                        //
+                        // A 384-byte blob with a correct EDID header cannot come from an empty
+                        // port. Trust it, and stop.
+                        if data.reengage_head(drm_dev, dev, h as u8) {
+                            data.set_connected(drm_dev, h);
+                            head_known[h] = true;
+                            head_debounce[h] = 0;
+                            head_silent[h] = 0;
+                            presence_grace[h] = Instant::<Monotonic>::now() + PRESENCE_GRACE;
+                            dev_info!(
+                                cdev,
+                                "vino: head {h} monitor CONNECTED -- its EDID read back after the \
+                                 re-engage\n"
+                            );
+                            drm_dev.hotplug_event();
+                        }
                         head_silent[h] = 0;
                         next_presence = Instant::<Monotonic>::now();
                     }
@@ -1042,6 +1079,15 @@ impl WorkItem for BringUp {
                 // up and re-enumerated itself; see `drm_sink::DOWNSTREAM_EVENT`.
                 if drm_sink::take_downstream_event() {
                     next_presence = Instant::<Monotonic>::now();
+                    // Bring the retry deadline forward rather than running a second, unbounded
+                    // re-engage path. Two independent triggers hammered the dock with a seven
+                    // message sequence roughly every second, which is very likely what pushed it
+                    // into the give-up reset this was meant to prevent.
+                    for h in 0..VinoDriver::CP_SETUP_HEADS {
+                        if !head_known[h] {
+                            next_reengage[h] = Instant::<Monotonic>::now();
+                        }
+                    }
                     // ★ Break the replug deadlock (measured 2026-07-27, second unplug test).
                     //
                     // A head whose monitor came back stays silent, because the dock will not answer
@@ -1055,18 +1101,6 @@ impl WorkItem for BringUp {
                     // monitor really is gone the sequence is harmless -- the dock stays silent and
                     // the head stays disconnected -- and the trigger is edge-driven, so this cannot
                     // spin.
-                    for h in 0..VinoDriver::CP_SETUP_HEADS {
-                        if head_known[h] {
-                            continue;
-                        }
-                        dev_info!(
-                            cdev,
-                            "vino: head {h} absent and the dock reports a downstream change -- \
-                             re-engaging speculatively\n"
-                        );
-                        data.reengage_head(drm_dev, dev, h as u8);
-                        head_silent[h] = 0;
-                    }
                 }
                 let now_p = Instant::<Monotonic>::now();
                 if (now_p - next_presence).as_millis() >= 0 {
@@ -1099,6 +1133,14 @@ impl WorkItem for BringUp {
                             }
                         };
                         if present == head_known[h] {
+                            head_debounce[h] = 0;
+                            continue;
+                        }
+                        // Inside the settling window after a recovery, a negative answer is not
+                        // evidence -- see `PRESENCE_GRACE`.
+                        if !present
+                            && (Instant::<Monotonic>::now() - presence_grace[h]).as_millis() < 0
+                        {
                             head_debounce[h] = 0;
                             continue;
                         }
@@ -4309,6 +4351,7 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         kernel::sysfs::Attr::rw(c"blank_marker"),
         kernel::sysfs::Attr::rw(c"record_sub_parity"),
         kernel::sysfs::Attr::wo(c"simulate_unplug"),
+        kernel::sysfs::Attr::rw(c"record_band_order"),
     ];
 
     fn show(&self, name: &CStr, out: &mut kernel::sysfs::Writer<'_>) -> Result {
@@ -4323,6 +4366,10 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         }
         if name == c"record_sub_parity" {
             let on = drm_sink::band_parity_bit();
+            return out.write(if on { b"1\n" } else { b"0\n" });
+        }
+        if name == c"record_band_order" {
+            let on = drm_sink::interlaced_bands();
             return out.write(if on { b"1\n" } else { b"0\n" });
         }
         if name == c"blank_marker" {
@@ -4369,13 +4416,24 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         // sequence can be exercised on demand, and it doubles as the manual recovery for a
         // replugged monitor that stayed dark. The work happens on the keepalive loop, which already
         // owns a live I/O token; see `drm_sink::REENGAGE_REQUEST`.
+        // Band order: 0 = raster (vino's shape), 1 = all even bands then all odd (DLM's
+        // `ep0b_frame1` shape). Like the parity bit, no pixel decoder can see the difference.
+        if name == c"record_band_order" {
+            let on = buf.first() == Some(&b'1');
+            drm_sink::set_interlaced_bands(on);
+            pr_info!(
+                "vino: record band order set to {} via sysfs -- next frame is a keyframe\n",
+                if on { "INTERLACED (even bands, then odd)" } else { "raster" }
+            );
+            return Ok(());
+        }
         // The `sub` bit-4 y-parity flag on image records. The only oracle for this is a person
         // looking at the panel, so it has to be flippable live; see `drm_sink::BAND_PARITY_BIT`.
         if name == c"record_sub_parity" {
             let on = buf.first() == Some(&b'1');
             drm_sink::set_band_parity_bit(on);
             pr_info!(
-                "vino: record sub bit4 y-parity {} via sysfs -- next frame carries the change\n",
+                "vino: record sub bit4 y-parity {} via sysfs -- next frame is a keyframe\n",
                 if on { "ENABLED" } else { "disabled" }
             );
             return Ok(());
@@ -4566,15 +4624,15 @@ mod tests {
         //         = 2 x 2 macro-tiles, each 4 strips wide x 4 bands = 16 strips.
         let (w, h) = (512usize, 128usize);
         const STRIPS_PER_MACRO: usize = 16;
-        let (full, _) = video::wht::colour_frame_ep08(w, h, 0, 0, true, g)?;
+        let (full, _) = video::wht::colour_frame_ep08(w, h, 0, 0, true, false, g)?;
 
         // A damage clip covering the WHOLE surface selects every strip in the same raster order as
         // the full-frame path, so the wire bytes are identical.
-        let (dfull, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(0, 0, w, h)], true, g)?;
+        let (dfull, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(0, 0, w, h)], true, false, g)?;
         assert_eq!(flat(&full)?.as_slice(), flat(&dfull)?.as_slice());
 
         // No damage -> no strips -> empty frame list (caller must skip the USB write).
-        let (empty, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[], true, g)?;
+        let (empty, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[], true, false, g)?;
         assert!(empty.is_empty());
 
         // Selection is exact and macro-tile-quantised. Assert the strip COUNT directly (the shared
@@ -4588,17 +4646,17 @@ mod tests {
 
         // A 1-pixel clip lands in ONE macro-tile and selects all 16 of its strips -- not 1.
         assert_eq!(coords(&[(1, 1, 2, 2)])?, STRIPS_PER_MACRO);
-        let (d1, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(1, 1, 2, 2)], true, g)?;
+        let (d1, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(1, 1, 2, 2)], true, false, g)?;
         assert!(!d1.is_empty());
         assert!(total(&d1) < total(&full));
 
         // A 1-pixel-wide clip down the whole left edge spans the left macro-tile COLUMN: 2 tiles.
         assert_eq!(coords(&[(0, 0, 1, h)])?, 2 * STRIPS_PER_MACRO);
-        let (d2, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(0, 0, 1, h)], true, g)?;
+        let (d2, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(0, 0, 1, h)], true, false, g)?;
         assert!(total(&d1) < total(&d2) && total(&d2) < total(&full));
 
         // Non-aligned geometry is rejected (same contract as colour_frame_ep08).
-        assert!(video::wht::colour_frame_ep08_damage(100, 32, 0, 0, &[(0, 0, 1, 1)], true, g).is_err());
+        assert!(video::wht::colour_frame_ep08_damage(100, 32, 0, 0, &[(0, 0, 1, 1)], true, false, g).is_err());
         Ok(())
     }
 
@@ -4606,7 +4664,7 @@ mod tests {
     fn black_training_frame_matches_captured_1440p_size() -> Result {
         // Corrected Vino captures repeatedly measured a 205,696-byte first write:
         // 2,560-byte ARM + 203,040-byte black image + 96-byte frame trailer.
-        let frame = video::wht::black_frame_ep08(2560, 1440, 0, true)?;
+        let frame = video::wht::black_frame_ep08(2560, 1440, 0, true, false)?;
         let image_len = frame.iter().map(|part| part.len()).sum::<usize>();
         assert_eq!(image_len, 203_040);
         assert_eq!(2_560 + image_len + video::wht::frame_trailer(0, 0).len(), 205_696);
