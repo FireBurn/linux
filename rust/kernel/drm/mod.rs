@@ -3,6 +3,7 @@
 //! DRM subsystem abstractions.
 
 pub mod device;
+pub mod display;
 pub mod driver;
 pub mod file;
 pub mod fourcc;
