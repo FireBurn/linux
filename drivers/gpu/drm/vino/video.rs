@@ -996,6 +996,7 @@ pub(crate) mod wht {
         height: usize,
         seq0: u32,
         head: u8,
+        band_parity: bool,
         mut px: impl FnMut(usize, usize) -> (u8, u8, u8),
     ) -> Result<(KVec<KVec<u8>>, u32)> {
         if width % STRIP_W != 0 || height % STRIP_H != 0 {
@@ -1013,7 +1014,7 @@ pub(crate) mod wht {
             }
             sy += STRIP_H;
         }
-        Ok((frame_records(&strips, head)?, seq0.wrapping_add(1)))
+        Ok((frame_records(&strips, head, band_parity)?, seq0.wrapping_add(1)))
     }
 
     /// Build a valid all-black WHT frame without sampling or transforming a framebuffer.
@@ -1059,7 +1060,7 @@ pub(crate) mod wht {
             }
             sy += STRIP_H;
         }
-        frame_records(&strips, head)
+        frame_records(&strips, head, true)
     }
 
     /// Encode ONE 64x16 strip whose top-left output pixel is `(sx, sy)`.
@@ -1153,6 +1154,7 @@ pub(crate) mod wht {
         seq0: u32,
         head: u8,
         clips: &[(usize, usize, usize, usize)],
+        band_parity: bool,
         mut px: impl FnMut(usize, usize) -> (u8, u8, u8),
     ) -> Result<(KVec<KVec<u8>>, u32)> {
         if width % STRIP_W != 0 || height % STRIP_H != 0 {
@@ -1171,7 +1173,7 @@ pub(crate) mod wht {
             packs_us += (t2 - t1).as_micros_ceil();
         }
         let t3 = Instant::<Monotonic>::now();
-        let records = frame_records(&strips, head)?;
+        let records = frame_records(&strips, head, band_parity)?;
         // ★ Is the encode cost in the per-strip work (which parallelises across CPUs, since strips
         // are independent) or in the serial framing? This split is what decides whether threading
         // is the right lever -- see the phase log in `drm_sink.rs`.
@@ -1216,7 +1218,11 @@ pub(crate) mod wht {
     /// never does. The previous 0x4000 cap produced 16-KiB records for real desktop content;
     /// black/grey happened to remain below the real limit and were accepted, while the first
     /// oversized live record reset the dock.
-    pub(crate) fn frame_records(strips: &[KVec<u8>], head: u8) -> Result<KVec<KVec<u8>>> {
+    pub(crate) fn frame_records(
+        strips: &[KVec<u8>],
+        head: u8,
+        band_parity_bit: bool,
+    ) -> Result<KVec<KVec<u8>>> {
         const PREFIX: usize = 8;
         const STRIDE_CAP: usize = 0x0ff0;
         // Allocation boundary only, not wire framing. This removes the multi-megabyte contiguous
@@ -1231,7 +1237,23 @@ pub(crate) mod wht {
             let mut record: KVec<u8> = KVec::new();
             record.extend_from_slice(&[0u8; 8 + PREFIX], GFP_KERNEL)?; // TLV(8) + prefix(8)
             record[4..8].copy_from_slice(&4u32.to_le_bytes()); // type = 4
-            let sub = head as u16 | (((y0 / STRIP_H as u16) & 1) << 4);
+            // ★ `sub` bit 4 is the one framing divergence from DLM that is still open, and it is
+            // the only one a software decoder cannot see: `colour_decode.py` ignores `sub`
+            // entirely, so vino's wire decodes to the correct desktop either way -- while the dock,
+            // which does not ignore it, may not render it that way. That matters because the
+            // remaining artifact is reported as visible on the panel and absent from every capture.
+            //
+            // DLM is not uniform here. Its steady-state frames (`dlm-fullurb ep08_frame1/2`) use
+            // this y-parity rule, which is why vino adopted it; but `ep08_frame0` never sets the
+            // bit, and `ep0b_frame1` orders all even bands then all odd (interlaced fields) and
+            // never sets it either -- 48 of 96 records there disagree with vino. So `false` is a
+            // shape DLM demonstrably also emits, not a guess.
+            //
+            // Passed in rather than read from a global so this file stays free of
+            // `crate::module_parameters` and remains vendorable into chimera; an earlier attempt at
+            // the same knob was reverted for exactly that reason.
+            let parity = u16::from(band_parity_bit) & ((y0 / STRIP_H as u16) & 1);
+            let sub = head as u16 | (parity << 4);
             record[8..10].copy_from_slice(&sub.to_le_bytes());
             let mut n = 0usize;
             while i < strips.len() && strip_y(&strips[i]) == y0 {

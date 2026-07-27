@@ -4267,6 +4267,7 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         kernel::sysfs::Attr::rw(c"dock_pixel_budget"),
         kernel::sysfs::Attr::wo(c"reengage"),
         kernel::sysfs::Attr::rw(c"blank_marker"),
+        kernel::sysfs::Attr::rw(c"record_sub_parity"),
     ];
 
     fn show(&self, name: &CStr, out: &mut kernel::sysfs::Writer<'_>) -> Result {
@@ -4278,6 +4279,10 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
             let v = drm_sink::pixel_budget_override();
             let s = kernel::str::CString::try_from_fmt(kernel::prelude::fmt!("{v}\n"))?;
             return out.write(s.to_bytes());
+        }
+        if name == c"record_sub_parity" {
+            let on = drm_sink::band_parity_bit();
+            return out.write(if on { b"1\n" } else { b"0\n" });
         }
         if name == c"blank_marker" {
             let v = drm_sink::blank_marker_state();
@@ -4323,6 +4328,17 @@ impl kernel::sysfs::DeviceAttributes for VinoControl {
         // sequence can be exercised on demand, and it doubles as the manual recovery for a
         // replugged monitor that stayed dark. The work happens on the keepalive loop, which already
         // owns a live I/O token; see `drm_sink::REENGAGE_REQUEST`.
+        // The `sub` bit-4 y-parity flag on image records. The only oracle for this is a person
+        // looking at the panel, so it has to be flippable live; see `drm_sink::BAND_PARITY_BIT`.
+        if name == c"record_sub_parity" {
+            let on = buf.first() == Some(&b'1');
+            drm_sink::set_band_parity_bit(on);
+            pr_info!(
+                "vino: record sub bit4 y-parity {} via sysfs -- next frame carries the change\n",
+                if on { "ENABLED" } else { "disabled" }
+            );
+            return Ok(());
+        }
         // Candidate `id=0x16 sub=0x2e` off23 state for the blank path, or 0 to disable. The whole
         // point is to sweep it without a rebuild; see `drm_sink::BLANK_MARKER_STATE`.
         if name == c"blank_marker" {
@@ -4495,15 +4511,15 @@ mod tests {
         //         = 2 x 2 macro-tiles, each 4 strips wide x 4 bands = 16 strips.
         let (w, h) = (512usize, 128usize);
         const STRIPS_PER_MACRO: usize = 16;
-        let (full, _) = video::wht::colour_frame_ep08(w, h, 0, 0, g)?;
+        let (full, _) = video::wht::colour_frame_ep08(w, h, 0, 0, true, g)?;
 
         // A damage clip covering the WHOLE surface selects every strip in the same raster order as
         // the full-frame path, so the wire bytes are identical.
-        let (dfull, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(0, 0, w, h)], g)?;
+        let (dfull, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(0, 0, w, h)], true, g)?;
         assert_eq!(flat(&full)?.as_slice(), flat(&dfull)?.as_slice());
 
         // No damage -> no strips -> empty frame list (caller must skip the USB write).
-        let (empty, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[], g)?;
+        let (empty, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[], true, g)?;
         assert!(empty.is_empty());
 
         // Selection is exact and macro-tile-quantised. Assert the strip COUNT directly (the shared
@@ -4517,17 +4533,17 @@ mod tests {
 
         // A 1-pixel clip lands in ONE macro-tile and selects all 16 of its strips -- not 1.
         assert_eq!(coords(&[(1, 1, 2, 2)])?, STRIPS_PER_MACRO);
-        let (d1, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(1, 1, 2, 2)], g)?;
+        let (d1, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(1, 1, 2, 2)], true, g)?;
         assert!(!d1.is_empty());
         assert!(total(&d1) < total(&full));
 
         // A 1-pixel-wide clip down the whole left edge spans the left macro-tile COLUMN: 2 tiles.
         assert_eq!(coords(&[(0, 0, 1, h)])?, 2 * STRIPS_PER_MACRO);
-        let (d2, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(0, 0, 1, h)], g)?;
+        let (d2, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(0, 0, 1, h)], true, g)?;
         assert!(total(&d1) < total(&d2) && total(&d2) < total(&full));
 
         // Non-aligned geometry is rejected (same contract as colour_frame_ep08).
-        assert!(video::wht::colour_frame_ep08_damage(100, 32, 0, 0, &[(0, 0, 1, 1)], g).is_err());
+        assert!(video::wht::colour_frame_ep08_damage(100, 32, 0, 0, &[(0, 0, 1, 1)], true, g).is_err());
         Ok(())
     }
 

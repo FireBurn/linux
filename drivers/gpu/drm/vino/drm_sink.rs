@@ -262,6 +262,29 @@ pub(super) fn set_blank_marker_state(v: u32) {
     BLANK_MARKER_STATE.store(v, Ordering::Relaxed);
 }
 
+/// Whether image records carry DLM's y-parity bit in `sub` bit 4.
+///
+/// **The last framing divergence from DLM, and the only one no capture analysis can settle.**
+/// `colour_decode.py` ignores `sub` entirely, so vino's wire decodes to the correct desktop with
+/// the bit either way -- which is exactly why every measurement says the wire is perfect while a
+/// minor artifact remains visible on the panel. The dock does not ignore it.
+///
+/// DLM is not uniform: its steady-state frames use this y-parity rule (which is why vino adopted
+/// it), but `ep08_frame0` never sets the bit and `ep0b_frame1` orders all even bands then all odd
+/// and never sets it either -- 48 of 96 records there disagree with vino. So clearing it is a shape
+/// DLM demonstrably emits too, not a guess.
+///
+/// Runtime-settable via `/sys/devices/vino/record_sub_parity` because the only valid oracle is a
+/// person looking at the panel: flip it, look, flip it back. Default `1` = the current behaviour.
+static BAND_PARITY_BIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+pub(super) fn band_parity_bit() -> bool {
+    BAND_PARITY_BIT.load(Ordering::Relaxed) != 0
+}
+pub(super) fn set_band_parity_bit(on: bool) {
+    BAND_PARITY_BIT.store(u32::from(on), Ordering::Relaxed);
+}
+
 /// Request a re-engage of `head`'s downstream sink (sysfs writer side).
 pub(super) fn request_reengage(head: u32) {
     REENGAGE_REQUEST.fetch_or(1 << head, Ordering::Release);
@@ -5034,7 +5057,7 @@ fn encode_and_send_wht(
                         );
                     }
                     Some((
-                        super::video::wht::frame_records(&strips, head)?,
+                        super::video::wht::frame_records(&strips, head, band_parity_bit())?,
                         seq0.wrapping_add(1),
                     ))
                 }
@@ -5045,13 +5068,16 @@ fn encode_and_send_wht(
     };
     let (frames, next_seq) = match parallel {
         Some(r) => r,
-        None if full => super::video::wht::colour_frame_ep08(w_pad, h_pad, seq0, head, px)?,
+        None if full => {
+            super::video::wht::colour_frame_ep08(w_pad, h_pad, seq0, head, band_parity_bit(), px)?
+        }
         None => super::video::wht::colour_frame_ep08_damage(
             w_pad,
             h_pad,
             seq0,
             head,
             &content_damage,
+            band_parity_bit(),
             px,
         )?,
     };
