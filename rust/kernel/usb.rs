@@ -1398,6 +1398,7 @@ impl UrbSlot {
         matches!(self.urb, Some(QueueUrb::Active(_)))
     }
 
+    #[inline]
     fn wait(&self, timeout: Delta) -> bool {
         let millis = timeout.as_millis();
         let millis = if millis <= 0 {
@@ -1409,6 +1410,7 @@ impl UrbSlot {
             .wait_for_completion_timeout(crate::time::msecs_to_jiffies(millis))
     }
 
+    #[inline]
     fn finish(&mut self) -> Result<(i32, usize)> {
         let state = self.urb.take().ok_or(EIO)?;
         let active = match state {
@@ -1665,6 +1667,34 @@ impl BulkOutQueue {
             return Err(Error::from_errno(status));
         }
 
+        Ok(true)
+    }
+
+    /// Reports whether the next `count` queue slots can be submitted without waiting.
+    ///
+    /// Completed slots are reaped and any transfer error is returned. This is useful when a
+    /// higher-level protocol must not block halfway through a multi-URB record while waiting for
+    /// endpoint progress; callers can defer the whole record and service its control plane first.
+    #[inline]
+    pub fn can_send_n(&mut self, io: &Io<'_>, count: usize) -> Result<bool> {
+        self.inner.check(io)?;
+        if count > self.slots.len() {
+            return Ok(false);
+        }
+        for off in 0..count {
+            let i = (self.cursor + off) % self.slots.len();
+            if self.slots[i].is_active() {
+                if !self.slots[i].wait(Delta::ZERO) {
+                    return Ok(false);
+                }
+                // `wait_for_completion_timeout()` consumes the completion signal. Reap the URB
+                // now rather than leaving `send()` to wait for the signal a second time.
+                let (status, _) = self.slots[i].finish()?;
+                if status != 0 {
+                    return Err(Error::from_errno(status));
+                }
+            }
+        }
         Ok(true)
     }
 
@@ -2595,6 +2625,72 @@ impl<Ctx: device::DeviceContext> Device<Ctx> {
     /// Returns the USB device number assigned by the bus.
     fn devnum(&self) -> u32 {
         self.inner().devnum as u32
+    }
+
+    /// Returns the `idVendor` of the device descriptor.
+    pub fn vendor_id(&self) -> u16 {
+        self.inner().descriptor.idVendor
+    }
+
+    /// Returns the `idProduct` of the device descriptor.
+    pub fn product_id(&self) -> u16 {
+        self.inner().descriptor.idProduct
+    }
+
+    /// Returns the `bcdDevice` of the device descriptor.
+    ///
+    /// Vendors conventionally use this as the device revision, and it is the only version a driver
+    /// can read without speaking the device's own protocol.
+    pub fn bcd_device(&self) -> u16 {
+        self.inner().descriptor.bcdDevice
+    }
+
+    /// Returns the `bcdUSB` of the device descriptor.
+    pub fn bcd_usb(&self) -> u16 {
+        self.inner().descriptor.bcdUSB
+    }
+
+    /// Returns the enumerated bus speed as a human-readable string.
+    pub fn speed_str(&self) -> &'static str {
+        match self.inner().speed {
+            bindings::usb_device_speed_USB_SPEED_LOW => "low (1.5 Mbps)",
+            bindings::usb_device_speed_USB_SPEED_FULL => "full (12 Mbps)",
+            bindings::usb_device_speed_USB_SPEED_HIGH => "high (480 Mbps)",
+            bindings::usb_device_speed_USB_SPEED_WIRELESS => "wireless",
+            bindings::usb_device_speed_USB_SPEED_SUPER => "super (5 Gbps)",
+            bindings::usb_device_speed_USB_SPEED_SUPER_PLUS => "super-plus (10+ Gbps)",
+            _ => "unknown",
+        }
+    }
+
+    /// Returns the device's `iManufacturer` string, if the core cached one.
+    pub fn manufacturer(&self) -> Option<&CStr> {
+        // SAFETY: `manufacturer` is either null or a NUL-terminated string owned by the USB core
+        // for as long as the device exists, which outlives the borrow of `self`.
+        unsafe { Self::opt_cstr(self.inner().manufacturer) }
+    }
+
+    /// Returns the device's `iProduct` string, if the core cached one.
+    pub fn product(&self) -> Option<&CStr> {
+        // SAFETY: As for `manufacturer`.
+        unsafe { Self::opt_cstr(self.inner().product) }
+    }
+
+    /// Returns the device's `iSerialNumber` string, if the core cached one.
+    pub fn serial(&self) -> Option<&CStr> {
+        // SAFETY: As for `manufacturer`.
+        unsafe { Self::opt_cstr(self.inner().serial) }
+    }
+
+    /// # Safety
+    ///
+    /// `p` must be null or point to a NUL-terminated string that outlives `'a`.
+    unsafe fn opt_cstr<'a>(p: *mut crate::ffi::c_char) -> Option<&'a CStr> {
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: The caller guarantees `p` is a NUL-terminated string valid for `'a`.
+        Some(unsafe { CStr::from_char_ptr(p) })
     }
 }
 
