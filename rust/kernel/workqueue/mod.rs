@@ -380,6 +380,12 @@ pub struct OwnedQueue {
     queue: NonNull<Queue>,
 }
 
+// SAFETY: `Queue` operations are thread-safe and ownership may be transferred
+// between threads.
+unsafe impl Send for OwnedQueue {}
+// SAFETY: Shared access only exposes the thread-safe `Queue` API.
+unsafe impl Sync for OwnedQueue {}
+
 impl Deref for OwnedQueue {
     type Target = Queue;
     fn deref(&self) -> &Queue {
