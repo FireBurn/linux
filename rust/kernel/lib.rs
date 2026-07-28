@@ -142,6 +142,7 @@ pub mod uaccess;
 pub mod usb;
 pub mod workqueue;
 pub mod xarray;
+pub mod xxhash;
 
 #[doc(hidden)]
 pub use bindings;
