@@ -9,7 +9,10 @@ use kernel::{
         Core, //
     },
     prelude::*,
-    sync::aref::ARef,
+    sync::{
+        aref::ARef,
+        Arc, //
+    },
     usb, //
 };
 
@@ -33,6 +36,7 @@ impl usb::Driver for SampleDriver {
         intf: &'bound usb::Interface<Core<'_>>,
         _id: &usb::DeviceId,
         _info: &'bound Self::IdInfo,
+        _io: Arc<usb::IoWindow>,
     ) -> impl PinInit<Self, Error> + 'bound {
         let dev: &device::Device<Core<'_>> = intf.as_ref();
         dev_info!(dev, "Rust USB driver sample probed\n");
