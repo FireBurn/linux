@@ -2610,6 +2610,72 @@ impl<Ctx: device::DeviceContext> Device<Ctx> {
     fn devnum(&self) -> u32 {
         self.inner().devnum as u32
     }
+
+    /// Returns the `idVendor` of the device descriptor.
+    pub fn vendor_id(&self) -> u16 {
+        self.inner().descriptor.idVendor
+    }
+
+    /// Returns the `idProduct` of the device descriptor.
+    pub fn product_id(&self) -> u16 {
+        self.inner().descriptor.idProduct
+    }
+
+    /// Returns the `bcdDevice` of the device descriptor.
+    ///
+    /// Vendors conventionally use this as the device revision, and it is the only version a driver
+    /// can read without speaking the device's own protocol.
+    pub fn bcd_device(&self) -> u16 {
+        self.inner().descriptor.bcdDevice
+    }
+
+    /// Returns the `bcdUSB` of the device descriptor.
+    pub fn bcd_usb(&self) -> u16 {
+        self.inner().descriptor.bcdUSB
+    }
+
+    /// Returns the enumerated bus speed as a human-readable string.
+    pub fn speed_str(&self) -> &'static str {
+        match self.inner().speed {
+            bindings::usb_device_speed_USB_SPEED_LOW => "low (1.5 Mbps)",
+            bindings::usb_device_speed_USB_SPEED_FULL => "full (12 Mbps)",
+            bindings::usb_device_speed_USB_SPEED_HIGH => "high (480 Mbps)",
+            bindings::usb_device_speed_USB_SPEED_WIRELESS => "wireless",
+            bindings::usb_device_speed_USB_SPEED_SUPER => "super (5 Gbps)",
+            bindings::usb_device_speed_USB_SPEED_SUPER_PLUS => "super-plus (10+ Gbps)",
+            _ => "unknown",
+        }
+    }
+
+    /// Returns the device's `iManufacturer` string, if the core cached one.
+    pub fn manufacturer(&self) -> Option<&CStr> {
+        // SAFETY: `manufacturer` is either null or a NUL-terminated string owned by the USB core
+        // for as long as the device exists, which outlives the borrow of `self`.
+        unsafe { Self::opt_cstr(self.inner().manufacturer) }
+    }
+
+    /// Returns the device's `iProduct` string, if the core cached one.
+    pub fn product(&self) -> Option<&CStr> {
+        // SAFETY: As for `manufacturer`.
+        unsafe { Self::opt_cstr(self.inner().product) }
+    }
+
+    /// Returns the device's `iSerialNumber` string, if the core cached one.
+    pub fn serial(&self) -> Option<&CStr> {
+        // SAFETY: As for `manufacturer`.
+        unsafe { Self::opt_cstr(self.inner().serial) }
+    }
+
+    /// # Safety
+    ///
+    /// `p` must be null or point to a NUL-terminated string that outlives `'a`.
+    unsafe fn opt_cstr<'a>(p: *mut crate::ffi::c_char) -> Option<&'a CStr> {
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: The caller guarantees `p` is a NUL-terminated string valid for `'a`.
+        Some(unsafe { CStr::from_char_ptr(p) })
+    }
 }
 
 impl Device<device::Bound> {
