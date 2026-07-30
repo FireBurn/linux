@@ -290,6 +290,27 @@ impl<T: KmsDriver> Framebuffer<T> {
         })
     }
 
+    /// Returns the GEM object backing plane 0 of this framebuffer.
+    ///
+    /// A driver needs this to hand the buffer to a client, which is done by minting a handle for it
+    /// in that client's file. The same type, ownership, import and device checks as [`Self::vmap`]
+    /// apply, so the returned reference is known to belong to this driver.
+    #[cfg(CONFIG_RUST_DRM_GEM_SHMEM_HELPER)]
+    pub fn object<O>(&self) -> Result<&shmem::Object<O>>
+    where
+        O: gem::DriverObject<Driver = T>,
+        T: crate::drm::Driver<Object = shmem::Object<O>>,
+    {
+        // SAFETY: The framebuffer is initialized via its type invariant.
+        let raw = unsafe { &*self.0.get() };
+        let object_raw = raw.obj[0];
+        validate_object(raw, object_raw)?;
+
+        // SAFETY: `validate_object` established that `object_raw` is a live object of this
+        // driver's type, and it is owned by the framebuffer for at least this borrow.
+        Ok(unsafe { <shmem::Object<O> as gem::IntoGEMObject>::from_raw(object_raw) })
+    }
+
     /// Map a packed, single-plane, linear Rust shmem framebuffer and retain its backing object.
     ///
     /// The validation is identical to [`Framebuffer::vmap`], but the returned mapping is not tied
