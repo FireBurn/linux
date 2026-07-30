@@ -249,6 +249,83 @@ where
         !unsafe { (*connected.anchor.as_ptr()).pending.file_priv }.is_null()
     }
 
+    /// Run `f` with the connected DRM file, if one is still open.
+    ///
+    /// Returns `Ok(None)` when no file is connected or the connected file is closing.
+    ///
+    /// Unlike [`Self::send`], `f` may sleep. That matters because the useful things to do with a
+    /// client's file -- minting a GEM handle for a buffer the driver wants to hand over, for
+    /// instance -- allocate and take mutexes, so they cannot run under `event_lock`.
+    ///
+    /// # Lifetime
+    ///
+    /// DRM files are not refcounted, so holding one across a sleep needs an explicit exclusion
+    /// against teardown. `drm_close_helper()` removes the file from `drm_device::filelist` under
+    /// `filelist_mutex` and only calls `drm_file_free()` **after** dropping it, so a file found on
+    /// that list while the mutex is held cannot be freed until the mutex is released. This walks
+    /// the list under `filelist_mutex` and only hands `f` a file it found there, which also
+    /// rejects the case where a newly opened file reused the closed one's address.
+    pub fn with_connected_file<R>(
+        &self,
+        dev: &Device<D>,
+        f: impl FnOnce(&File<F>) -> Result<R>,
+    ) -> Result<Option<R>> {
+        // Snapshot the receiver under `event_lock`, which is also what tells us the connection is
+        // still live: DRM core clears `file_priv` there during teardown.
+        let receiver = {
+            let state = self.state.lock();
+            let Some(connected) = state.connected.as_ref() else {
+                return Ok(None);
+            };
+            if connected.dev.as_raw() != dev.as_raw() {
+                return Err(EINVAL);
+            }
+            let irq = interrupt::local_interrupt_disable();
+            let _guard = connected.dev.event_lock().lock_with(&irq);
+            // SAFETY: The state mutex keeps the anchor allocated, and `event_lock` serializes this
+            // read against DRM file teardown.
+            unsafe { (*connected.anchor.as_ptr()).pending.file_priv }
+        };
+        if receiver.is_null() {
+            return Ok(None);
+        }
+
+        let raw_dev = dev.as_raw();
+        // SAFETY: `raw_dev` is a valid device by the type invariants of `Device`.
+        let filelist_mutex = unsafe { &raw mut (*raw_dev).filelist_mutex };
+        // SAFETY: `filelist_mutex` is a valid, initialized mutex owned by the device.
+        unsafe { bindings::mutex_lock(filelist_mutex) };
+
+        // SAFETY: The head is valid and the list is stable while `filelist_mutex` is held.
+        let head = unsafe { &raw mut (*raw_dev).filelist };
+        let mut node = unsafe { (*head).next };
+        let mut found = false;
+        while !core::ptr::eq(node, head) {
+            // SAFETY: `node` is a live list node on the device's file list.
+            let file = unsafe {
+                crate::container_of!(node, bindings::drm_file, lhead) as *mut bindings::drm_file
+            };
+            if core::ptr::eq(file, receiver) {
+                found = true;
+                break;
+            }
+            // SAFETY: As above.
+            node = unsafe { (*node).next };
+        }
+
+        let result = if found {
+            // SAFETY: `receiver` is on the device's file list and `filelist_mutex` is held, so
+            // `drm_file_free()` cannot run for it until the mutex is dropped below.
+            f(unsafe { File::<F>::from_raw(receiver) }).map(Some)
+        } else {
+            Ok(None)
+        };
+
+        // SAFETY: Acquired directly above.
+        unsafe { bindings::mutex_unlock(filelist_mutex) };
+        result
+    }
+
     /// Deliver `payload` to the connected file, or drop it if the file has closed.
     pub fn send<T: EventPayload>(&self, payload: T) -> Result {
         let mut storage = KBox::new(
