@@ -626,6 +626,13 @@ pub(super) struct VinoDrmData {
     /// Set once the dock engages the CP cipher (`wsub=0x45` acks > 0); EP08 scanout is gated on it.
     /// Per device, so a second connected dock does not share one dock's engagement state.
     cp_engaged: core::sync::atomic::AtomicBool,
+    /// Whether this dock's video path is understood well enough to write to it.
+    ///
+    /// The Ridge arm/training sequence makes Navarro hard-reset on the very first EP08 write, so
+    /// the platform gates video until its own sequence is worked out. Everything short of video --
+    /// control session, EDID, modes, hotplug -- works either way, and a dock that resets every few
+    /// seconds cannot be developed against at all.
+    video_supported: core::sync::atomic::AtomicBool,
     /// Excludes the independent keepalive loop while the mode worker emits the mode-relative
     /// activation timeline. Without this, a keepalive poll can win `cp_link` between
     /// two explicitly paced markers and stretch/reorder the sequence.
@@ -781,6 +788,7 @@ impl VinoDrmData {
             edid_target: core::sync::atomic::AtomicU32::new(NO_EDID_TARGET),
             edid_caught <- new_mutex!(None),
             self_blanked: core::sync::atomic::AtomicU32::new(0),
+            video_supported: core::sync::atomic::AtomicBool::new(true),
             video_keys <- new_mutex!(core::array::from_fn(
                 |_| kernel::crypto::Secret::zeroed()
             )),
@@ -953,6 +961,16 @@ impl VinoDrmData {
     /// Record whether this dock has engaged its CP cipher (`wsub=0x45` acks > 0). The plane
     /// scanout path is gated on it, so pushing frames at a dock whose CP channel is dead cannot
     /// fault it. Set by the bring-up work item once the CP setup completes.
+    /// Record whether this dock's video path may be driven; see [`VinoDrmData::video_supported`].
+    pub(super) fn set_video_supported(&self, ok: bool) {
+        self.video_supported.store(ok, Ordering::Release);
+    }
+
+    /// Whether video writes are permitted for this dock.
+    pub(super) fn video_supported(&self) -> bool {
+        self.video_supported.load(Ordering::Acquire)
+    }
+
     pub(super) fn set_cp_engaged(&self, engaged: bool) {
         self.cp_engaged
             .store(engaged, core::sync::atomic::Ordering::SeqCst);
@@ -1190,6 +1208,13 @@ impl VinoDrmData {
         duration_ms: i64,
         with_arm: bool,
     ) -> Result<u32> {
+        if !self.video_supported() {
+            // The platform's video sequence is not established yet. Writing the Ridge one makes
+            // this dock hard-reset on the first EP08 transfer, which takes the control session,
+            // the EDID and the connectors down with it.
+            vino_debug!("vino: head={head} video suppressed -- platform video path not enabled\n");
+            return Ok(0);
+        }
         if frames.is_empty() {
             return Err(kernel::error::code::EINVAL);
         }
@@ -3367,6 +3392,13 @@ impl plane::DriverPlane for VinoPlane {
 /// Compress and submit one coalesced primary-plane flip on the deferred worker. Keeping all slow
 /// work here makes the DRM atomic callback bounded to state inspection plus an `ARef` increment.
 fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: PendingScanout) {
+    if !data.video_supported() {
+        // Every scanout write funnels through here. See `VinoDrmData::video_supported`: the Ridge
+        // video sequence hard-resets this platform's dock on the first EP08 transfer, taking the
+        // control session and the connectors with it, so video stays off until the platform's own
+        // sequence is established.
+        return;
+    }
     use core::sync::atomic::Ordering::Relaxed;
 
     let head_i = frame.head as usize;

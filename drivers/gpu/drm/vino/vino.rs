@@ -67,6 +67,10 @@ pub(crate) struct DockProfile {
     pub(crate) name: &'static str,
     /// Video bulk-OUT endpoint per head.
     pub(crate) video_eps: [u8; drm_sink::HEADS],
+    /// Whether this dock's video path is established. Ridge's arm/training sequence makes Navarro
+    /// hard-reset on the first EP08 write, so video stays off there until its own sequence is
+    /// worked out; control, EDID, modes and hotplug are unaffected.
+    pub(crate) video_supported: bool,
     /// Whether the dock runs a per-head HDCP repeater authentication after the main-link AKE.
     ///
     /// Ridge does: each head gets its own AKE, `rrx`, `Edkey` and `V`, and its video key comes
@@ -81,6 +85,7 @@ pub(crate) struct DockProfile {
 static PROFILE_D6000: DockProfile = DockProfile {
     name: "Dell D6000 (Ridge, DL-6xxx)",
     video_eps: [0x08, 0x0b],
+    video_supported: true,
     per_head_auth: true,
 };
 
@@ -94,6 +99,7 @@ static PROFILE_D6000: DockProfile = DockProfile {
 static PROFILE_DL7400: DockProfile = DockProfile {
     name: "DL-7400 quad dock (Navarro, DL-7000)",
     video_eps: [0x08, 0x0a],
+    video_supported: false,
     per_head_auth: false,
 };
 
@@ -2420,6 +2426,11 @@ impl usb::Driver for VinoDriver {
         // Run them on the device's ordered session queue so probe can return immediately. The work
         // item owns the DRM device, and the bound data retains a handle so quiesce can cancel or
         // flush it before the I/O window closes.
+        // Gate video on what this platform's video path is known to accept.
+        {
+            let d: &drm_sink::VinoDrmData = &ddev;
+            d.set_video_supported(info.video_supported);
+        }
         let bringup = BringUp::new(ddev.clone(), info)?;
         let bringup_slot = KBox::pin_init(new_mutex!(Some(bringup.clone())), GFP_KERNEL)?;
 
