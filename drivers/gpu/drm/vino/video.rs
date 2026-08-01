@@ -999,7 +999,7 @@ pub(crate) mod wht {
             record.extend_from_slice(&[0u8; 8 + PREFIX], GFP_KERNEL)?;
             record[4..8].copy_from_slice(&4u32.to_le_bytes());
             let parity = u16::from(band_parity_bit) & ((y0 / STRIP_H as u16) & 1);
-            let sub = head as u16 | (parity << 4);
+            let sub = head_sub(head) as u16 | (parity << 4);
             record[8..10].copy_from_slice(&sub.to_le_bytes());
             let mut n = 0usize;
             while i < order.len() && strip_y(&strips[order[i]]) == y0 {
@@ -1037,6 +1037,30 @@ pub(crate) mod wht {
 
     /// Build the three 32-byte end-of-frame records.
     ///
+    /// How the dock encodes a head in a video record's `sub` field.
+    ///
+    /// Ridge puts the bare head number there (0, 1). Navarro shifts it: its records use `0x00` and
+    /// `0x08`, and its stream-open ids are `0x17`/`0x1f` -- the same eight-apart spacing. Held as a
+    /// shift rather than a table because the record builders are free functions reached from many
+    /// call sites, and threading a device profile through all of them to carry one integer would
+    /// be far more disruptive than this.
+    ///
+    /// Zero -- the Ridge encoding -- is the default, so a dock whose profile says nothing keeps
+    /// exactly the behaviour it had.
+    pub(crate) static HEAD_SUB_SHIFT: core::sync::atomic::AtomicU8 =
+        core::sync::atomic::AtomicU8::new(0);
+
+    /// Set the head encoding for this dock; see [`HEAD_SUB_SHIFT`].
+    pub(crate) fn set_head_sub_shift(shift: u8) {
+        HEAD_SUB_SHIFT.store(shift, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Encode `head` the way this dock expects it in a record `sub` field.
+    #[inline]
+    pub(crate) fn head_sub(head: u8) -> u8 {
+        head << HEAD_SUB_SHIFT.load(core::sync::atomic::Ordering::Acquire)
+    }
+
     /// They delimit every logical frame, including the ARM-prefixed first frame. The first record
     /// carries a wrapping one-based frame counter; all three carry a three-slot phase (`0,2,4`) and
     /// the selected head.
@@ -1048,7 +1072,8 @@ pub(crate) mod wht {
         let frame_no = (seq0 as u8).wrapping_add(1);
         let mut out = [0u8; 96];
 
-        for (i, head_byte) in [head, head, head | 0x10].into_iter().enumerate() {
+        let h = head_sub(head);
+        for (i, head_byte) in [h, h, h | 0x10].into_iter().enumerate() {
             let o = i * 32;
             out[o + 2] = 0x1c; // size=28 -> 32-byte record
             out[o + 4] = 0x04; // type=4

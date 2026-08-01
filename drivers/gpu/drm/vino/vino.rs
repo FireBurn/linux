@@ -67,6 +67,11 @@ pub(crate) struct DockProfile {
     pub(crate) name: &'static str,
     /// Video bulk-OUT endpoint per head.
     pub(crate) video_eps: [u8; drm_sink::HEADS],
+    /// How the dock encodes a head in a video record's `sub` field, as a left shift.
+    ///
+    /// Ridge uses the bare head number (shift 0). Navarro spaces heads eight apart -- records use
+    /// `0x00`/`0x08` and stream-opens `0x17`/`0x1f` -- so shift 3.
+    pub(crate) head_sub_shift: u8,
     /// Whether this dock's video path is established. Ridge's arm/training sequence makes Navarro
     /// hard-reset on the first EP08 write, so video stays off there until its own sequence is
     /// worked out; control, EDID, modes and hotplug are unaffected.
@@ -85,6 +90,7 @@ pub(crate) struct DockProfile {
 static PROFILE_D6000: DockProfile = DockProfile {
     name: "Dell D6000 (Ridge, DL-6xxx)",
     video_eps: [0x08, 0x0b],
+    head_sub_shift: 0,
     video_supported: true,
     per_head_auth: true,
 };
@@ -99,6 +105,7 @@ static PROFILE_D6000: DockProfile = DockProfile {
 static PROFILE_DL7400: DockProfile = DockProfile {
     name: "DL-7400 quad dock (Navarro, DL-7000)",
     video_eps: [0x08, 0x0a],
+    head_sub_shift: 3,
     video_supported: false,
     per_head_auth: false,
 };
@@ -2430,6 +2437,7 @@ impl usb::Driver for VinoDriver {
         {
             let d: &drm_sink::VinoDrmData = &ddev;
             d.set_video_supported(info.video_supported);
+            drm_sink::set_head_sub_shift(info.head_sub_shift);
         }
         let bringup = BringUp::new(ddev.clone(), info)?;
         let bringup_slot = KBox::pin_init(new_mutex!(Some(bringup.clone())), GFP_KERNEL)?;

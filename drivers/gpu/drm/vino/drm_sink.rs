@@ -109,6 +109,11 @@ const INTERLACED_BANDS: bool = false;
 /// dock supported so far exposes exactly this many video endpoints.
 pub(crate) const HEADS: usize = 2;
 
+/// Re-export so `probe` can set the dock's head encoding without reaching into the codec module.
+pub(crate) fn set_head_sub_shift(shift: u8) {
+    super::video::wht::set_head_sub_shift(shift);
+}
+
 /// Maximum number of individual frame-damage rectangles re-converted per flip before they are
 /// collapsed into a single bounding box. Bounds the stack array used on the atomic-commit path
 /// (no per-flip allocation); a compositor that reports more clips than this just gets a coarser
