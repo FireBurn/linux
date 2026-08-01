@@ -67,6 +67,11 @@ pub(crate) struct DockProfile {
     pub(crate) name: &'static str,
     /// Video bulk-OUT endpoint per head.
     pub(crate) video_eps: [u8; drm_sink::HEADS],
+    /// Whether the dock wants the cold ARM burst prefixed to the first frame after a mode set.
+    ///
+    /// Ridge does. Navarro opens a stream with a short per-head message instead, and a capture of
+    /// DLM shows no ARM-sized write on its video endpoints at all.
+    pub(crate) video_arm: bool,
     /// How the dock encodes a head in a video record's `sub` field, as a left shift.
     ///
     /// Ridge uses the bare head number (shift 0). Navarro spaces heads eight apart -- records use
@@ -90,6 +95,7 @@ pub(crate) struct DockProfile {
 static PROFILE_D6000: DockProfile = DockProfile {
     name: "Dell D6000 (Ridge, DL-6xxx)",
     video_eps: [0x08, 0x0b],
+    video_arm: true,
     head_sub_shift: 0,
     video_supported: true,
     per_head_auth: true,
@@ -105,6 +111,7 @@ static PROFILE_D6000: DockProfile = DockProfile {
 static PROFILE_DL7400: DockProfile = DockProfile {
     name: "DL-7400 quad dock (Navarro, DL-7000)",
     video_eps: [0x08, 0x0a],
+    video_arm: false,
     head_sub_shift: 3,
     video_supported: false,
     per_head_auth: false,
@@ -1735,7 +1742,18 @@ impl VinoDriver {
                 Self::CP_SETUP_HEADS
             );
         } else {
-            pr_info!("vino: platform has no per-head authentication; link AKE only\n");
+            // With no per-head SKE there is no per-head video key to derive, and the link session
+            // key is the only one the dock and host share. Give every head that, with its own
+            // content nonce.
+            for head in 0..Self::CP_SETUP_HEADS {
+                video_keys[head] = kernel::crypto::Secret::zeroed();
+                video_keys[head][..16].copy_from_slice(&session.ks[..]);
+                let vnonce = cp::video_content_nonce(&session.riv, head as u8);
+                video_keys[head][16..24].copy_from_slice(&vnonce);
+            }
+            pr_info!(
+                "vino: platform has no per-head authentication; link AKE only, video keys from the link session\n"
+            );
         }
 
         // Finalize the streams of the heads that authenticated, before entering the steady-state
@@ -2438,6 +2456,7 @@ impl usb::Driver for VinoDriver {
             let d: &drm_sink::VinoDrmData = &ddev;
             d.set_video_supported(info.video_supported);
             drm_sink::set_head_sub_shift(info.head_sub_shift);
+            d.set_video_arm(info.video_arm);
         }
         let bringup = BringUp::new(ddev.clone(), info)?;
         let bringup_slot = KBox::pin_init(new_mutex!(Some(bringup.clone())), GFP_KERNEL)?;

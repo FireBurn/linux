@@ -638,6 +638,8 @@ pub(super) struct VinoDrmData {
     /// control session, EDID, modes, hotplug -- works either way, and a dock that resets every few
     /// seconds cannot be developed against at all.
     video_supported: core::sync::atomic::AtomicBool,
+    /// Whether to prefix the cold ARM burst to the first frame; see `DockProfile::video_arm`.
+    video_arm: core::sync::atomic::AtomicBool,
     /// Excludes the independent keepalive loop while the mode worker emits the mode-relative
     /// activation timeline. Without this, a keepalive poll can win `cp_link` between
     /// two explicitly paced markers and stretch/reorder the sequence.
@@ -794,6 +796,7 @@ impl VinoDrmData {
             edid_caught <- new_mutex!(None),
             self_blanked: core::sync::atomic::AtomicU32::new(0),
             video_supported: core::sync::atomic::AtomicBool::new(true),
+            video_arm: core::sync::atomic::AtomicBool::new(true),
             video_keys <- new_mutex!(core::array::from_fn(
                 |_| kernel::crypto::Secret::zeroed()
             )),
@@ -966,6 +969,11 @@ impl VinoDrmData {
     /// Record whether this dock has engaged its CP cipher (`wsub=0x45` acks > 0). The plane
     /// scanout path is gated on it, so pushing frames at a dock whose CP channel is dead cannot
     /// fault it. Set by the bring-up work item once the CP setup completes.
+    /// Record whether this dock wants the cold ARM burst.
+    pub(super) fn set_video_arm(&self, ok: bool) {
+        self.video_arm.store(ok, Ordering::Release);
+    }
+
     /// Record whether this dock's video path may be driven; see [`VinoDrmData::video_supported`].
     pub(super) fn set_video_supported(&self, ok: bool) {
         self.video_supported.store(ok, Ordering::Release);
@@ -4448,11 +4456,12 @@ fn encode_and_send_wht(
     let head_bit = 1u32 << head;
     // The 2560-byte arm burst appears only on frame zero after a mode set. Later frames begin
     // directly with video records.
-    let arm = if data
-        .arm_prefix_pending
-        .load(core::sync::atomic::Ordering::Acquire)
-        & head_bit
-        != 0
+    let arm = if data.video_arm.load(Ordering::Acquire)
+        && data
+            .arm_prefix_pending
+            .load(core::sync::atomic::Ordering::Acquire)
+            & head_bit
+            != 0
     {
         Some(data.build_arm_burst_buf(head_i)?)
     } else {
