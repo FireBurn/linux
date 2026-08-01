@@ -1672,6 +1672,29 @@ impl VinoDrmData {
     /// from the per-head SKE with `riv_h ^ (0x08 | head)` in byte 7, and share
     /// one block counter. Records #8/#9 carry the decoder configuration and
     /// independent nonces.
+    /// Build the per-head video stream-open this platform wants in place of the cold ARM burst.
+    ///
+    /// Sealed with the head's video key like every other video-endpoint message, and prefixed to
+    /// the first frame after a mode set so it reaches the dock before any pixels.
+    fn build_stream_open_buf(&self, head: usize) -> Result<KVec<u8>> {
+        let keys = self.video_keys.lock();
+        let key = keys.get(head).ok_or(EINVAL)?;
+        let mut vkey = kernel::crypto::Secret::zeroed();
+        vkey.copy_from_slice(&key[..16]);
+        let mut vnonce = [0u8; 8];
+        vnonce.copy_from_slice(&key[16..24]);
+        drop(keys);
+        let content = super::cp::navarro_stream_open(0, head as u8);
+        super::cp::seal_video_arm(
+            &vkey,
+            &vnonce,
+            super::cp::navarro_stream_open_sub(head as u8),
+            0x0002,
+            0,
+            &content,
+        )
+    }
+
     fn build_arm_burst_buf(&self, head: usize) -> Result<KVec<u8>> {
         let keys = self.video_keys.lock();
         let key = keys.get(head).ok_or(EINVAL)?;
@@ -4456,14 +4479,20 @@ fn encode_and_send_wht(
     let head_bit = 1u32 << head;
     // The 2560-byte arm burst appears only on frame zero after a mode set. Later frames begin
     // directly with video records.
-    let arm = if data.video_arm.load(Ordering::Acquire)
-        && data
-            .arm_prefix_pending
-            .load(core::sync::atomic::Ordering::Acquire)
-            & head_bit
-            != 0
+    let arm = if data
+        .arm_prefix_pending
+        .load(core::sync::atomic::Ordering::Acquire)
+        & head_bit
+        != 0
     {
-        Some(data.build_arm_burst_buf(head_i)?)
+        // Ridge prefixes a cold ARM burst to the first frame after a mode set; this platform
+        // prefixes a short per-head stream-open instead. Both go in the same slot, ahead of any
+        // pixels.
+        if data.video_arm.load(Ordering::Acquire) {
+            Some(data.build_arm_burst_buf(head_i)?)
+        } else {
+            Some(data.build_stream_open_buf(head_i)?)
+        }
     } else {
         None
     };

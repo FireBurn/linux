@@ -890,6 +890,28 @@ pub(super) fn video_arm_plain_frame(sub: u16, body: &[u8; 16]) -> [u8; 32] {
 }
 
 /// Build a sealed type-4 video-arm frame from its header fields and plaintext content.
+/// Build the 16-byte content of a Navarro per-head video stream-open.
+///
+/// The dock opens each head's stream with a 48-byte frame on that head's video endpoint before any
+/// pixels: 16-byte header, 16 bytes of sealed content, 16-byte MAC. Its wire `sub` is `0x17` for
+/// the first head and `0x1f` for the second -- the same eight-apart spacing the platform uses for
+/// heads everywhere -- and `aux` is 2.
+///
+/// The content follows the shape every other control message on this transport uses: the message
+/// id, its sub, then the running counter.
+pub(super) fn navarro_stream_open(counter: u16, head: u8) -> [u8; 16] {
+    let mut c = [0u8; 16];
+    c[0..2].copy_from_slice(&navarro_stream_open_sub(head).to_le_bytes());
+    c[2..4].copy_from_slice(&0x0002u16.to_le_bytes());
+    c[4..6].copy_from_slice(&counter.to_le_bytes());
+    c
+}
+
+/// The wire `sub` of a head's stream-open: `0x17`, `0x1f`, ...
+pub(super) fn navarro_stream_open_sub(head: u8) -> u16 {
+    0x0017 + (head as u16) * 8
+}
+
 pub(super) fn seal_video_arm(
     key: &[u8; 16],
     riv: &[u8; 8],
