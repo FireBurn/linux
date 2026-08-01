@@ -51,6 +51,41 @@ macro_rules! vino_dev_debug {
 const VID_DISPLAYLINK: u16 = 0x17e9;
 /// Dell Universal Dock D6000 (DL3 family) product id.
 const PID_D6000: u16 = 0x6006;
+/// WAVLINK DL7400 and relatives: "Universal DP Quad Display Docking 16G", identity tail
+/// `NavaDock`, i.e. the Navarro platform on DL-7000 silicon.
+const PID_DL7400: u16 = 0x7000;
+
+/// What differs between the DisplayLink docks this driver drives.
+///
+/// The control plane is identical across them -- bulk OUT `0x02`, bulk IN `0x84`, the same HDCP
+/// and CP sequence -- but the video endpoints are not, so they cannot be a global constant. The
+/// D6000 exposes four video bulk-OUT endpoints and drives its two heads from `0x08` and `0x0b`;
+/// the DL7400 exposes only two, `0x08` and `0x0a`, so naming `0x0b` there fails endpoint
+/// resolution outright and the device never comes up.
+pub(crate) struct DockProfile {
+    /// Human name, logged at probe so an unfamiliar unit identifies itself in dmesg.
+    pub(crate) name: &'static str,
+    /// Video bulk-OUT endpoint per head.
+    pub(crate) video_eps: [u8; drm_sink::HEADS],
+}
+
+/// Dell D6000 and other Ridge-platform docks. HW-verified.
+static PROFILE_D6000: DockProfile = DockProfile {
+    name: "Dell D6000 (Ridge, DL-6xxx)",
+    video_eps: [0x08, 0x0b],
+};
+
+/// DL-7400 quad-display docks (Navarro).
+///
+/// ⚠ Two heads, not four. The part advertises four DisplayPort outputs but exposes only two video
+/// endpoints, and DisplayLink's own strings describe a "Dual NIVO" arrangement with tiled viewers,
+/// so four outputs are most likely two streams each carrying a tiled pair. Two heads is what the
+/// endpoint inventory actually supports; driving four needs the tiling protocol, which is not
+/// reverse-engineered.
+static PROFILE_DL7400: DockProfile = DockProfile {
+    name: "DL-7400 quad dock (Navarro, DL-7000)",
+    video_eps: [0x08, 0x0a],
+};
 
 /// Control and per-head bulk endpoints.
 const EP_CTRL_OUT: u8 = 0x02;
@@ -68,7 +103,7 @@ pub(crate) struct Endpoints {
     pub(crate) ctrl_out: usb::Endpoint<usb::BulkOut>,
     /// EP84: dock->host control-plane bulk replies.
     pub(crate) ctrl_in: usb::Endpoint<usb::BulkIn>,
-    /// Per-head video bulk-OUT endpoints ([`drm_sink::VIDEO_EPS`]).
+    /// Per-head video bulk-OUT endpoints, from [`DockProfile::video_eps`].
     pub(crate) video: [usb::Endpoint<usb::BulkOut>; drm_sink::HEADS],
 }
 
@@ -77,9 +112,12 @@ impl Endpoints {
     ///
     /// The control endpoints and the video endpoints are required; the interrupt status endpoint
     /// is optional because only the bring-up probe reads it.
-    pub(crate) fn resolve<Ctx: device::DeviceContext>(intf: &usb::Interface<Ctx>) -> Result<Self> {
-        let mut video = [intf.endpoint::<usb::BulkOut>(drm_sink::VIDEO_EPS[0])?; drm_sink::HEADS];
-        for (slot, addr) in video.iter_mut().zip(drm_sink::VIDEO_EPS).skip(1) {
+    pub(crate) fn resolve<Ctx: device::DeviceContext>(
+        intf: &usb::Interface<Ctx>,
+        profile: &DockProfile,
+    ) -> Result<Self> {
+        let mut video = [intf.endpoint::<usb::BulkOut>(profile.video_eps[0])?; drm_sink::HEADS];
+        for (slot, addr) in video.iter_mut().zip(profile.video_eps).skip(1) {
             *slot = intf.endpoint::<usb::BulkOut>(addr)?;
         }
 
@@ -1423,7 +1461,11 @@ impl VinoDriver {
                 }
             }
         }
-        for head in 0..Self::CP_SETUP_HEADS {
+        // Which heads completed their downstream authentication. A head with nothing plugged into
+        // it never runs one, so this is not expected to be all of them.
+        let mut head_ok = [false; Self::CP_SETUP_HEADS];
+        let mut heads_authenticated = 0usize;
+        'per_head: for head in 0..Self::CP_SETUP_HEADS {
             // Derive an independent HDCP 2.2 authentication chain for this downstream head.
             let mut rtx_h = [0u8; drm_hdcp::RTX_LEN];
             rng::fill(&mut rtx_h);
@@ -1456,8 +1498,19 @@ impl VinoDriver {
                 // for deriving this head's kd, Edkey and V before the consuming messages.
                 if i >= 3 && !rrx_applied {
                     let Some(rrx_h) = fresh_rrx else {
-                        pr_err!("vino: per-head[{head}] missing AKE_Send_Rrx\n");
-                        return Err(EPROTO);
+                        // No `rrx` means this head never began a downstream authentication, which
+                        // is what an empty DisplayPort connector looks like -- DLM does not run a
+                        // per-head burst for a head with no sink either, as a capture of it
+                        // driving a monitorless dock shows: one AKE for the dock, none per head.
+                        //
+                        // Skip the head rather than failing the device. Aborting here took the
+                        // whole dock down whenever a single connector was empty, so a two-head
+                        // dock with one monitor never came up at all, and a dock with none was
+                        // unreachable even for EDID and hotplug.
+                        pr_info!(
+                            "vino: head {head} has no downstream sink (no AKE_Send_Rrx); skipping its authentication\n"
+                        );
+                        continue 'per_head;
                     };
                     let kd_h = hdcp::derive_kd(&km_h, &rtx_h, &rrx_h)?;
                     edkey_h = Some(hdcp::compute_eks(&km_h, &rtx_h, &rrx_h, &rn_h, &ske_ks_h)?);
@@ -1633,10 +1686,25 @@ impl VinoDriver {
                     }
                 }
             }
-        }
 
-        // Finalize both streams before entering the steady-state heartbeat.
+            head_ok[head] = true;
+            heads_authenticated += 1;
+        }
+        pr_info!(
+            "vino: {heads_authenticated}/{} head(s) authenticated\n",
+            Self::CP_SETUP_HEADS
+        );
+
+        // Finalize the streams of the heads that authenticated, before entering the steady-state
+        // heartbeat.
+        //
+        // Only those heads: finalizing a stream whose downstream authentication never ran makes
+        // the dock hard-reset a few seconds later and re-enumerate, which reads as a spontaneous
+        // dock reset rather than as a message it refused.
         for (id, sub, off22) in cp::CP_SETUP_FINALIZE {
+            if (off22 as usize) < Self::CP_SETUP_HEADS && !head_ok[off22 as usize] {
+                continue;
+            }
             // Offset 22 selects the head or step; sub 0x4c also carries 1 at offset 23.
             let mut c = [0u8; 32];
             c[0..2].copy_from_slice(&id.to_le_bytes());
@@ -2234,18 +2302,21 @@ kernel::usb_device_table!(
     USB_TABLE,
     MODULE_USB_TABLE,
     <VinoDriver as usb::Driver>::IdInfo,
-    [(usb::DeviceId::from_id(VID_DISPLAYLINK, PID_D6000), ())]
+    [
+        (usb::DeviceId::from_id(VID_DISPLAYLINK, PID_D6000), &PROFILE_D6000),
+        (usb::DeviceId::from_id(VID_DISPLAYLINK, PID_DL7400), &PROFILE_DL7400),
+    ]
 );
 
 impl usb::Driver for VinoDriver {
-    type IdInfo = ();
+    type IdInfo = &'static DockProfile;
     type Data<'bound> = VinoBoundData;
     const ID_TABLE: usb::IdTable<Self::IdInfo> = &USB_TABLE;
 
     fn probe<'bound>(
         intf: &'bound usb::Interface<Core<'_>>,
         _id: &usb::DeviceId,
-        _info: &'bound Self::IdInfo,
+        info: &'bound Self::IdInfo,
         io: Arc<usb::IoWindow>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let cdev: &device::Device<Core<'_>> = intf.as_ref();
@@ -2257,6 +2328,17 @@ impl usb::Driver for VinoDriver {
         // An interface with no active alternate setting has no endpoints to drive.
         let ifnum = intf.number().ok_or(ENODEV)?;
         log_device_identity(cdev, intf, ifnum);
+        if ifnum == 0 {
+            // Which profile matched, and the endpoints it implies. On unfamiliar hardware this one
+            // line is what says whether the driver recognised the dock or fell back to a stranger's
+            // endpoint map, and needing a debug build to see it costs a whole test round trip.
+            dev_info!(
+                cdev,
+                "vino: matched profile \"{}\", video endpoints {:#04x?}\n",
+                info.name,
+                info.video_eps
+            );
+        }
         if ifnum != 0 {
             // Keep the app-specific interface paired with the display function. Let the audio
             // (2-4) and Ethernet (5-6) interfaces fall through to their class drivers. Returning
@@ -2285,7 +2367,7 @@ impl usb::Driver for VinoDriver {
 
         // Resolve the dock's endpoints against interface 0's descriptor once, so every later
         // transfer names a direction/type-checked endpoint instead of a bare address.
-        let eps = Endpoints::resolve(intf)?;
+        let eps = Endpoints::resolve(intf, info)?;
 
         // DRM device lifecycle: allocate an `UnregisteredDevice`, wire up the KMS pipeline on it
         // while still unregistered, then register it. The `Registration` is stored in the bound

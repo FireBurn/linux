@@ -103,11 +103,11 @@ const BAND_PARITY_BIT: bool = true;
 /// Emit image records in raster order.
 const INTERLACED_BANDS: bool = false;
 
-/// Number of display heads on the D6000.
+/// Number of display heads driven per dock.
+///
+/// A ceiling as much as a count: it sizes the per-head arrays throughout the driver, and every
+/// dock supported so far exposes exactly this many video endpoints.
 pub(crate) const HEADS: usize = 2;
-
-/// Video bulk-OUT endpoint for each head.
-pub(crate) const VIDEO_EPS: [u8; HEADS] = [0x08, 0x0b];
 
 /// Maximum number of individual frame-damage rectangles re-converted per flip before they are
 /// collapsed into a single bounding box. Bounds the stack array used on the atomic-commit path
@@ -3092,7 +3092,7 @@ pub(super) struct PlaneArgs {
 #[pin_data]
 pub(super) struct VinoPlane {
     /// Which display head (0-based) this plane belongs to. Selects the scanout video endpoint
-    /// ([`VIDEO_EPS`]) and the cursor CP `head` field.
+    /// (see `DockProfile::video_eps`) and the cursor CP `head` field.
     head: u8,
     /// Whether this is the cursor plane (vs. the primary scanout plane).
     is_cursor: bool,
