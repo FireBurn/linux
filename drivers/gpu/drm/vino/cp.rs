@@ -942,6 +942,16 @@ pub(super) fn parse_edid_from_reply(
         if edid[..8] != MAGIC {
             continue;
         }
+        // ...and its checksum. The magic is only eight bytes and a dock with an empty port can
+        // return a block that carries it, which is enough to be mistaken for a monitor: the head
+        // is then declared connected, a hotplug is raised for a sink that is not there, and the
+        // dock resets. A real base block sums to zero modulo 256.
+        if edid.len() < 128 {
+            continue;
+        }
+        if edid[..128].iter().fold(0u8, |a, b| a.wrapping_add(*b)) != 0 {
+            continue;
+        }
         let total = ((1 + edid[126] as usize) * 128).min(edid.len());
         let mut out = KVec::with_capacity(total, GFP_KERNEL)?;
         out.extend_from_slice(&edid[..total], GFP_KERNEL)?;

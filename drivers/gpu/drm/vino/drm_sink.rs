@@ -1895,8 +1895,25 @@ impl VinoDrmData {
         match caught.or_else(|| self.drain_for_edid(io)) {
             Some(blob) => {
                 let n = blob.len();
+                // Say what the EDID claims to be, not just that one arrived. On unfamiliar
+                // hardware this is what distinguishes a real monitor from a block the dock
+                // synthesised for an empty port.
+                if blob.len() >= 12 {
+                    let m = u16::from_be_bytes([blob[8], blob[9]]);
+                    let vendor = [
+                        b'@' + ((m >> 10) & 0x1f) as u8,
+                        b'@' + ((m >> 5) & 0x1f) as u8,
+                        b'@' + (m & 0x1f) as u8,
+                    ];
+                    pr_info!(
+                        "vino: head {head} EDID {n} B, vendor {}{}{} product {:#06x}\n",
+                        vendor[0] as char,
+                        vendor[1] as char,
+                        vendor[2] as char,
+                        u16::from_le_bytes([blob[10], blob[11]])
+                    );
+                }
                 self.set_edid(head as usize, blob);
-                vino_debug!("vino: head {head} EDID re-cached after re-engage ({n} bytes)\n");
                 Ok(true)
             }
             None => {
