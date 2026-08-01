@@ -534,7 +534,35 @@ pub(super) fn decode_in_lenient(
 /// key and `V` must use this value rather than the main-link `rrx`, otherwise repeater
 /// authentication and the downstream DDC path fail.
 pub(super) fn perhead_rrx(ks: &[u8; 16], out_riv: &[u8; 8], wire: &[u8]) -> Option<[u8; 8]> {
-    if wire.len() <= 16 || u16::from_le_bytes([wire[8], wire[9]]) != 0x45 {
+    if wire.len() <= 16 {
+        return None;
+    }
+    // The push arrives in one of two framings depending on the dock.
+    //
+    // Ridge seals it (`wsub=0x45`) and it has to be opened below. Navarro sends the whole per-head
+    // burst in the plaintext framing (`wsub=0x25`) instead, and the reply is readable as it
+    // stands: inner id/sub at offsets 16/18, HDCP msg-id at 25, `rrx` at 26. Rejecting anything
+    // that was not sealed dropped this silently, so no head on that platform ever obtained an
+    // `rrx`, its repeater authentication never completed, and the dock reset shortly after being
+    // told a monitor was connected.
+    const SUB_HDCP_RESP: u16 = 0x25;
+    const SUB_SEALED: u16 = 0x45;
+    let wsub = u16::from_le_bytes([wire[8], wire[9]]);
+    if wsub == SUB_HDCP_RESP {
+        let inner = &wire[16..];
+        if inner.len() < 18 {
+            return None;
+        }
+        let id = u16::from_le_bytes([inner[0], inner[1]]);
+        let sub = u16::from_le_bytes([inner[2], inner[3]]);
+        if id != 0x10 || sub != 0x84 || inner[9] != 0x06 {
+            return None;
+        }
+        let mut rrx = [0u8; 8];
+        rrx.copy_from_slice(&inner[10..18]);
+        return Some(rrx);
+    }
+    if wsub != SUB_SEALED {
         return None;
     }
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);

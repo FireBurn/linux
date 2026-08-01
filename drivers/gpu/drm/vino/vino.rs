@@ -67,12 +67,21 @@ pub(crate) struct DockProfile {
     pub(crate) name: &'static str,
     /// Video bulk-OUT endpoint per head.
     pub(crate) video_eps: [u8; drm_sink::HEADS],
+    /// Whether the dock runs a per-head HDCP repeater authentication after the main-link AKE.
+    ///
+    /// Ridge does: each head gets its own AKE, `rrx`, `Edkey` and `V`, and its video key comes
+    /// from that head's SKE. Navarro does not -- a capture of DLM bringing this dock up with a
+    /// monitor attached contains exactly one AKE_No_Stored_km and no per-head burst of any kind,
+    /// sealed or plaintext. Running one anyway leaves every head waiting for an AKE_Send_Rrx that
+    /// the dock is never going to send.
+    pub(crate) per_head_auth: bool,
 }
 
 /// Dell D6000 and other Ridge-platform docks. HW-verified.
 static PROFILE_D6000: DockProfile = DockProfile {
     name: "Dell D6000 (Ridge, DL-6xxx)",
     video_eps: [0x08, 0x0b],
+    per_head_auth: true,
 };
 
 /// DL-7400 quad-display docks (Navarro).
@@ -85,6 +94,7 @@ static PROFILE_D6000: DockProfile = DockProfile {
 static PROFILE_DL7400: DockProfile = DockProfile {
     name: "DL-7400 quad dock (Navarro, DL-7000)",
     video_eps: [0x08, 0x0a],
+    per_head_auth: false,
 };
 
 /// Control and per-head bulk endpoints.
@@ -411,6 +421,9 @@ struct VinoBoundData {
 #[pin_data]
 struct BringUp {
     ddev: ARef<drm_sink::VinoDrmDevice>,
+    /// Which dock this is. The bring-up sequence differs by platform (see [`DockProfile`]), and
+    /// the work item runs long after `probe` has returned, so it carries the profile itself.
+    profile: &'static DockProfile,
     #[pin]
     work: Work<BringUp>,
 }
@@ -420,10 +433,14 @@ impl_has_work! {
 }
 
 impl BringUp {
-    fn new(ddev: ARef<drm_sink::VinoDrmDevice>) -> Result<Arc<Self>> {
+    fn new(
+        ddev: ARef<drm_sink::VinoDrmDevice>,
+        profile: &'static DockProfile,
+    ) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(BringUp {
                 ddev,
+                profile,
                 work <- new_work!("vino::bring_up"),
             }),
             GFP_KERNEL,
@@ -435,6 +452,7 @@ impl WorkItem for BringUp {
     type Pointer = Arc<BringUp>;
 
     fn run(this: Arc<BringUp>) {
+        let profile = this.profile;
         let data: &drm_sink::VinoDrmData = &this.ddev;
         let Ok(link) = UsbLink::open(&data.io, data.eps) else {
             return;
@@ -465,6 +483,7 @@ impl WorkItem for BringUp {
                 let mut discovery_deferred = [false; VinoDriver::CP_SETUP_HEADS];
                 let (n, wseq_end, ctr_end) = VinoDriver::send_cp_setup(
                     dev,
+                    profile,
                     &mut session,
                     &mut edid_out,
                     &mut edid_heads,
@@ -1266,6 +1285,7 @@ impl VinoDriver {
     /// session, and `video_keys` receives the key and nonce established for each head.
     fn send_cp_setup(
         dev: &UsbLink<'_>,
+        profile: &DockProfile,
         session: &mut Session,
         // Scratch slot filled by reply drains and moved into the selected head's EDID cache.
         edid_out: &mut Option<KVec<u8>>,
@@ -1466,6 +1486,12 @@ impl VinoDriver {
         let mut head_ok = [false; Self::CP_SETUP_HEADS];
         let mut heads_authenticated = 0usize;
         'per_head: for head in 0..Self::CP_SETUP_HEADS {
+            if !profile.per_head_auth {
+                // This platform authenticates the link once and never per head; see
+                // `DockProfile::per_head_auth`. Sending the burst anyway just waits for replies
+                // that are not coming.
+                break 'per_head;
+            }
             // Derive an independent HDCP 2.2 authentication chain for this downstream head.
             let mut rtx_h = [0u8; drm_hdcp::RTX_LEN];
             rng::fill(&mut rtx_h);
@@ -1690,10 +1716,14 @@ impl VinoDriver {
             head_ok[head] = true;
             heads_authenticated += 1;
         }
-        pr_info!(
-            "vino: {heads_authenticated}/{} head(s) authenticated\n",
-            Self::CP_SETUP_HEADS
-        );
+        if profile.per_head_auth {
+            pr_info!(
+                "vino: {heads_authenticated}/{} head(s) authenticated\n",
+                Self::CP_SETUP_HEADS
+            );
+        } else {
+            pr_info!("vino: platform has no per-head authentication; link AKE only\n");
+        }
 
         // Finalize the streams of the heads that authenticated, before entering the steady-state
         // heartbeat.
@@ -2390,7 +2420,7 @@ impl usb::Driver for VinoDriver {
         // Run them on the device's ordered session queue so probe can return immediately. The work
         // item owns the DRM device, and the bound data retains a handle so quiesce can cancel or
         // flush it before the I/O window closes.
-        let bringup = BringUp::new(ddev.clone())?;
+        let bringup = BringUp::new(ddev.clone(), info)?;
         let bringup_slot = KBox::pin_init(new_mutex!(Some(bringup.clone())), GFP_KERNEL)?;
 
         let data: &drm_sink::VinoDrmData = &ddev;
