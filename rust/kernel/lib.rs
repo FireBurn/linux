@@ -72,6 +72,8 @@ pub mod driver;
 #[cfg(CONFIG_DRM = "y")]
 pub mod drm;
 pub mod error;
+#[cfg(target_arch = "x86_64")]
+pub mod fpu;
 pub mod faux;
 #[cfg(CONFIG_RUST_FW_LOADER_ABSTRACTIONS)]
 pub mod firmware;
