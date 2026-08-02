@@ -718,15 +718,15 @@ impl WorkItem for BringUp {
                         next_presence = Instant::<Monotonic>::now();
                     }
                 }
-                // A topology push brings both presence probing and absent-head recovery forward.
+                // A topology push brings presence probing forward.  Do not also cancel the
+                // absent-head re-engage backoff here: Navarro emits an `id=0x44` reply for every
+                // ordinary presence probe, and `drain_cp_pushes` deliberately reports that as a
+                // downstream event.  Resetting `next_reengage` on each such reply turned two
+                // empty sockets into a continuous engage/EDID loop instead of the documented
+                // four-second retry cadence.  The probe below observes an actual arrival and
+                // then re-engages that specific connector immediately.
                 if data.take_downstream_event() {
                     next_presence = Instant::<Monotonic>::now();
-                    // Use one bounded recovery path for both periodic and event-driven retries.
-                    for h in 0..data.connector_count() {
-                        if !head_known[h] {
-                            next_reengage[h] = Instant::<Monotonic>::now();
-                        }
-                    }
                 }
                 let now_p = Instant::<Monotonic>::now();
                 if (now_p - next_presence).as_millis() >= 0 {
