@@ -1014,6 +1014,15 @@ impl VinoDrmData {
         self.presence_from_status.store(on, Ordering::Release);
     }
 
+    /// Whether a decodable status word is required to determine connector presence.
+    ///
+    /// Navarro answers the same handler for both occupied and empty sockets.  Unlike Ridge, a
+    /// missing reply therefore cannot be inferred to mean that a monitor was removed: it merely
+    /// means that this polling round did not recover the status word.
+    pub(super) fn presence_from_status(&self) -> bool {
+        self.presence_from_status.load(Ordering::Acquire)
+    }
+
     /// Record how many connectors this dock exposes; see [`DockProfile::connectors`].
     pub(super) fn set_connectors(&self, n: u8) {
         self.connectors.store(

@@ -743,6 +743,15 @@ impl WorkItem for BringUp {
                                 if data.is_self_blanked(h) {
                                     continue;
                                 }
+                                // Navarro reports all four physical sockets through the same
+                                // handler and distinguishes them with a status bit.  A missing
+                                // sealed reply has no such bit, so it is not evidence that this
+                                // particular monitor disappeared.  Retain the last known state
+                                // and wait for a decodable negative reply instead of repeatedly
+                                // tearing down a live KMS connector and exposing stale dock RAM.
+                                if data.presence_from_status() {
+                                    continue;
+                                }
                                 head_silent[h] = head_silent[h].saturating_add(1);
                                 if head_silent[h] < PRESENCE_SILENT_LIMIT {
                                     continue; // one dropped reply proves nothing
