@@ -890,26 +890,26 @@ pub(super) fn video_arm_plain_frame(sub: u16, body: &[u8; 16]) -> [u8; 32] {
 }
 
 /// Build a sealed type-4 video-arm frame from its header fields and plaintext content.
-/// Build the 16-byte content of a Navarro per-head video stream-open.
+/// Build the 16-byte plaintext of a Navarro video stream-open.
 ///
-/// The dock opens each head's stream with a 48-byte frame on that head's video endpoint before any
-/// pixels: 16-byte header, 16 bytes of sealed content, 16-byte MAC. Its wire `sub` is `0x17` for
-/// the first head and `0x1f` for the second -- the same eight-apart spacing the platform uses for
-/// heads everywhere -- and `aux` is 2.
-///
-/// The content follows the shape every other control message on this transport uses: the message
-/// id, its sub, then the running counter.
-pub(super) fn navarro_stream_open(counter: u16, head: u8) -> [u8; 16] {
-    let mut c = [0u8; 16];
-    c[0..2].copy_from_slice(&navarro_stream_open_sub(head).to_le_bytes());
-    c[2..4].copy_from_slice(&0x0002u16.to_le_bytes());
-    c[4..6].copy_from_slice(&counter.to_le_bytes());
+/// This is not a normal CP header.  The cold DLM captures decrypt to the fixed fourteen-byte
+/// prefix below followed by a session-local u16 token. In particular, the connector is encoded
+/// solely in the *wire* sub, not in this plaintext. The token has varied per connector and
+/// session; its construction and acceptance rule are not yet known.
+pub(super) fn navarro_stream_open(token: u16) -> [u8; 16] {
+    let mut c = [
+        0x04, 0x00, 0x08, 0x04, 0x05, 0x00, 0x06, 0x00, 0x07, 0x01, 0x08, 0x02, 0x07, 0x00, 0, 0,
+    ];
+    c[14..16].copy_from_slice(&token.to_le_bytes());
     c
 }
 
-/// The wire `sub` of a head's stream-open: `0x17`, `0x1f`, ...
-pub(super) fn navarro_stream_open_sub(head: u8) -> u16 {
-    0x0017 + (head as u16) * 8
+/// The wire `sub` of a Navarro connector's stream-open.
+///
+/// Navarro has four connectors, even though its two video endpoints multiplex them.  Frame
+/// records use `connector << 3`, while this one-time stream-open uses `(connector << 3) | 7`.
+pub(super) fn navarro_stream_open_sub(connector: u8) -> u16 {
+    ((connector as u16) << 3) | 0x0007
 }
 
 pub(super) fn seal_video_arm(

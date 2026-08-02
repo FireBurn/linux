@@ -103,11 +103,12 @@ const BAND_PARITY_BIT: bool = true;
 /// Emit image records in raster order.
 const INTERLACED_BANDS: bool = false;
 
-/// Number of display heads driven per dock.
+/// Maximum number of physical downstream connectors Vino exposes.
 ///
-/// A ceiling as much as a count: it sizes the per-head arrays throughout the driver, and every
-/// dock supported so far exposes exactly this many video endpoints.
-pub(crate) const HEADS: usize = 2;
+/// Ridge docks use the first two. Navarro has four physical DP sockets; connectors 0/2 share
+/// bulk endpoint 0x08 and connectors 1/3 share 0x0a. `DockProfile::connectors` selects the
+/// active prefix at runtime, while this constant keeps the DRM object layout fixed at registration.
+pub(crate) const HEADS: usize = 4;
 
 /// Re-export so `probe` can set the dock's head encoding without reaching into the codec module.
 pub(crate) fn set_head_sub_shift(shift: u8) {
@@ -600,6 +601,10 @@ pub(super) struct VinoDrmData {
     scanout_work_h0: Work<VinoDrmDevice, 1>,
     #[pin]
     scanout_work_h1: Work<VinoDrmDevice, 2>,
+    #[pin]
+    scanout_work_h2: Work<VinoDrmDevice, 3>,
+    #[pin]
+    scanout_work_h3: Work<VinoDrmDevice, 4>,
     /// Dedicated queue for initial authentication and the steady-state control session.
     session_queue: workqueue::OwnedQueue,
     /// Ordered queue for runtime KMS and cursor control transactions.
@@ -640,6 +645,12 @@ pub(super) struct VinoDrmData {
     video_supported: core::sync::atomic::AtomicBool,
     /// Whether to prefix the cold ARM burst to the first frame; see `DockProfile::video_arm`.
     video_arm: core::sync::atomic::AtomicBool,
+    /// Whether presence comes from the probe reply's status word rather than from which handler
+    /// answered; see `DockProfile::presence_from_status`.
+    presence_from_status: core::sync::atomic::AtomicBool,
+    /// How many downstream connectors this dock answers a presence probe for; see
+    /// `DockProfile::connectors`. Ridge: 2; Navarro: all four physical sockets.
+    connectors: core::sync::atomic::AtomicU8,
     /// Excludes the independent keepalive loop while the mode worker emits the mode-relative
     /// activation timeline. Without this, a keepalive poll can win `cp_link` between
     /// two explicitly paced markers and stretch/reorder the sequence.
@@ -671,7 +682,11 @@ pub(super) struct VinoDrmData {
     /// Logical WHT frame sequence per head.
     #[pin]
     scanout_seq: Mutex<[u32; HEADS]>,
-    /// Persistent pipelined bulk-OUT queue per head. It remains live between frames.
+    /// Persistent pipelined bulk-OUT queue per connector. It remains live between frames.
+    ///
+    /// Navarro video stays gated until its sealed stream-open/key schedule is reproduced. Before
+    /// that gate is lifted, these queues must be refactored to one queue per physical endpoint so
+    /// connectors 0/2 and 1/3 cannot submit overlapping URBs to their shared pipes.
     #[pin]
     video_q: Mutex<[Option<super::usb::BulkOutQueue>; HEADS]>,
     /// One reusable 64-KiB coalescing window per head. `frame_records` deliberately stores a frame
@@ -756,6 +771,8 @@ impl VinoDrmData {
             cmd_work <- new_delayed_work!("vino::kms_cmd"),
             scanout_work_h0 <- new_work!("vino::scanout_h0"),
             scanout_work_h1 <- new_work!("vino::scanout_h1"),
+            scanout_work_h2 <- new_work!("vino::scanout_h2"),
+            scanout_work_h3 <- new_work!("vino::scanout_h3"),
             session_queue: workqueue::Queue::new_ordered().build(kernel::c_str!("vino_session"))?,
             kms_queue: workqueue::Queue::new_ordered().build(kernel::c_str!("vino_kms"))?,
             scanout_queue: workqueue::Queue::new_unbound()
@@ -796,6 +813,8 @@ impl VinoDrmData {
             edid_caught <- new_mutex!(None),
             self_blanked: core::sync::atomic::AtomicU32::new(0),
             video_supported: core::sync::atomic::AtomicBool::new(true),
+            presence_from_status: core::sync::atomic::AtomicBool::new(false),
+            connectors: core::sync::atomic::AtomicU8::new(HEADS as u8),
             video_arm: core::sync::atomic::AtomicBool::new(true),
             video_keys <- new_mutex!(core::array::from_fn(
                 |_| kernel::crypto::Secret::zeroed()
@@ -908,6 +927,8 @@ impl VinoDrmData {
         drop(self.cmd_work.cancel_sync());
         drop(self.scanout_work_h0.cancel_sync());
         drop(self.scanout_work_h1.cancel_sync());
+        drop(self.scanout_work_h2.cancel_sync());
+        drop(self.scanout_work_h3.cancel_sync());
 
         // A running callback may have taken a batch just before shutdown was published. It has
         // finished now; clear anything it left behind and tear the USB queues down while their
@@ -982,6 +1003,28 @@ impl VinoDrmData {
     /// Whether video writes are permitted for this dock.
     pub(super) fn video_supported(&self) -> bool {
         self.video_supported.load(Ordering::Acquire)
+    }
+
+    /// Record how this dock reports monitor presence; see [`DockProfile::presence_from_status`].
+    pub(super) fn set_presence_from_status(&self, on: bool) {
+        self.presence_from_status.store(on, Ordering::Release);
+    }
+
+    /// Record how many connectors this dock exposes; see [`DockProfile::connectors`].
+    pub(super) fn set_connectors(&self, n: u8) {
+        self.connectors.store(
+            if n == 0 {
+                HEADS as u8
+            } else {
+                n.min(HEADS as u8)
+            },
+            Ordering::Release,
+        );
+    }
+
+    /// Number of physical connectors selected by the matched dock profile.
+    pub(super) fn connector_count(&self) -> usize {
+        usize::from(self.connectors.load(Ordering::Acquire)).min(HEADS)
     }
 
     pub(super) fn set_cp_engaged(&self, engaged: bool) {
@@ -1684,7 +1727,9 @@ impl VinoDrmData {
         let mut vnonce = [0u8; 8];
         vnonce.copy_from_slice(&key[16..24]);
         drop(keys);
-        let content = super::cp::navarro_stream_open(0, head as u8);
+        // The final u16 is a session-local opaque token. Its construction and validation are not
+        // yet known; this path remains unreachable while Navarro video is gated.
+        let content = super::cp::navarro_stream_open(0);
         super::cp::seal_video_arm(
             &vkey,
             &vnonce,
@@ -2017,19 +2062,28 @@ impl VinoDrmData {
         None
     }
 
-    /// Stage 2 (runtime monitor hotplug): probe whether head `head` currently has a monitor.
+    /// Stage 2 (runtime monitor hotplug): probe one physical connector.
     ///
-    /// Sends the per-head EDID probe (`id=0x15 sub=0x20`, byte22 = head selector -- the same
-    /// selector that unblocked the whole EDID path) and decodes the dock's sealed `0x45` reply.
-    /// A present monitor routes the probe to the dock's trusted EDID/display-capability handler
-    /// (`id=0x44`/`id=0x194`/`id=0x78`); an empty port gets a bare generic `id=0x14` ack. Returns
-    /// `Some(true/false)` on a decodable reply, `None` if CP is down or no reply decoded (caller
-    /// treats `None` as "no change", and debounces `Some` transitions). Reuses the live session
-    /// `ks/riv/counter` exactly like `send_cp`, so it stays in CP lockstep.
+    /// Navarro multiplexes two connectors per bulk endpoint, but its EDID selector and stream
+    /// record subfield are still per socket. Never collapse sockets 0/2 or 1/3 here: doing so
+    /// turns two independently connected monitors into one KMS connector.
     pub(super) fn probe_head_present(&self, dev: &BoundInterface<'_>, head: u8) -> Option<bool> {
+        if usize::from(head) >= self.connector_count() {
+            return Some(false);
+        }
+        self.probe_connector_present(dev, head, head)
+    }
+
+    /// Probe one downstream connector. `head` selects its own presence-change cell.
+    ///
+    /// Sends the EDID probe (`id=0x15 sub=0x20`, byte22 = connector selector -- the same selector
+    /// that unblocked the whole EDID path) and decodes the dock's sealed `0x45` reply. Returns
+    /// `Some(true/false)` on a decodable reply, `None` if CP is down or nothing decoded. Reuses the
+    /// live session `ks/riv/counter` exactly like `send_cp`, so it stays in CP lockstep.
+    fn probe_connector_present(&self, dev: &BoundInterface<'_>, sel: u8, head: u8) -> Option<bool> {
         let mut guard = self.cp_link.lock();
         let link = (&mut *guard).as_mut()?;
-        let msg = super::cp::get_edid_req_sub(link.counter, 0x0020, head).ok()?;
+        let msg = super::cp::get_edid_req_sub(link.counter, 0x0020, sel).ok()?;
         let frame =
             super::cp::seal_interactive(&link.ks, &link.riv, 0x15, link.wire_seq, &msg).ok()?;
         dev.ctrl_send(&frame, super::timeout(), GFP_KERNEL).ok()?;
@@ -2048,11 +2102,20 @@ impl VinoDrmData {
         };
         // Decode the downstream status at inner bytes 22..26 as well as the handler ID.
         let (id, status, _) = super::cp::probe_reply_status(&link.ks, &link.riv, &reply[..got])?;
-        // A head with no monitor cannot be routed to an EDID handler, so the dock answers the
-        // generic `id=0x14` rather than the rich `id=0x44` -- the same substitution it makes for a
-        // wrong head selector, which is how the EDID head-selector bug was found. Keep that as the
-        // primary discriminator and let the status word refine it.
-        let present = matches!(id, 0x44 | 0x194 | 0x78);
+        // On Ridge a head with no monitor cannot be routed to an EDID handler, so the dock answers
+        // the generic `id=0x14` rather than the rich `id=0x44` -- the same substitution it makes
+        // for a wrong head selector, which is how the EDID head-selector bug was found. That is
+        // the primary discriminator there, refined by the status word.
+        //
+        // Navarro answers `id=0x44` for every one of its four connectors whether or not a monitor
+        // is attached, so the same test is unconditionally true and no unplug is ever seen. There
+        // presence is bit `0x10` of inner byte 23 -- `05 11 27 00` occupied, `05 01 <20|21|60|61>
+        // 00` empty -- which lands in bits 8..15 of the status word.
+        let present = if self.presence_from_status.load(Ordering::Acquire) {
+            status & 0x0000_1000 != 0
+        } else {
+            matches!(id, 0x44 | 0x194 | 0x78)
+        };
         // One line per *changed* answer per head, so a steady link is silent and an unplug is
         // unmissable. Both fields are packed into the same cell: the id alone cannot distinguish a
         // dock that keeps saying `0x44` from one whose downstream state has moved underneath it.
@@ -2261,9 +2324,8 @@ impl VinoDrmData {
     }
 
     /// Wake `head`'s scanout worker. The work ID is a const generic, so the runtime head index has
-    /// to be matched into it here; the `HEADS == 2` assertion by the `WorkItem` impls keeps this
-    /// exhaustive. Enqueueing an already-pending item is a no-op, and enqueueing one that is
-    /// currently running re-arms it, preserving a flip that arrives during
+    /// to be matched into it here. Enqueueing an already-pending item is a no-op, and enqueueing
+    /// one that is currently running re-arms it, preserving a flip that arrives during
     /// encoding for the worker's next pass.
     fn enqueue_scanout(&self, dev: &VinoDrmDevice, head: usize) {
         match head {
@@ -2272,6 +2334,12 @@ impl VinoDrmData {
             }
             1 => {
                 let _ = self.scanout_queue.enqueue::<_, 2>(ARef::from(dev));
+            }
+            2 => {
+                let _ = self.scanout_queue.enqueue::<_, 3>(ARef::from(dev));
+            }
+            3 => {
+                let _ = self.scanout_queue.enqueue::<_, 4>(ARef::from(dev));
             }
             _ => {}
         }
@@ -2390,15 +2458,15 @@ impl_has_delayed_work! {
 impl_has_work! {
     impl HasWork<VinoDrmDevice, 1> for VinoDrmData { self.scanout_work_h0 }
     impl HasWork<VinoDrmDevice, 2> for VinoDrmData { self.scanout_work_h1 }
+    impl HasWork<VinoDrmDevice, 3> for VinoDrmData { self.scanout_work_h2 }
+    impl HasWork<VinoDrmDevice, 4> for VinoDrmData { self.scanout_work_h3 }
 }
 
-/// One scanout work item exists per head, and a work ID is a const generic. Raising [`HEADS`]
-/// without adding a `scanout_work_hN` field (plus its `HasWork`/`WorkItem` impls and an
-/// `enqueue_scanout` arm) would silently leave the extra heads with no worker at all -- their
-/// frames would sit in `pending_scanout` until some other head's flip happened to run. Fail the
-/// build instead.
+/// One scanout work item exists per connector, and its work ID is a const generic. Keep this
+/// assertion adjacent to the explicit fields/arms below: adding another connector without all
+/// three would silently leave its frames in `pending_scanout`.
 const _: () = assert!(
-    HEADS == 2,
+    HEADS == 4,
     "add a scanout_work_hN work item per head (see VinoDrmData::enqueue_scanout)"
 );
 
@@ -2413,6 +2481,20 @@ impl WorkItem<2> for VinoDrmData {
     type Pointer = ARef<VinoDrmDevice>;
     fn run(this: ARef<VinoDrmDevice>) {
         run_scanout_worker(this, 1);
+    }
+}
+
+impl WorkItem<3> for VinoDrmData {
+    type Pointer = ARef<VinoDrmDevice>;
+    fn run(this: ARef<VinoDrmDevice>) {
+        run_scanout_worker(this, 2);
+    }
+}
+
+impl WorkItem<4> for VinoDrmData {
+    type Pointer = ARef<VinoDrmDevice>;
+    fn run(this: ARef<VinoDrmDevice>) {
+        run_scanout_worker(this, 3);
     }
 }
 
@@ -4915,6 +4997,9 @@ impl connector::DriverConnector for VinoConnector {
     fn detect(connector: &Connector<Self>, _force: bool) -> Status {
         let data: &VinoDrmData = connector.drm_dev();
         let head = connector.head as usize;
+        if head >= data.connector_count() {
+            return Status::Disconnected;
+        }
         let has_edid = data
             .cached_edids
             .lock()

@@ -65,7 +65,8 @@ const PID_DL7400: u16 = 0x7000;
 pub(crate) struct DockProfile {
     /// Human name, logged at probe so an unfamiliar unit identifies itself in dmesg.
     pub(crate) name: &'static str,
-    /// Video bulk-OUT endpoint per head.
+    /// Video bulk-OUT endpoint per physical connector. Navarro deliberately repeats its two
+    /// endpoint addresses: connectors 0/2 share 0x08 and connectors 1/3 share 0x0a.
     pub(crate) video_eps: [u8; drm_sink::HEADS],
     /// Whether the dock wants the cold ARM burst prefixed to the first frame after a mode set.
     ///
@@ -74,8 +75,8 @@ pub(crate) struct DockProfile {
     pub(crate) video_arm: bool,
     /// How the dock encodes a head in a video record's `sub` field, as a left shift.
     ///
-    /// Ridge uses the bare head number (shift 0). Navarro spaces heads eight apart -- records use
-    /// `0x00`/`0x08` and stream-opens `0x17`/`0x1f` -- so shift 3.
+    /// Ridge uses the bare connector number (shift 0). Navarro spaces connectors eight apart --
+    /// records use `0x00`/`0x08`/`0x10`/`0x18` and stream-opens `0x07`/`0x0f`/`0x17`/`0x1f`.
     pub(crate) head_sub_shift: u8,
     /// Whether this dock's video path is established. Ridge's arm/training sequence makes Navarro
     /// hard-reset on the first EP08 write, so video stays off there until its own sequence is
@@ -89,32 +90,53 @@ pub(crate) struct DockProfile {
     /// sealed or plaintext. Running one anyway leaves every head waiting for an AKE_Send_Rrx that
     /// the dock is never going to send.
     pub(crate) per_head_auth: bool,
+    /// Whether monitor presence must be read from the probe reply's status word rather than from
+    /// which handler answered.
+    ///
+    /// Ridge routes the `id=0x15 sub=0x20` probe to its EDID/display-capability handler only when
+    /// a sink is actually attached, so "the rich `id=0x44` answered rather than the generic
+    /// `id=0x14`" *is* the presence signal there.
+    ///
+    /// Navarro answers `id=0x44` for **all four** of its connectors whether or not a monitor is
+    /// attached -- measured across a session in which two cables were walked between sockets -- so
+    /// that discriminator is unconditionally true there and an unplug can never be observed.
+    /// Presence is instead bit `0x10` of inner byte 23, i.e. `status & 0x1000`: an occupied
+    /// connector answers `05 11 27 00`, an empty one `05 01 <20|21|60|61> 00`.
+    pub(crate) presence_from_status: bool,
+    /// Number of downstream connectors the dock answers a presence probe for.
+    ///
+    /// This is the range of the selector at probe byte 22, and it is **not** the head count: Ridge
+    /// has two of each, Navarro has four connectors feeding two video endpoints (`0x08` carried
+    /// connectors 0 then 2, `0x0a` carried 1 then 3, measured across cable moves). Connector index
+    /// is the physical socket number minus one.
+    pub(crate) connectors: u8,
 }
 
 /// Dell D6000 and other Ridge-platform docks. HW-verified.
 static PROFILE_D6000: DockProfile = DockProfile {
     name: "Dell D6000 (Ridge, DL-6xxx)",
-    video_eps: [0x08, 0x0b],
+    video_eps: [0x08, 0x0b, 0x08, 0x0b],
     video_arm: true,
     head_sub_shift: 0,
     video_supported: true,
     per_head_auth: true,
+    presence_from_status: false,
+    connectors: 2,
 };
 
 /// DL-7400 quad-display docks (Navarro).
 ///
-/// ⚠ Two heads, not four. The part advertises four DisplayPort outputs but exposes only two video
-/// endpoints, and DisplayLink's own strings describe a "Dual NIVO" arrangement with tiled viewers,
-/// so four outputs are most likely two streams each carrying a tiled pair. Two heads is what the
-/// endpoint inventory actually supports; driving four needs the tiling protocol, which is not
-/// reverse-engineered.
+/// Four independent physical connectors multiplexed over two video endpoints. This is not tiling:
+/// the Windows capture has a distinct stream-open and record `sub` for each socket.
 static PROFILE_DL7400: DockProfile = DockProfile {
     name: "DL-7400 quad dock (Navarro, DL-7000)",
-    video_eps: [0x08, 0x0a],
+    video_eps: [0x08, 0x0a, 0x08, 0x0a],
     video_arm: false,
     head_sub_shift: 3,
     video_supported: false,
     per_head_auth: false,
+    presence_from_status: true,
+    connectors: 4,
 };
 
 /// Control and per-head bulk endpoints.
@@ -528,7 +550,11 @@ impl WorkItem for BringUp {
                 // Cache complete per-head discovery results before emitting the single initial
                 // hotplug event. A timed-out head remains absent and the keepalive's existing
                 // bounded re-engagement path retries it without discarding the live session.
-                for (head, slot) in edid_heads.into_iter().enumerate() {
+                for (head, slot) in edid_heads
+                    .into_iter()
+                    .enumerate()
+                    .take(usize::from(profile.connectors))
+                {
                     if discovery_deferred[head] {
                         continue;
                     }
@@ -610,7 +636,7 @@ impl WorkItem for BringUp {
             const PRESENCE_GRACE: Delta = Delta::from_millis(10_000);
             let mut presence_grace = [Instant::<Monotonic>::now(); VinoDriver::CP_SETUP_HEADS];
             let mut head_silent = [0u8; VinoDriver::CP_SETUP_HEADS];
-            for h in 0..VinoDriver::CP_SETUP_HEADS {
+            for h in 0..data.connector_count() {
                 head_known[h] = data.head_present(h);
             }
             while !data.is_shutting_down() {
@@ -642,7 +668,7 @@ impl WorkItem for BringUp {
                 // Keep trying to bring an absent head's sink back. See `REENGAGE_RETRY`.
                 {
                     let now_r = Instant::<Monotonic>::now();
-                    for h in 0..VinoDriver::CP_SETUP_HEADS {
+                    for h in 0..data.connector_count() {
                         if head_known[h] || (now_r - next_reengage[h]).as_millis() < 0 {
                             continue;
                         }
@@ -682,7 +708,7 @@ impl WorkItem for BringUp {
                 if data.take_downstream_event() {
                     next_presence = Instant::<Monotonic>::now();
                     // Use one bounded recovery path for both periodic and event-driven retries.
-                    for h in 0..VinoDriver::CP_SETUP_HEADS {
+                    for h in 0..data.connector_count() {
                         if !head_known[h] {
                             next_reengage[h] = Instant::<Monotonic>::now();
                         }
@@ -691,7 +717,7 @@ impl WorkItem for BringUp {
                 let now_p = Instant::<Monotonic>::now();
                 if (now_p - next_presence).as_millis() >= 0 {
                     next_presence = now_p + PRESENCE_PERIOD;
-                    for h in 0..VinoDriver::CP_SETUP_HEADS {
+                    for h in 0..data.connector_count() {
                         let present = match data.probe_head_present(dev, h as u8) {
                             Some(p) => {
                                 head_silent[h] = 0;
@@ -1314,6 +1340,7 @@ impl VinoDriver {
         heads_present: &mut [bool; Self::CP_SETUP_HEADS],
         discovery_deferred: &mut [bool; Self::CP_SETUP_HEADS],
     ) -> Result<(usize, u32, u16)> {
+        let connector_count = usize::from(profile.connectors).min(Self::CP_SETUP_HEADS);
         // 16 KiB so the dock's ~5787 B capability block is read whole (see [`EP84_BUF`]).
         let mut resp = KVec::from_elem(0u8, EP84_BUF, GFP_KERNEL)?;
         let mut drained = 0usize;
@@ -1505,7 +1532,7 @@ impl VinoDriver {
         // it never runs one, so this is not expected to be all of them.
         let mut head_ok = [false; Self::CP_SETUP_HEADS];
         let mut heads_authenticated = 0usize;
-        'per_head: for head in 0..Self::CP_SETUP_HEADS {
+        'per_head: for head in 0..connector_count {
             if !profile.per_head_auth {
                 // This platform authenticates the link once and never per head; see
                 // `DockProfile::per_head_auth`. Sending the burst anyway just waits for replies
@@ -1739,13 +1766,13 @@ impl VinoDriver {
         if profile.per_head_auth {
             pr_info!(
                 "vino: {heads_authenticated}/{} head(s) authenticated\n",
-                Self::CP_SETUP_HEADS
+                connector_count
             );
         } else {
             // With no per-head SKE there is no per-head video key to derive, and the link session
             // key is the only one the dock and host share. Give every head that, with its own
             // content nonce.
-            for head in 0..Self::CP_SETUP_HEADS {
+            for head in 0..connector_count {
                 video_keys[head] = kernel::crypto::Secret::zeroed();
                 video_keys[head][..16].copy_from_slice(&session.ks[..]);
                 let vnonce = cp::video_content_nonce(&session.riv, head as u8);
@@ -1889,10 +1916,11 @@ impl VinoDriver {
             const EDID_POLL_ITERS: usize = 250;
             const EDID_POLL_DELAY: Delta = Delta::from_millis(20);
             const EDID_POLL_PROBE_EVERY: usize = 8;
-            // Offset 22 selects the downstream head. Skip an additional head when its earlier
-            // display-capability transaction reported no monitor.
-            for head in 0..Self::CP_SETUP_HEADS {
-                if head != 0 && !heads_present[head] {
+            // Offset 22 selects the downstream connector. Ridge can skip an additional connector
+            // when its per-head display-capability transaction reported no monitor. Navarro has no
+            // such transaction, so discover all four physical sockets directly.
+            for head in 0..connector_count {
+                if profile.per_head_auth && head != 0 && !heads_present[head] {
                     continue;
                 }
                 let hu8 = head as u8;
@@ -2468,6 +2496,8 @@ impl usb::Driver for VinoDriver {
             d.set_video_supported(info.video_supported || force_video);
             drm_sink::set_head_sub_shift(info.head_sub_shift);
             d.set_video_arm(info.video_arm);
+            d.set_presence_from_status(info.presence_from_status);
+            d.set_connectors(info.connectors);
         }
         let bringup = BringUp::new(ddev.clone(), info)?;
         let bringup_slot = KBox::pin_init(new_mutex!(Some(bringup.clone())), GFP_KERNEL)?;
@@ -3044,6 +3074,24 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn navarro_stream_open_matches_decrypted_capture() {
+        // Captured DLM stream-opens for connectors 0 and 1 differ only in their opaque final
+        // token; the connector lives in the wire sub.  Pin both facts so this is never mistaken
+        // for the usual `[id, sub, counter]` CP layout again.
+        assert_eq!(
+            cp::navarro_stream_open(0x33d9),
+            [
+                0x04, 0x00, 0x08, 0x04, 0x05, 0x00, 0x06, 0x00, 0x07, 0x01, 0x08, 0x02, 0x07,
+                0x00, 0xd9, 0x33,
+            ]
+        );
+        assert_eq!(cp::navarro_stream_open_sub(0), 0x0007);
+        assert_eq!(cp::navarro_stream_open_sub(1), 0x000f);
+        assert_eq!(cp::navarro_stream_open_sub(2), 0x0017);
+        assert_eq!(cp::navarro_stream_open_sub(3), 0x001f);
     }
 
     #[test]
