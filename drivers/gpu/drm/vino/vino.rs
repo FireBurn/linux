@@ -84,12 +84,15 @@ pub(crate) struct DockProfile {
     pub(crate) video_supported: bool,
     /// Whether the dock runs a per-head HDCP repeater authentication after the main-link AKE.
     ///
-    /// Ridge does: each head gets its own AKE, `rrx`, `Edkey` and `V`, and its video key comes
-    /// from that head's SKE. Navarro does not -- a capture of DLM bringing this dock up with a
-    /// monitor attached contains exactly one AKE_No_Stored_km and no per-head burst of any kind,
-    /// sealed or plaintext. Running one anyway leaves every head waiting for an AKE_Send_Rrx that
-    /// the dock is never going to send.
+    /// Both supported platforms do. Navarro's sequence is structurally identical to Ridge's, but
+    /// changes the connector marker and uses its delivered RIV directly for video.
     pub(crate) per_head_auth: bool,
+    /// Whether per-head HDCP records select a connector as a one-hot bit at byte `22 + head`.
+    /// Ridge instead has a one-based head number at byte 23.
+    pub(crate) per_head_onehot: bool,
+    /// Whether video uses the RIV delivered by its per-head SKE unchanged.
+    /// Ridge xors byte 7 with `0x08 | head`; Navarro does not.
+    pub(crate) video_riv_direct: bool,
     /// Whether monitor presence must be read from the probe reply's status word rather than from
     /// which handler answered.
     ///
@@ -120,6 +123,8 @@ static PROFILE_D6000: DockProfile = DockProfile {
     head_sub_shift: 0,
     video_supported: true,
     per_head_auth: true,
+    per_head_onehot: false,
+    video_riv_direct: false,
     presence_from_status: false,
     connectors: 2,
 };
@@ -133,8 +138,13 @@ static PROFILE_DL7400: DockProfile = DockProfile {
     video_eps: [0x08, 0x0a, 0x08, 0x0a],
     video_arm: false,
     head_sub_shift: 3,
+    // The control/authentication path is verified, but the first shared-pipe video transaction
+    // still differs from DLM's captured endpoint preamble. Keep scanout gated until that
+    // transaction is reconstructed and validated offline.
     video_supported: false,
-    per_head_auth: false,
+    per_head_auth: true,
+    per_head_onehot: true,
+    video_riv_direct: true,
     presence_from_status: true,
     connectors: 4,
 };
@@ -1587,7 +1597,11 @@ impl VinoDriver {
             // The dock applies the control-plane whitening constant to each per-head SKE key.
             let video_key = cp::cp_session_key(&ske_ks_h);
             video_keys[head][..16].copy_from_slice(&video_key[..]);
-            let vnonce = cp::video_content_nonce(&riv_h, head as u8);
+            let vnonce = if profile.video_riv_direct {
+                riv_h
+            } else {
+                cp::video_content_nonce(&riv_h, head as u8)
+            };
             video_keys[head][16..24].copy_from_slice(&vnonce);
             for (i, (id, sub, content_len)) in cp::CP_SETUP_PER_HEAD.iter().copied().enumerate() {
                 // The per-head `rrx` arrives with the response to AKE_No_Stored_km. It is mandatory
@@ -1646,12 +1660,16 @@ impl VinoDriver {
                 c[0..2].copy_from_slice(&id.to_le_bytes());
                 c[2..4].copy_from_slice(&sub.to_le_bytes());
                 c[4..6].copy_from_slice(&cp_ctr.to_le_bytes());
-                // Per-head AKE messages carry the head marker at offset 23, HDCP message id at
-                // offset 27 and the standard HDCP payload at offset 28.
+                // Per-head AKE messages carry the platform-specific connector marker, HDCP
+                // message id at offset 27 and the standard HDCP payload at offset 28.
                 match i {
                     // AKE restatements: head marker @23, HDCP msg-id tag @27, HDCP field @28..
                     0 | 1 | 2 | 3 | 4 | 5 => {
-                        c[23] = head as u8 + 1;
+                        if profile.per_head_onehot {
+                            c[22 + head] = 0x80;
+                        } else {
+                            c[23] = head as u8 + 1;
+                        }
                         c[27] = match i {
                             0 => 0x02, // AKE_Init (rtx)
                             1 => 0x13, // AKE_Transmitter_Info
