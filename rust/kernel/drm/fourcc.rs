@@ -20,3 +20,21 @@ pub const XRGB8888: u32 = fourcc_code(b'X', b'R', b'2', b'4');
 
 /// 32 bpp RGB with alpha.
 pub const ARGB8888: u32 = fourcc_code(b'A', b'R', b'2', b'4');
+
+/// 32 bpp BGR with unused alpha.
+pub const XBGR8888: u32 = fourcc_code(b'X', b'B', b'2', b'4');
+
+/// 32 bpp BGR with alpha.
+pub const ABGR8888: u32 = fourcc_code(b'A', b'B', b'2', b'4');
+
+/// 30 bpp 10:10:10 RGB with unused alpha.
+pub const XRGB2101010: u32 = fourcc_code(b'X', b'R', b'3', b'0');
+
+/// 30 bpp 10:10:10 RGB with alpha.
+pub const ARGB2101010: u32 = fourcc_code(b'A', b'R', b'3', b'0');
+
+/// 30 bpp 10:10:10 BGR with unused alpha.
+pub const XBGR2101010: u32 = fourcc_code(b'X', b'B', b'3', b'0');
+
+/// 30 bpp 10:10:10 BGR with alpha.
+pub const ABGR2101010: u32 = fourcc_code(b'A', b'B', b'3', b'0');

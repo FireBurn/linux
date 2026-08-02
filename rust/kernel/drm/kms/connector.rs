@@ -495,6 +495,60 @@ impl<T: DriverConnector> UnregisteredConnector<T> {
             bindings::drm_connector_attach_encoder(self.as_raw(), encoder.as_raw())
         })
     }
+
+    /// Attach the HDR output metadata property to this [`Connector`].
+    ///
+    /// This property carries a blob supplied by userspace. Drivers must still validate and apply
+    /// the metadata in their atomic commit path before claiming that HDR output is supported.
+    pub fn attach_hdr_output_metadata_property(&self) {
+        // SAFETY: `self` is an initialized connector owned by this DRM device. The helper only
+        // attaches the mode-config-owned standard property to its mode object.
+        unsafe {
+            bindings::drm_connector_attach_hdr_output_metadata_property(self.as_raw());
+        }
+    }
+
+    /// Create and attach the standard DP colorspace property to this [`Connector`].
+    ///
+    /// A zero mask asks DRM to expose every colorspace defined for DisplayPort. A driver must
+    /// still reject values its sink or transport cannot actually carry in its atomic check.
+    pub fn attach_colorspace_property(&self) -> Result {
+        to_result(unsafe { bindings::drm_mode_create_dp_colorspace_property(self.as_raw(), 0) })?;
+        // SAFETY: the successful create call above initialized `colorspace_property` for this
+        // connector; the C helper only attaches that property to this connector's mode object.
+        to_result(unsafe { bindings::drm_connector_attach_colorspace_property(self.as_raw()) })
+    }
+
+    /// Attach the standard `max bpc` range property to this [`Connector`].
+    ///
+    /// `min_bpc` and `max_bpc` are validated before conversion so callers cannot wrap an invalid
+    /// range through the C `int` API. DRM requires the connector to have an atomic state before
+    /// this helper is called; newly-created Rust connectors acquire that state here.
+    pub fn attach_max_bpc_property(&self, min_bpc: u32, max_bpc: u32) -> Result {
+        if min_bpc == 0 || min_bpc > max_bpc || max_bpc > i32::MAX as u32 {
+            return Err(EINVAL);
+        }
+
+        // `drm_connector_attach_max_bpc_property()` writes the initial bpc values into the
+        // connector state. `KmsDriver::create_objects()` runs before the mode-config-wide reset,
+        // so initialize our state through the driver's Rust reset callback when necessary.
+        let state = unsafe { (*self.as_raw()).state };
+        if state.is_null() {
+            // SAFETY: `self` is a newly initialized `Connector<T>` and this unregistered typestate
+            // prevents concurrent access. The callback creates the matching `ConnectorState<T>`.
+            unsafe { connector_reset_callback::<T::State>(self.as_raw()) };
+        }
+
+        // SAFETY: `self` is initialized and now owns a connector state. The validated bounds fit
+        // the C API's signed integer parameters, and the helper only installs a DRM core property.
+        to_result(unsafe {
+            bindings::drm_connector_attach_max_bpc_property(
+                self.as_raw(),
+                min_bpc as i32,
+                max_bpc as i32,
+            )
+        })
+    }
 }
 
 /// Common methods available on any type which implements [`AsRawConnector`].
