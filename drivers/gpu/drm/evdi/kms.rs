@@ -339,6 +339,11 @@ impl KmsDriver for EvdiDrmDriver {
         // Advertise FB_DAMAGE_CLIPS so the compositor reports which region
         // changed. Without it, GRABPIX must return the full plane.
         primary.enable_fb_damage_clips();
+        // PRIMARY_FORMATS includes ARGB/ABGR scanout formats.  DRM requires every plane that
+        // exposes an alpha format to describe its alpha convention, even though EVDI forwards
+        // the resulting pixels to its userspace consumer instead of doing hardware compositing.
+        // Compositors supply the primary scanout in premultiplied form.
+        primary.create_blend_mode_property(plane::BlendModes::PREMULTIPLIED)?;
         // A real cursor plane, so the compositor keeps the pointer out of the primary framebuffer
         // and the client can drive its sink's own cursor. Without one, every pointer movement
         // dirties the desktop and costs a full frame.
