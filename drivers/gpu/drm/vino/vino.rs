@@ -2454,7 +2454,18 @@ impl usb::Driver for VinoDriver {
         // Gate video on what this platform's video path is known to accept.
         {
             let d: &drm_sink::VinoDrmData = &ddev;
-            d.set_video_supported(info.video_supported);
+            // `force_video` exists to answer one question on a dock whose profile disables video:
+            // whether the platform actually requires its sealed stream-open, or whether correct
+            // record framing alone is enough. It is off by default because the way a dock rejects
+            // a malformed video write is to reset itself, taking the control session with it.
+            let force_video = *crate::module_parameters::force_video.value() != 0;
+            if force_video && !info.video_supported {
+                dev_info!(
+                    cdev,
+                    "vino: force_video set -- driving video this profile disables\n"
+                );
+            }
+            d.set_video_supported(info.video_supported || force_video);
             drm_sink::set_head_sub_shift(info.head_sub_shift);
             d.set_video_arm(info.video_arm);
         }
@@ -2524,6 +2535,10 @@ kernel::module_usb_driver! {
         debug: u8 {
             default: 0,
             description: "Enable verbose Vino protocol and scanout diagnostics",
+        },
+        force_video: u8 {
+            default: 0,
+            description: "Drive video on docks whose profile disables it (experiment; may reset the dock)",
         },
     },
 }
