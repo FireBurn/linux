@@ -2510,13 +2510,26 @@ impl usb::Driver for VinoDriver {
             // record framing alone is enough. It is off by default because the way a dock rejects
             // a malformed video write is to reset itself, taking the control session with it.
             let force_video = *crate::module_parameters::force_video.value() != 0;
+            // `force_video` remains useful for profiles whose established ARM/training path is
+            // merely disabled for an experiment. Navarro has no such fallback: its observed
+            // stream-open is a different sealed message, and forcing the Ridge ARM burst makes
+            // the dock watchdog-reset. Do not let a generic debug knob silently bypass that
+            // protocol boundary.
+            let forced_supported = force_video && info.video_arm;
             if force_video && !info.video_supported {
-                dev_info!(
-                    cdev,
-                    "vino: force_video set -- driving video this profile disables\n"
-                );
+                if forced_supported {
+                    dev_info!(
+                        cdev,
+                        "vino: force_video set -- driving video this profile disables\n"
+                    );
+                } else {
+                    dev_warn!(
+                        cdev,
+                        "vino: force_video ignored -- this profile has no established video-open path\n"
+                    );
+                }
             }
-            d.set_video_supported(info.video_supported || force_video);
+            d.set_video_supported(info.video_supported || forced_supported);
             drm_sink::set_head_sub_shift(info.head_sub_shift);
             d.set_video_arm(info.video_arm);
             d.set_presence_from_status(info.presence_from_status);
