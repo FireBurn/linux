@@ -213,7 +213,21 @@ impl<'a> UsbLink<'a> {
         usb::BulkOutQueue::new(self.window, &self.io, &self.eps.ctrl_out, depth, buf_len)
     }
 
-    /// Opens the pipelined video writer for `head`.
+    /// Returns the canonical queue slot for `head`'s physical video endpoint.
+    ///
+    /// A dock profile may repeat an endpoint address for multiple physical connectors (Navarro
+    /// uses EP08 for connectors 0/2 and EP0a for 1/3).  Those connectors must share one
+    /// persistent queue: separate queues could submit interleaved URBs to the same pipe.
+    pub(crate) fn video_pipe_index(&self, head: usize) -> Result<usize> {
+        let endpoint = self.eps.video.get(head).ok_or(EINVAL)?;
+        self.eps
+            .video
+            .iter()
+            .position(|candidate| candidate.address() == endpoint.address())
+            .ok_or(EINVAL)
+    }
+
+    /// Opens the pipelined video writer for `head`'s physical video endpoint.
     pub(crate) fn video_queue(
         &self,
         head: usize,

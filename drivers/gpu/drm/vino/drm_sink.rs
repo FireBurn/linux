@@ -682,13 +682,15 @@ pub(super) struct VinoDrmData {
     /// Logical WHT frame sequence per head.
     #[pin]
     scanout_seq: Mutex<[u32; HEADS]>,
-    /// Persistent pipelined bulk-OUT queue per connector. It remains live between frames.
+    /// Persistent pipelined bulk-OUT queue per physical video endpoint. It remains live between
+    /// frames.
     ///
-    /// Navarro video stays gated until its sealed stream-open/key schedule is reproduced. Before
-    /// that gate is lifted, these queues must be refactored to one queue per physical endpoint so
-    /// connectors 0/2 and 1/3 cannot submit overlapping URBs to their shared pipes.
+    /// The slot is the first connector whose endpoint address matches the caller's (see
+    /// [`UsbLink::video_pipe_index`](super::UsbLink::video_pipe_index)); duplicate slots remain
+    /// empty. Holding an individual slot mutex over a whole frame serializes connectors that share
+    /// a pipe without needlessly serializing independent endpoints.
     #[pin]
-    video_q: Mutex<[Option<super::usb::BulkOutQueue>; HEADS]>,
+    video_q: [Mutex<Option<super::usb::BulkOutQueue>>; HEADS],
     /// One reusable 64-KiB coalescing window per head. `frame_records` deliberately stores a frame
     /// as small allocations so encoding never asks kmalloc for multi-megabyte physically contiguous
     /// memory; scanout joins those fragments into this bounded window before `BulkOutQueue::send`
@@ -791,7 +793,7 @@ impl VinoDrmData {
             last_status_poll <- new_spinlock!(None),
             sustain_until <- new_spinlock!([const { None }; HEADS]),
             scanout_seq <- new_mutex!([0; HEADS]),
-            video_q <- new_mutex!([const { None }; HEADS]),
+            video_q <- pin_init::pin_init_array_from_fn(|_| new_mutex!(None)),
             video_staging <- new_mutex!([const { None }; HEADS]),
             last_timing <- new_spinlock!([None; HEADS]),
             arm_prefix_pending: core::sync::atomic::AtomicU32::new(0),
@@ -941,7 +943,9 @@ impl VinoDrmData {
         }
         *self.strip_hashes.lock() = [const { None }; HEADS];
         *self.dirty_ttl.lock() = [const { None }; HEADS];
-        *self.video_q.lock() = [const { None }; HEADS];
+        for queue in &self.video_q {
+            *queue.lock() = None;
+        }
         *self.video_staging.lock() = [const { None }; HEADS];
         *self.cp_link.lock() = None;
         vino_debug!("vino: deferred KMS/video work drained for unplug\n");
@@ -1276,6 +1280,7 @@ impl VinoDrmData {
         }
         const XFER: usize = 65536;
         let head_i = head as usize;
+        let pipe_i = dev.video_pipe_index(head_i)?;
         let head_bit = 1u32 << head;
         let image_len: usize = frames.iter().map(|f| f.len()).sum();
         let arm = if with_arm {
@@ -1317,16 +1322,20 @@ impl VinoDrmData {
                 }
                 let staging = staging_slot.as_mut().ok_or(kernel::error::code::ENOMEM)?;
 
-                let mut queues = self.video_q.lock();
-                let queue_slot = &mut queues[head_i];
+                let mut queue_slot = self.video_q[pipe_i].lock();
                 if queue_slot.is_none() {
                     *queue_slot = Some(dev.video_queue(head_i, 8, XFER)?);
                     vino_debug!(
-                        "vino: head={} persistent video queue opened by prompt training\n",
-                        head
+                        "vino: head={} endpoint={:#04x} persistent video queue opened by prompt training\n",
+                        head,
+                        dev.eps.video[head_i].address()
                     );
                 }
-                let queue = queue_slot.as_mut().ok_or(kernel::error::code::ENODEV)?;
+                let queue = queue_slot
+                    .as_mut()
+                    .get_mut()
+                    .as_mut()
+                    .ok_or(kernel::error::code::ENODEV)?;
 
                 let arm_parts = usize::from(!arm_slice.is_empty());
                 let part_count = arm_parts + frames.len() + 1;
@@ -4644,6 +4653,7 @@ fn encode_and_send_wht(
     // keep the frame continuous across transfer boundaries. Do not flush between frames: slot reuse
     // reaps completions without introducing a pipeline gap.
     const XFER: usize = 65536;
+    let pipe_i = dev.video_pipe_index(head_i)?;
     let mut last_wire_len = 0usize;
     for repeat in 0..repeat_count {
         // A compositor mode change can arrive while the presentation is in flight. Never let the
@@ -4673,9 +4683,9 @@ fn encode_and_send_wht(
         let wire_len = arm_slice.len() + image_len + frame_trailer.len();
         last_wire_len = wire_len;
         {
-            // Take this head's staging buffer and queue out of their arrays while submitting, then
-            // restore them. The per-head slots require one submitter each without holding a shared
-            // array lock across blocking queue operations.
+            // Take this head's staging buffer while submitting, then restore it. The queue mutex
+            // stays locked for the complete frame: two connectors that address the same physical
+            // endpoint must never submit their record streams concurrently.
             let mut staging = match data.video_staging.lock()[head_i].take() {
                 Some(s) => s,
                 None => {
@@ -4684,78 +4694,82 @@ fn encode_and_send_wht(
                     s
                 }
             };
-            let mut queue = match data.video_q.lock()[head_i].take() {
-                Some(q) => q,
-                None => match dev.video_queue(head_i, 8, XFER) {
-                    Ok(q) => {
-                        vino_debug!(
-                            "vino: head={} persistent video queue opened (depth=8, {} B URBs)\n",
-                            head,
-                            XFER
-                        );
-                        q
-                    }
-                    // Nothing was taken that needs restoring yet except staging.
-                    Err(e) => {
-                        data.video_staging.lock()[head_i] = Some(staging);
-                        return Err(e);
-                    }
-                },
-            };
-            // Submit inside a closure so BOTH borrows are returned to their slots on every exit
-            // path, including the mid-frame submit failure below. Dropping the queue instead would
-            // silently close and reopen the endpoint pipe on the next frame.
-            let submit = |staging: &mut KVec<u8>, q: &mut super::usb::BulkOutQueue| -> Result {
-                let staging = &mut staging[..];
-                let q = &mut *q;
-                // Scatter/gather cursor over [optional ARM][record chunks][trailer]. Join only one
-                // transfer at a time in the reusable bounded staging allocation, avoiding a
-                // contiguous allocation spanning the complete frame.
-                let arm_parts = usize::from(!arm_slice.is_empty());
-                let trailer_parts = 1usize;
-                let part_count = arm_parts + frame_count + trailer_parts;
-                let mut part_i = 0usize;
-                let mut part_off = 0usize;
-                let mut wire_off = 0usize;
-                while wire_off < wire_len {
-                    let data_len = (wire_len - wire_off).min(XFER);
-                    let dst = &mut staging[..data_len];
-                    let mut dst_off = 0usize;
-                    while dst_off < dst.len() && part_i < part_count {
-                        let part: &[u8] = if part_i < arm_parts {
-                            arm_slice
-                        } else if part_i < arm_parts + frame_count {
-                            &frames[part_i - arm_parts][..]
-                        } else {
-                            &frame_trailer[..]
-                        };
-                        let n = (part.len() - part_off).min(dst.len() - dst_off);
-                        dst[dst_off..dst_off + n].copy_from_slice(&part[part_off..part_off + n]);
-                        dst_off += n;
-                        part_off += n;
-                        if part_off == part.len() {
-                            part_i += 1;
-                            part_off = 0;
+            let submitted = {
+                let mut queue_slot = data.video_q[pipe_i].lock();
+                if queue_slot.is_none() {
+                    match dev.video_queue(head_i, 8, XFER) {
+                        Ok(q) => {
+                            *queue_slot = Some(q);
+                            vino_debug!(
+                                "vino: head={} endpoint={:#04x} persistent video queue opened (depth=8, {} B URBs)\n",
+                                head,
+                                dev.eps.video[head_i].address(),
+                                XFER
+                            );
+                        }
+                        // Nothing was taken from the shared pipe slot, but return this head's
+                        // staging allocation before propagating the open error.
+                        Err(e) => {
+                            data.video_staging.lock()[head_i] = Some(staging);
+                            return Err(e);
                         }
                     }
-                    if let Err(e) = q.send(dev.io(), dst, super::timeout()) {
-                        pr_warn!(
-                            "vino: scanout head={} pipeline submit at off={}/{} failed\n",
-                            head,
-                            wire_off,
-                            wire_len
-                        );
-                        let _ = dev.clear_video_halt(head_i);
-                        return Err(e);
-                    }
-                    wire_off += data_len;
                 }
-                Ok(())
+                let mut queue = queue_slot.as_mut().get_mut().as_mut().ok_or(ENODEV)?;
+                // Keep both borrows inside the mutex scope. Dropping the queue or unlocking it
+                // mid-frame would permit a second connector to interleave URBs on this endpoint.
+                let submit = |staging: &mut KVec<u8>, q: &mut super::usb::BulkOutQueue| -> Result {
+                    let staging = &mut staging[..];
+                    let q = &mut *q;
+                    // Scatter/gather cursor over [optional ARM][record chunks][trailer]. Join only one
+                    // transfer at a time in the reusable bounded staging allocation, avoiding a
+                    // contiguous allocation spanning the complete frame.
+                    let arm_parts = usize::from(!arm_slice.is_empty());
+                    let trailer_parts = 1usize;
+                    let part_count = arm_parts + frame_count + trailer_parts;
+                    let mut part_i = 0usize;
+                    let mut part_off = 0usize;
+                    let mut wire_off = 0usize;
+                    while wire_off < wire_len {
+                        let data_len = (wire_len - wire_off).min(XFER);
+                        let dst = &mut staging[..data_len];
+                        let mut dst_off = 0usize;
+                        while dst_off < dst.len() && part_i < part_count {
+                            let part: &[u8] = if part_i < arm_parts {
+                                arm_slice
+                            } else if part_i < arm_parts + frame_count {
+                                &frames[part_i - arm_parts][..]
+                            } else {
+                                &frame_trailer[..]
+                            };
+                            let n = (part.len() - part_off).min(dst.len() - dst_off);
+                            dst[dst_off..dst_off + n]
+                                .copy_from_slice(&part[part_off..part_off + n]);
+                            dst_off += n;
+                            part_off += n;
+                            if part_off == part.len() {
+                                part_i += 1;
+                                part_off = 0;
+                            }
+                        }
+                        if let Err(e) = q.send(dev.io(), dst, super::timeout()) {
+                            pr_warn!(
+                                "vino: scanout head={} pipeline submit at off={}/{} failed\n",
+                                head,
+                                wire_off,
+                                wire_len
+                            );
+                            let _ = dev.clear_video_halt(head_i);
+                            return Err(e);
+                        }
+                        wire_off += data_len;
+                    }
+                    Ok(())
+                };
+                submit(&mut staging, &mut queue)
             };
-            let submitted = submit(&mut staging, &mut queue);
-            // Restore both borrows before propagating any error.
+            // Restore the per-connector staging allocation after the endpoint transaction.
             data.video_staging.lock()[head_i] = Some(staging);
-            data.video_q.lock()[head_i] = Some(queue);
             submitted?;
         }
 
