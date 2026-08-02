@@ -3113,15 +3113,14 @@ mod tests {
     }
 
     #[test]
-    fn navarro_stream_open_matches_decrypted_capture() {
-        // Captured DLM stream-opens for connectors 0 and 1 differ only in their opaque final
-        // token; the connector lives in the wire sub.  Pin both facts so this is never mistaken
-        // for the usual `[id, sub, counter]` CP layout again.
+    fn navarro_stream_open_matches_live_sealer_input() {
+        // DLM's live AES-CTR entry sees exactly these fourteen bytes. The connector lives solely
+        // in the wire sub, never in an invented token or normal CP `[id, sub, counter]` layout.
         assert_eq!(
-            cp::navarro_stream_open(0x33d9),
+            cp::navarro_stream_open(),
             [
                 0x04, 0x00, 0x08, 0x04, 0x05, 0x00, 0x06, 0x00, 0x07, 0x01, 0x08, 0x02, 0x07,
-                0x00, 0xd9, 0x33,
+                0x00,
             ]
         );
         assert_eq!(cp::navarro_stream_open_sub(0), 0x0007);

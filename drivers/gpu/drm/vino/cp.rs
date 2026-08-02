@@ -890,18 +890,16 @@ pub(super) fn video_arm_plain_frame(sub: u16, body: &[u8; 16]) -> [u8; 32] {
 }
 
 /// Build a sealed type-4 video-arm frame from its header fields and plaintext content.
-/// Build the 16-byte plaintext of a Navarro video stream-open.
+/// Build the 14-byte plaintext of a Navarro video stream-open.
 ///
-/// This is not a normal CP header.  The cold DLM captures decrypt to the fixed fourteen-byte
-/// prefix below followed by a session-local u16 token. In particular, the connector is encoded
-/// solely in the *wire* sub, not in this plaintext. The token has varied per connector and
-/// session; its construction and acceptance rule are not yet known.
-pub(super) fn navarro_stream_open(token: u16) -> [u8; 16] {
-    let mut c = [
-        0x04, 0x00, 0x08, 0x04, 0x05, 0x00, 0x06, 0x00, 0x07, 0x01, 0x08, 0x02, 0x07, 0x00, 0, 0,
-    ];
-    c[14..16].copy_from_slice(&token.to_le_bytes());
-    c
+/// This is not a normal CP header.  A live DLM sealer capture proves that the content passed to
+/// AES-CTR is exactly these fourteen bytes: the apparent trailing u16 in an older decrypted-wire
+/// reconstruction was not part of the stream-open content. In particular, the connector is
+/// encoded solely in the *wire* sub, not in this plaintext.
+pub(super) fn navarro_stream_open() -> [u8; 14] {
+    [
+        0x04, 0x00, 0x08, 0x04, 0x05, 0x00, 0x06, 0x00, 0x07, 0x01, 0x08, 0x02, 0x07, 0x00,
+    ]
 }
 
 /// The wire `sub` of a Navarro connector's stream-open.

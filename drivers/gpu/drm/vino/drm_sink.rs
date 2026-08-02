@@ -1745,9 +1745,9 @@ impl VinoDrmData {
         let mut vnonce = [0u8; 8];
         vnonce.copy_from_slice(&key[16..24]);
         drop(keys);
-        // The final u16 is a session-local opaque token. Its construction and validation are not
-        // yet known; this path remains unreachable while Navarro video is gated.
-        let content = super::cp::navarro_stream_open(0);
+        // A live DLM sealer capture establishes this is the complete fourteen-byte content. This
+        // path remains unreachable while the per-selector key derivation is gated.
+        let content = super::cp::navarro_stream_open();
         super::cp::seal_video_arm(
             &vkey,
             &vnonce,
