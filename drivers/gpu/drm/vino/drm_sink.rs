@@ -277,35 +277,40 @@ static COLD_RIDGE: ColdTimeline = ColdTimeline {
 /// Navarro's timeline, extracted from `captures/navarro-dlm-modeset-20260802-005453` and anchored
 /// on head 0's mode set exactly as Ridge's is.
 static COLD_NAVARRO: ColdTimeline = ColdTimeline {
-    h1_mode: 757,
-    // Navarro polls continuously across this span, so there is no silent window to preserve.
-    quiet_end: 758,
-    video: &[(1, 1116), (0, 1245)],
-    remode: &[(1129, 0)],
+    // Measured from `captures/navarro-dlm-today-124144` -- a cold bring-up recorded while DLM was
+    // demonstrably driving both panels on this dock -- and anchored on connector 0's *real*
+    // (`off23 = 2`) mode set.
+    //
+    // ⚠ This replaces a timeline taken from `navarro-dlm-modeset-20260802-005453`, which differed
+    // in every dimension: it had head 1 streaming first at +1116 ms and head 0 at +1245 ms, the
+    // second mode set at +757 ms, and a repeat mode set at +1129 ms. That capture was a mode
+    // *change* on an already-running link, not a cold bring-up, so vino was replaying a recovery
+    // sequence as if it were an activation -- nine times slower than the real thing and with the
+    // heads in the opposite order.
+    h1_mode: 10,
+    // DLM polls continuously across this span; there is no silent window to preserve.
+    quiet_end: 11,
+    video: &[(0, 122), (1, 272)],
+    remode: &[],
     markers: &[
-        (4, 0, 0x2f, 0),
-        (6, 0, 0x2e, 0),
-        (50, 0, 0x2f, 1),
-        (61, 0, 0x2e, 3),
-        (824, 1, 0x2f, 1),
-        (900, 1, 0x2e, 3),
-        (974, 1, 0x2f, 1),
-        (985, 1, 0x2e, 0),
-        (1145, 1, 0x2f, 0),
-        (1155, 0, 0x2f, 1),
-        (1159, 1, 0x2e, 0),
-        (1171, 0, 0x2e, 0),
-        (1225, 1, 0x2f, 1),
-        (1244, 1, 0x2e, 0),
-        (1325, 1, 0x2f, 0),
-        (1329, 0, 0x2f, 0),
-        (1334, 1, 0x2e, 0),
-        (1345, 0, 0x2e, 0),
+        (7, 0, 0x2f, 1),
+        (13, 0, 0x2e, 3),
+        (20, 1, 0x2f, 1),
+        (21, 0, 0x2f, 1),
+        (35, 0, 0x2e, 0),
+        (76, 1, 0x2e, 3),
+        (104, 1, 0x2f, 1),
+        (128, 1, 0x2e, 3),
+        (131, 0, 0x2f, 1),
+        (136, 0, 0x2e, 0),
+        (168, 1, 0x2f, 1),
+        (181, 1, 0x2e, 0),
+        (228, 0, 0x2f, 0),
+        (230, 0, 0x2e, 0),
+        (303, 1, 0x2f, 0),
+        (304, 1, 0x2e, 0),
     ],
-    polls: &[
-        178, 304, 379, 490, 543, 605, 677, 742, 813, 878, 958, 1043, 1161, 1230, 1311, 1405,
-        1486, 1554, 1612,
-    ],
+    polls: &[17, 78, 120, 162, 179, 223, 267],
     // Navarro reads every connector's EDID before the anchor, not inside the bracket.
     edid: &[],
 };
