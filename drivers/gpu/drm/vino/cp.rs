@@ -726,9 +726,26 @@ pub(super) fn decode_in_lenient(
         return None;
     }
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
-    let body = &wire[16..];
+    // Authenticated first, because a verified Dl3Cmac is proof and Navarro always supplies one.
+    //
+    // ⚠ Ridge does not, and this is the reply-matching path: `send_cp_reply` reads EP84 until it
+    // sees the reply whose inner counter echoes its request, and it identifies that reply through
+    // this function. Requiring a tag here therefore made every Ridge reply invisible -- the wire
+    // shows the dock sending 50 sealed `wsub=0x45` replies while vino reported `control session
+    // failed after 3 attempts (ETIMEDOUT)`. Falling back to the historical header-only decrypt
+    // brings the D6000 back up.
+    //
+    // Per frame rather than per dock deliberately: the strict pass can only succeed on a genuine
+    // authenticated frame, so a dock that carries tags keeps its guarantee, and no shared module
+    // state can be clobbered by whichever dock probed last. A global flag for this was tried and
+    // is exactly the bug -- the DL7400 overwrote Ridge's setting and lost its own per-head HDCP
+    // authentication (`0/4 head(s) authenticated`).
     for riv in inbound_reply_rivs(out_riv) {
-        let Ok(pt) = open_in(ks, &riv, seq, body) else {
+        let opened = open_in(ks, &riv, seq, &wire[16..]).or_else(|_| {
+            let n = wire.len().min(32);
+            open_in_ctr(ks, &riv, seq, &wire[16..n])
+        });
+        let Ok(pt) = opened else {
             continue;
         };
         if pt.len() < 8 {
@@ -741,8 +758,6 @@ pub(super) fn decode_in_lenient(
         // range (the captured transaction boundary replies with id=0x0405/sub=0x000c). Its
         // per-connector HDCP pushes also use bytes 4--7 as a one-hot 32-bit selector, so `ctr` is
         // only an echo counter for actual request/reply classes and bytes 6--7 need not be zero.
-        // `open_in` has already authenticated the complete ciphertext with Dl3Cmac; no plaintext
-        // plausibility restriction is needed here.
         return Some((id, sub, ctr));
     }
     None
@@ -1347,6 +1362,14 @@ pub(super) fn open_in(
         return Err(EINVAL);
     }
 
+    open_in_ctr(ks, in_riv, seq, ct)
+}
+
+/// AES-CTR over pure ciphertext, with no authentication.
+///
+/// Only [`open_in`] and [`decode_in_lenient`] may use this. Everything else must go through
+/// [`open_in`], where a verified Dl3Cmac is the admission test.
+fn open_in_ctr(ks: &[u8; 16], in_riv: &[u8; 8], seq: u32, ct: &[u8]) -> Result<KVec<u8>> {
     let cipher = crypto::Aes128::new(ks)?;
     let mut pt = KVec::with_capacity(ct.len(), GFP_KERNEL)?;
     for (i, chunk) in ct.chunks(16).enumerate() {
