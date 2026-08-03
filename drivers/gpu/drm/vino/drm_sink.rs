@@ -177,6 +177,47 @@ const FRAME_PERIOD_US: i64 = FRAME_PERIOD_MS * 1000;
 /// invisible to any analysis that decodes the wire, since the *bytes* are correct.
 static DOCK_BUFFERS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
 
+/// Serialises "restore this device's codec geometry, then encode with it".
+///
+/// The geometry lives in module-global statics, so restoring it before an encode is only correct
+/// while no other device is doing the same thing. Two docks of different generations encoding
+/// concurrently interleave their writes and each other's frames come out in the wrong strip
+/// layout -- Ridge 64x16 against Navarro 128x8. Measured: the DL7400's delivered pixels went from
+/// a residual of 0.47 to 22.21 once a D6000 was bound alongside it.
+///
+/// ⚠ This is a stopgap for the shape of the state, not a fix for it. The right change is to pass
+/// geometry into the codec instead of keeping it in globals; then no serialisation is needed and
+/// the two docks encode in parallel again.
+static ENCODE_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Held for the duration of one device's encode; see [`ENCODE_BUSY`].
+struct EncodeGeometryGuard;
+
+impl EncodeGeometryGuard {
+    /// Waits for any other device's encode to finish, then applies `data`'s geometry.
+    fn acquire(data: &VinoDrmData) -> Self {
+        while ENCODE_BUSY
+            .compare_exchange(
+                false,
+                true,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            fsleep(Delta::from_micros(200));
+        }
+        data.apply_codec_geometry();
+        Self
+    }
+}
+
+impl Drop for EncodeGeometryGuard {
+    fn drop(&mut self) {
+        ENCODE_BUSY.store(false, Ordering::Release);
+    }
+}
+
 /// Record how many buffers this dock rotates; see [`DOCK_BUFFERS`].
 pub(super) fn set_dock_buffers(n: u8) {
     DOCK_BUFFERS.store(n.max(1), Ordering::Release);
@@ -1783,9 +1824,8 @@ impl VinoDrmData {
             return Err(kernel::error::code::EINVAL);
         }
         // The first frames of a stream go out through this path, not `encode_and_send_wht`, and
-        // they carry the ARM burst. The other dock's probe may have overwritten the codec's global
-        // geometry since this device last used it. See `VinoDrmData::codec_geometry`.
-        self.apply_codec_geometry();
+        // they carry the ARM burst. See `ENCODE_BUSY`.
+        let _geometry = EncodeGeometryGuard::acquire(self);
         // Diagnostic: shrink the transfer so a dock that stops after one *transfer* can be told
         // apart from one that stops after a fixed *byte count*. Both look identical at the default
         // 65536, because exactly one transfer and exactly 65536 bytes are the same event.
@@ -5603,9 +5643,9 @@ fn encode_and_send_wht(
     w: usize,
     h: usize,
 ) -> Result {
-    // The other dock's probe may have overwritten the codec's global geometry since this device
-    // last encoded; restore this device's before touching the codec. See `codec_geometry`.
-    data.apply_codec_geometry();
+    // Restore this device's geometry and hold off any other device's encode until this one is
+    // done, so the globals cannot change underneath it. See `ENCODE_BUSY`.
+    let _geometry = EncodeGeometryGuard::acquire(data);
     // Gate video on the matching mode-set reaching the dock. Plane updates run before the CRTC
     // enable queues that mode-set, and the dock rejects video on an unconfigured stream. Deferring
     // does not advance the codec sequence; the next scanout pass retries the frame.
