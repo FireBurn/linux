@@ -2783,6 +2783,14 @@ kernel::module_usb_driver! {
             default: 0,
             description: "Diagnostic: corrupt the sealed prologue's Dl3Cmac to test whether the dock authenticates it",
         },
+        video_clear_each: u8 {
+            default: 0,
+            description: "Diagnostic: clear the video endpoint halt before every transfer, to test whether the dock halts it after each one",
+        },
+        video_xfer: u32 {
+            default: 0,
+            description: "Diagnostic: video transfer size in bytes (0 = 65536). Distinguishes a dock that stops after one TRANSFER from one that stops after a fixed BYTE COUNT",
+        },
         video_sync: u8 {
             default: 0,
             description: "Pace video as DLM does: one synchronous transfer at a time, never pipelined",

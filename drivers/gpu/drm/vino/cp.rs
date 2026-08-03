@@ -329,6 +329,29 @@ pub(super) fn mode_supported(mode: &kernel::drm::kms::modes::DisplayMode) -> boo
 /// detailed timing record. Offsets 26 through 46 contain geometry, link configuration, refresh and
 /// flags; offset 66 is mode-dependent, offset 68 is fixed, offset 70 contains the pixel clock, and
 /// offsets 74 through 79 contain a fresh token.
+/// Build the mode-set's *teardown* form: the same message with the operation byte at offset 23
+/// set to zero, every timing word zero, and `0x8000` at offset 42.
+///
+/// Offset 23 is an operation code, not the "fixed generation/type value" vino assumed it to be.
+/// DLM sends this form for a connector before it sends that connector's real mode -- in a
+/// same-day keyed capture, two rounds of `(conn 0, conn 1)` teardowns at -3.1 s and -1.2 s and
+/// then the real pair 0.12 s before the first video byte. vino only ever sent the `0x02` form, so
+/// the dock was asked to configure a pipe that had never been torn down.
+pub(super) fn clear_mode(counter: u16, head: u8) -> Result<KVec<u8>> {
+    let mut b = KVec::with_capacity(80, GFP_KERNEL)?;
+    header(&mut b, 0x48, 0x22, counter)?;
+    pad_to(&mut b, 22)?;
+    b.push(head, GFP_KERNEL)?; // off22: connector
+    b.push(0, GFP_KERNEL)?; // off23: operation 0 -- tear down
+    pad_to(&mut b, 42)?;
+    b.extend_from_slice(&0x8000u16.to_le_bytes(), GFP_KERNEL)?; // off42
+    pad_to(&mut b, 74)?;
+    let mut tail = [0u8; 6];
+    rng::fill(&mut tail);
+    b.extend_from_slice(&tail, GFP_KERNEL)?; // off74..79: pad to the AES block
+    Ok(b)
+}
+
 pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
     let mut b = KVec::with_capacity(80, GFP_KERNEL)?;
     header(&mut b, 0x48, 0x22, counter)?;

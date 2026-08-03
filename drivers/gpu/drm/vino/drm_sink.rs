@@ -1470,7 +1470,13 @@ impl VinoDrmData {
         if frames.is_empty() {
             return Err(kernel::error::code::EINVAL);
         }
-        const XFER: usize = VIDEO_XFER;
+        // Diagnostic: shrink the transfer so a dock that stops after one *transfer* can be told
+        // apart from one that stops after a fixed *byte count*. Both look identical at the default
+        // 65536, because exactly one transfer and exactly 65536 bytes are the same event.
+        let xfer: usize = match *crate::module_parameters::video_xfer.value() {
+            0 => VIDEO_XFER,
+            n => (n as usize).clamp(1024, VIDEO_XFER) & !1023,
+        };
         let head_i = head as usize;
         let pipe_i = dev.video_pipe_index(head_i)?;
         let head_bit = 1u32 << head;
@@ -1564,7 +1570,7 @@ impl VinoDrmData {
                 let staging_slot = &mut staging_slots[head_i];
                 if staging_slot.is_none() {
                     let mut staging = KVec::new();
-                    staging.resize(XFER, 0, GFP_KERNEL)?;
+                    staging.resize(xfer, 0, GFP_KERNEL)?;
                     *staging_slot = Some(staging);
                 }
                 let staging = staging_slot.as_mut().ok_or(kernel::error::code::ENOMEM)?;
@@ -1576,7 +1582,7 @@ impl VinoDrmData {
                     // the pipe on the opening image records without it. Clearing also resets the
                     // endpoint's sequence number, which is what the dock is really waiting for.
                     let _ = dev.clear_video_halt(head_i);
-                    *queue_slot = Some(dev.video_queue(head_i, 8, XFER)?);
+                    *queue_slot = Some(dev.video_queue(head_i, 8, xfer)?);
                     vino_debug!(
                         "vino: head={} endpoint={:#04x} persistent video queue opened by prompt training\n",
                         head,
@@ -1600,7 +1606,7 @@ impl VinoDrmData {
                 let mut part_off = 0usize;
                 let mut wire_off = 0usize;
                 while wire_off < wire_len {
-                    let data_len = (wire_len - wire_off).min(XFER);
+                    let data_len = (wire_len - wire_off).min(xfer);
                     let dst = &mut staging[..data_len];
                     let mut dst_off = 0usize;
                     while dst_off < dst.len() && part_i < part_count {
@@ -1624,6 +1630,13 @@ impl VinoDrmData {
                             part_i += 1;
                             part_off = 0;
                         }
+                    }
+                    // Diagnostic: the dock accepts exactly one transfer and then takes no more
+                    // -- 16384 bytes when the transfer is 16384, 65536 when it is 65536, so it is
+                    // one *transfer*, not a byte count. Clearing the halt before each one tests
+                    // whether the dock is halting the endpoint after every transfer.
+                    if *crate::module_parameters::video_clear_each.value() != 0 {
+                        let _ = dev.clear_video_halt(head_i);
                     }
                     // DLM submits one transfer, waits for its completion, then submits the
                     // next -- never more than two outstanding. `video_sync` reproduces that
@@ -1706,6 +1719,12 @@ impl VinoDrmData {
                 self.modeset_bracket_pre(dev, head)?;
             }
             let mode_anchor = Instant::<Monotonic>::now();
+            // Tear the connector's pipe down before configuring it, as DLM does. See
+            // `cp::clear_mode`: offset 23 is an operation code, and vino only ever sent the
+            // "set this mode" form.
+            if self.navarro_mode_words() {
+                self.send_cp(dev, 0x48, 0, |ctr| super::cp::clear_mode(ctr, head))?;
+            }
             self.send_cp(dev, 0x48, 0, |ctr| super::cp::set_mode(ctr, head, timing))?;
             if self.modeset_requested[head_i].load(Ordering::Acquire) != want {
                 return Ok(false);
@@ -1888,6 +1907,12 @@ impl VinoDrmData {
                 if head == 1 {
                     cp_until!(timeline.h1_mode - 1);
                     Self::wait_mode_offset(anchor, timeline.h1_mode);
+                }
+                // Tear this connector's pipe down first; see `cp::clear_mode`.
+                if self.navarro_mode_words() {
+                    self.send_cp(dev, 0x48, 0, |ctr| {
+                        super::cp::clear_mode(ctr, head as u8)
+                    })?;
                 }
                 self.send_cp(dev, 0x48, 0, |ctr| {
                     super::cp::set_mode(ctr, head as u8, &timing)
