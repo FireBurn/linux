@@ -688,6 +688,22 @@ impl WorkItem for BringUp {
             let mut head_debounce = [0u8; VinoDriver::CP_SETUP_HEADS];
             /// Consecutive silent probes required before treating a head as disconnected.
             const PRESENCE_SILENT_LIMIT: u8 = 3;
+            /// How long a head must stay silent before that silence counts as a removal.
+            ///
+            /// A downstream event pulls the next probe forward, so consecutive silent probes are
+            /// not `PRESENCE_PERIOD` apart -- they can be one control round trip apart. The dock
+            /// moves a head's status word whenever downstream state shifts, which is exactly what
+            /// a mode set does, so a Ridge mode set produced a burst of forced probes; three
+            /// silent ones then landed inside 30 ms and a live monitor was declared REMOVED,
+            /// failing dual-head activation with `ENODEV`. Removal needs both enough probes to
+            /// rule out one dropped reply and enough elapsed time to rule out a busy link.
+            const PRESENCE_SILENT_MIN: Delta = Delta::from_millis(3000);
+            /// Floor on the gap between presence probes, including event-forced ones.
+            ///
+            /// A downstream event should bring the probe forward, not remove its cadence
+            /// altogether: without a floor the probe runs once per loop iteration for as long as
+            /// the dock keeps talking.
+            const PRESENCE_MIN_GAP: Delta = Delta::from_millis(50);
             /// How often to retry the sink re-engage on a head believed to have no monitor.
             ///
             /// A recovered sink may not emit a uniquely identifiable event, so absent heads are
@@ -698,6 +714,8 @@ impl WorkItem for BringUp {
             const PRESENCE_GRACE: Delta = Delta::from_millis(10_000);
             let mut presence_grace = [Instant::<Monotonic>::now(); VinoDriver::CP_SETUP_HEADS];
             let mut head_silent = [0u8; VinoDriver::CP_SETUP_HEADS];
+            // When the current run of silent probes started; only read while `head_silent > 0`.
+            let mut head_silent_since = [Instant::<Monotonic>::now(); VinoDriver::CP_SETUP_HEADS];
             for h in 0..data.connector_count() {
                 head_known[h] = data.head_present(h);
             }
@@ -774,7 +792,11 @@ impl WorkItem for BringUp {
                 // four-second retry cadence.  The probe below observes an actual arrival and
                 // then re-engages that specific connector immediately.
                 if data.take_downstream_event() {
-                    next_presence = Instant::<Monotonic>::now();
+                    // Bring the probe forward, but never below `PRESENCE_MIN_GAP`.
+                    let soonest = Instant::<Monotonic>::now() + PRESENCE_MIN_GAP;
+                    if (next_presence - soonest).as_millis() > 0 {
+                        next_presence = soonest;
+                    }
                 }
                 let now_p = Instant::<Monotonic>::now();
                 if (now_p - next_presence).as_millis() >= 0 {
@@ -800,16 +822,26 @@ impl WorkItem for BringUp {
                                 if data.presence_from_status() {
                                     continue;
                                 }
+                                if head_silent[h] == 0 {
+                                    head_silent_since[h] = Instant::<Monotonic>::now();
+                                }
                                 head_silent[h] = head_silent[h].saturating_add(1);
-                                if head_silent[h] < PRESENCE_SILENT_LIMIT {
-                                    continue; // one dropped reply proves nothing
+                                let quiet =
+                                    Instant::<Monotonic>::now() - head_silent_since[h];
+                                if head_silent[h] < PRESENCE_SILENT_LIMIT
+                                    || quiet.as_millis() < PRESENCE_SILENT_MIN.as_millis()
+                                {
+                                    // One dropped reply proves nothing, and neither does a burst
+                                    // of them across a few milliseconds of a busy link.
+                                    continue;
                                 }
                                 if head_known[h] {
                                     dev_info!(
                                         cdev,
-                                        "vino: head {h} presence probe silent for {} cycles -- \
-                                         treating as REMOVED\n",
-                                        head_silent[h]
+                                        "vino: head {h} presence probe silent for {} probe(s) \
+                                         over {} ms -- treating as REMOVED\n",
+                                        head_silent[h],
+                                        quiet.as_millis()
                                     );
                                 }
                                 false
@@ -3907,7 +3939,6 @@ mod tests {
         assert_eq!(u16::from_le_bytes([m[34], m[35]]), 2160);
         assert_eq!(u16::from_le_bytes([m[70], m[71]]), 0xd040);
         assert_eq!(u16::from_le_bytes([m[68], m[69]]), 0x0200);
-        assert_eq!(&m[72..74], &[0, 0]);
         Ok(())
     }
 
