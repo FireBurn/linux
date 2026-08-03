@@ -2939,6 +2939,8 @@ impl VinoDrmData {
         let mut reply = KVec::from_elem(0u8, 4096, GFP_KERNEL)?;
         let deadline = Instant::<Monotonic>::now() + Delta::from_millis(64);
         let mut matched = 0usize;
+        let (mut reaped, mut undecodable) = (0u32, 0u32);
+        let (mut seen_id, mut seen_sub, mut seen_counter) = (0u16, 0u16, 0u16);
         loop {
             let got = if let Some(q) = link.ep84_q.as_mut() {
                 match q.recv(dev.io(), &mut reply, super::cp_reply_timeout()) {
@@ -2961,21 +2963,37 @@ impl VinoDrmData {
                         *self.edid_caught.lock() = Some(blob);
                     }
                 }
-                if let Some((reply_id, _, reply_counter)) =
+                if let Some((reply_id, reply_sub, reply_counter)) =
                     super::cp::decode_in_lenient(&link.ks, &link.riv, &reply[..got])
                 {
                     if reply_counter == request_counter {
                         matched = got;
                         break;
                     }
+                    seen_id = reply_id;
+                    seen_sub = reply_sub;
+                    seen_counter = reply_counter;
                     if matches!(reply_id, 0x44 | 0x194) {
                         self.downstream_event.store(true, Ordering::Release);
                     }
+                } else {
+                    undecodable += 1;
                 }
+                reaped += 1;
             }
             if (Instant::<Monotonic>::now() - deadline).as_millis() >= 0 {
                 break;
             }
+        }
+        // Name the message that went unanswered, and say whether the dock was silent or merely
+        // unreadable. Without this a stalled control session can only be reported as ETIMEDOUT,
+        // which cannot distinguish "the dock sent nothing" from "the dock replied and vino could
+        // not decode it" -- and on the D6000 the wire shows 50 sealed replies arriving during an
+        // attempt that ends in ETIMEDOUT.
+        if matched == 0 {
+            pr_info!(
+                "vino: unanswered id={id:#06x} ctr={request_counter}:                  reaped {reaped} reply/replies, {undecodable} undecodable,                  last decoded id={seen_id:#06x} sub={seen_sub:#06x} ctr={seen_counter}\n"
+            );
         }
         consume(&link.ks, &link.riv, &reply[..matched])
     }
