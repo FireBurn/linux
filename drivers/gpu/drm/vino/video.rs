@@ -1390,7 +1390,16 @@ pub(crate) mod wht {
     /// falls on a multiple of 512.
     #[inline]
     fn strip_size_class(len: usize) -> u8 {
-        (len >> 9) as u8
+        let class = (len >> 9) as u8;
+        // ⛔ The field does NOT saturate. Every map in the decrypted DLM corpus uses only classes
+        // 0..3 with a longest strip of 1670 B, while vino's live desktop reaches 2598 B -- classes
+        // 4 and 5, which no capture covers. Clamping to 3 was A/B'd on hardware on 2026-08-04 and
+        // made the DL7400's artifact **worse**, so the class is a real magnitude and the corpus
+        // simply never held a strip that long. `strip_class_cap` stays as a knob, defaulting off.
+        match *crate::module_parameters::strip_class_cap.value() {
+            0 => class,
+            cap => class.min(cap),
+        }
     }
 
     /// Collect `(x, y, byte length)` for every strip in an already-framed set of image records.
@@ -1474,6 +1483,7 @@ pub(crate) mod wht {
         width: usize,
         height: usize,
         frames: &[KVec<u8>],
+        remembered: &mut KVec<u8>,
     ) -> Result<KVec<u8>> {
         let bands = height.div_ceil(geom.strip_h());
         let across = width.div_ceil(geom.strip_w()).min(PARAM_BAND_STRIDE);
@@ -1481,24 +1491,53 @@ pub(crate) mod wht {
         let mut out = KVec::new();
 
         // One byte per map slot, laid out exactly as the sub-records carry it.
+        //
+        // ⚠ The map covers the WHOLE surface, but a delta frame carries only the strips its damage
+        // set selected. Rebuilding from zero each time therefore re-declares every *untouched*
+        // position as class 0 -- "under 512 bytes" -- which is the same mis-declaration that made
+        // busy strips decode to noise before the map existed at all, reintroduced for exactly the
+        // parts of the screen that are holding still. Carry the previous frame's classes forward
+        // and overwrite only what this frame actually sends.
+        //
+        // `remembered` is the caller's per-connector buffer; a mode change resizes it, and the
+        // resize zeroes it, which is correct because the dock's framebuffer is undefined until the
+        // keyframe that follows.
+        if remembered.len() != bands * PARAM_BAND_STRIDE {
+            remembered.clear();
+            remembered.resize(bands * PARAM_BAND_STRIDE, 0, GFP_KERNEL)?;
+        }
         let mut values: KVec<u8> = KVec::new();
         values.resize(bands * PARAM_BAND_STRIDE, 0, GFP_KERNEL)?;
+        if *crate::module_parameters::strip_map_persist.value() != 0 {
+            values.copy_from_slice(remembered);
+        }
         let mut described = 0usize;
+        let mut classes = [0usize; 8];
+        let mut longest = 0usize;
         for (x, y, len) in framed_strip_extents(frames) {
             let (bx, by) = (x / geom.strip_w(), y / geom.strip_h());
             if bx >= across || by >= bands {
                 continue;
             }
-            values[by * PARAM_BAND_STRIDE + bx] = strip_size_class(len);
+            let class = strip_size_class(len);
+            values[by * PARAM_BAND_STRIDE + bx] = class;
+            if let Some(slot) = classes.get_mut(usize::from(class)) {
+                *slot += 1;
+            }
+            longest = longest.max(len);
             described += 1;
         }
-        // How many of the frame's strips the map actually accounts for. A position the walk misses
-        // is announced as size class 0, so this must equal the strip count of the records handed
-        // in -- it read one record per allocation chunk until 2026-08-04.
+        // How many of the frame's strips the map accounts for, and how they are distributed. A
+        // position the walk misses is announced as size class 0, so `described` must equal the
+        // strip count of the records handed in -- it read one record per allocation chunk until
+        // 2026-08-04. The histogram is the second half of the check: a map that covers every strip
+        // but calls them all class 0 is the same failure with a healthier-looking count.
         vino_debug!(
-            "vino: connector={connector} strip map describes {described} strip(s) over {} record chunk(s)\n",
-            frames.len()
+            "vino: connector={connector} strip map {described} strip(s) over {} chunk(s), classes {:?}, longest {longest} B\n",
+            frames.len(),
+            &classes[..4]
         );
+        remembered.copy_from_slice(&values);
 
         let mut band = 0usize;
         let mut record = 0usize;

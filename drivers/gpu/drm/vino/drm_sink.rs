@@ -858,6 +858,13 @@ pub(super) struct VinoDrmData {
     /// beyond what the dock may actually display.
     #[pin]
     strip_hashes: Mutex<[Option<StripHashState>; HEADS]>,
+    /// The DL7400 per-strip size-class map most recently sent for each connector.
+    ///
+    /// The map describes the whole surface while a delta frame carries only its damaged strips, so
+    /// rebuilding it from zero each frame re-declares every untouched position as class 0. See
+    /// `video::wht::navarro_strip_params`.
+    #[pin]
+    strip_classes: Mutex<[KVec<u8>; HEADS]>,
     /// Per-strip retransmit debt. Spreading repeated updates across frames reaches both of the
     /// dock's scanout buffers; consecutive presentations can target the same buffer.
     #[pin]
@@ -1053,6 +1060,7 @@ impl VinoDrmData {
             heads_present: core::sync::atomic::AtomicU32::new(0),
             color <- new_mutex!([None; HEADS]),
             strip_hashes <- new_mutex!([const { None }; HEADS]),
+            strip_classes <- new_mutex!(core::array::from_fn(|_| KVec::new())),
             dirty_ttl <- new_mutex!([const { None }; HEADS]),
             cp_engaged: core::sync::atomic::AtomicBool::new(false),
             cp_timeline_exclusive: core::sync::atomic::AtomicBool::new(false),
@@ -1757,7 +1765,14 @@ impl VinoDrmData {
                     let (sw, sh) = (geom.strip_w(), geom.strip_h());
                     let w_pad = (t.hactive as usize).div_ceil(sw) * sw;
                     let h_pad = (t.vactive as usize).div_ceil(sh) * sh;
-                    super::video::wht::navarro_strip_params(geom, head, w_pad, h_pad, &frames)?
+                    super::video::wht::navarro_strip_params(
+                        geom,
+                        head,
+                        w_pad,
+                        h_pad,
+                        &frames,
+                        &mut self.strip_classes.lock()[head_i],
+                    )?
                 }
                 None => KVec::new(),
             }
@@ -5883,7 +5898,14 @@ fn encode_and_send_wht(
     let params: KVec<u8> = if geom.head_sub_shift == 0 {
         KVec::new()
     } else {
-        super::video::wht::navarro_strip_params(geom, head, w_pad, h_pad, &frames)?
+        super::video::wht::navarro_strip_params(
+            geom,
+            head,
+            w_pad,
+            h_pad,
+            &frames,
+            &mut data.strip_classes.lock()[head_i],
+        )?
     };
     vino_debug!(
         "vino: head={} shift={} params={} B ({}x{} pad)\n",

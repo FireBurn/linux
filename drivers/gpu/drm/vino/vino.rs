@@ -3553,6 +3553,14 @@ kernel::module_usb_driver! {
             default: 0,
             description: "Diagnostic: clear the video endpoint halt before every transfer, to test whether the dock halts it after each one",
         },
+        strip_map_persist: u8 {
+            default: 1,
+            description: "Carry the DL7400 per-strip size-class map forward between frames, so a delta does not re-declare every untouched strip as class 0 (0 = rebuild from zero each frame, DLM's literal capture behaviour)",
+        },
+        strip_class_cap: u8 {
+            default: 0,
+            description: "Diagnostic: clamp the DL7400 per-strip size class (kind=0x200f) to this value (0 = uncapped). Every measured DLM map uses only 0..3; vino emits 4 and 5 for its longest strips, which no capture covers",
+        },
         video_xfer: u32 {
             default: 0,
             description: "Diagnostic: video transfer size in bytes (0 = 65536). Distinguishes a dock that stops after one TRANSFER from one that stops after a fixed BYTE COUNT",
