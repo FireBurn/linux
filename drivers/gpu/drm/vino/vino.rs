@@ -1953,8 +1953,15 @@ impl VinoDriver {
                 wseq += 2; // every initialization message is 32 B = 2 AES blocks
             }};
         }
-        send_init!(0x0014, 0x0030, &[]);
-        send_init!(0x0015, 0x000b, &[0x01]);
+        // ⚠ Navarro-only. This whole initialisation sequence was introduced with the DL7400 and
+        // did not exist before it: the parent of 498a10040294 sends none of `0x14/0x30`,
+        // `0x15/0x0b` or `0x16/0x2a`. Ridge inherited three messages it had never sent, and a
+        // user bisect landed the D6000's "no pixels at all" regression exactly on that commit.
+        // Ridge's own sequence is the historical one below.
+        if profile.navarro_mode_words {
+            send_init!(0x0014, 0x0030, &[]);
+            send_init!(0x0015, 0x000b, &[0x01]);
+        }
 
         if profile.navarro_mode_words {
             // The working DLM transaction places the video-engine transition at this exact
@@ -1978,9 +1985,11 @@ impl VinoDriver {
             dev.control_recv(0x22, 0xc1, 1, 0, &mut state2, timeout(), GFP_KERNEL)?;
             fsleep(Delta::from_millis(3));
         }
-        for connector in 0..connector_count {
-            let prefix = [connector as u8, 0x01];
-            send_init!(0x0016, 0x002a, &prefix);
+        if profile.navarro_mode_words {
+            for connector in 0..connector_count {
+                let prefix = [connector as u8, 0x01];
+                send_init!(0x0016, 0x002a, &prefix);
+            }
         }
 
         // Drain pending replies before starting the per-head authentication blocks. Each block
