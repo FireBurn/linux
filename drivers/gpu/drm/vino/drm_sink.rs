@@ -1490,6 +1490,26 @@ impl VinoDrmData {
             image_len += f.len().min(image_cap - image_len);
             image_parts += 1;
         }
+        // The DL7400's per-strip parameter map, ahead of the pixels it describes. This path --
+        // the startup/prompt-training submit -- is the one the dock's first frames go out on, so
+        // wiring the map only into the steady-state scanout left it absent from every frame that
+        // matters. Ridge has no equivalent record and gets an empty slice.
+        let params: KVec<u8> = if super::video::wht::head_sub_shift() == 0 {
+            KVec::new()
+        } else {
+            let t = self.last_timing.lock().get(head_i).copied().flatten();
+            match t {
+                Some(t) => {
+                    let sw = super::video::wht::strip_w();
+                    let sh = super::video::wht::strip_h();
+                    let w_pad = (t.hactive as usize).div_ceil(sw) * sw;
+                    let h_pad = (t.vactive as usize).div_ceil(sh) * sh;
+                    super::video::wht::navarro_strip_params(head, w_pad, h_pad)?
+                }
+                None => KVec::new(),
+            }
+        };
+        vino_debug!("vino: head={head} prompt-training parameter map {} B\n", params.len());
         let arm = if with_arm {
             if self.arm_prefix_pending.load(Ordering::Acquire) & head_bit == 0 {
                 return Err(ENODEV);
@@ -1523,9 +1543,22 @@ impl VinoDrmData {
             };
             // The dock is owed one sealed report on the stream sub for every frame on the frame
             // sub; without it the link is torn down a few seconds after the first frame.
-            let report = self.build_stream_report_buf(head_i)?;
+            //
+            // ⚠ Except on the frame that carries the prologue. DLM's first frame goes straight
+            // from the decoder configuration to its image records: no stream report, and no
+            // parameter map until about forty-five image records in. vino put both immediately
+            // after the configuration, so its records 6 and 7 were two records DLM never sends
+            // there -- and the dock accepted exactly one transfer and then stopped draining.
+            let report = if arm_slice.is_empty() {
+                self.build_stream_report_buf(head_i)?
+            } else {
+                None
+            };
             let report_slice: &[u8] = report.as_ref().map_or(&[], |r| &r[..]);
-            let wire_len = arm_slice.len() + report_slice.len() + image_len + trailer.len();
+            // Same rule for the parameter map.
+            let params_slice: &[u8] = if arm_slice.is_empty() { &params[..] } else { &[] };
+            let wire_len =
+                arm_slice.len() + report_slice.len() + params_slice.len() + image_len + trailer.len();
             {
                 let mut staging_slots = self.video_staging.lock();
                 let staging_slot = &mut staging_slots[head_i];
@@ -1560,7 +1593,8 @@ impl VinoDrmData {
                 // sealed stream report, then the pixels, then the frame's closing records.
                 let arm_parts = usize::from(!arm_slice.is_empty());
                 let report_parts = usize::from(!report_slice.is_empty());
-                let lead = arm_parts + report_parts;
+                let param_parts = usize::from(!params_slice.is_empty());
+                let lead = arm_parts + report_parts + param_parts;
                 let part_count = lead + image_parts + 1;
                 let mut part_i = 0usize;
                 let mut part_off = 0usize;
@@ -1572,8 +1606,10 @@ impl VinoDrmData {
                     while dst_off < dst.len() && part_i < part_count {
                         let part: &[u8] = if part_i < arm_parts {
                             arm_slice
-                        } else if part_i < lead {
+                        } else if part_i < arm_parts + report_parts {
                             report_slice
+                        } else if part_i < lead {
+                            params_slice
                         } else if part_i < lead + image_parts {
                             let f = &frames[part_i - lead][..];
                             &f[..f.len().min(image_cap)]
@@ -1589,7 +1625,15 @@ impl VinoDrmData {
                             part_off = 0;
                         }
                     }
-                    if let Err(e) = queue.send(dev.io(), dst, super::timeout()) {
+                    // DLM submits one transfer, waits for its completion, then submits the
+                    // next -- never more than two outstanding. `video_sync` reproduces that
+                    // exactly; the queue path pipelines eight.
+                    let sent = if *crate::module_parameters::video_sync.value() != 0 {
+                        dev.video_send(head_i, dst, super::timeout(), GFP_KERNEL).map(|_| ())
+                    } else {
+                        queue.send(dev.io(), dst, super::timeout())
+                    };
+                    if let Err(e) = sent {
                         let _ = dev.clear_video_halt(head_i);
                         return Err(e);
                     }
@@ -5196,6 +5240,14 @@ fn encode_and_send_wht(
     } else {
         super::video::wht::navarro_strip_params(head, w_pad, h_pad)?
     };
+    vino_debug!(
+        "vino: head={} shift={} params={} B ({}x{} pad)\n",
+        head,
+        super::video::wht::head_sub_shift(),
+        params.len(),
+        w_pad,
+        h_pad
+    );
     if arm.is_some() {
         data.send_stream_open(dev, head_i)?;
     }

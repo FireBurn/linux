@@ -280,6 +280,22 @@ impl<'a> UsbLink<'a> {
         usb::BulkOutQueue::new(self.window, &self.io, ep, depth, buf_len)
     }
 
+    /// Writes one video transfer synchronously, the way DLM paces its own.
+    ///
+    /// DLM never has more than two URBs outstanding on a video endpoint and normally exactly one:
+    /// it submits 65536 bytes, waits for the completion, then submits the next. vino pipelines
+    /// four to eight through `video_queue`. This is the transport half of that difference.
+    pub(crate) fn video_send(
+        &self,
+        head: usize,
+        data: &[u8],
+        timeout: Delta,
+        gfp: Flags,
+    ) -> Result<usize> {
+        let ep = self.eps.video.get(head).ok_or(EINVAL)?;
+        self.io.bulk_send(ep, data, timeout, gfp)
+    }
+
     /// The underlying I/O token, for the paths that open a persistent queue.
     pub(crate) fn io(&self) -> &usb::Io<'a> {
         &self.io
@@ -2766,6 +2782,10 @@ kernel::module_usb_driver! {
         break_mac: u8 {
             default: 0,
             description: "Diagnostic: corrupt the sealed prologue's Dl3Cmac to test whether the dock authenticates it",
+        },
+        video_sync: u8 {
+            default: 0,
+            description: "Pace video as DLM does: one synchronous transfer at a time, never pipelined",
         },
         video_records: u32 {
             default: 0,
