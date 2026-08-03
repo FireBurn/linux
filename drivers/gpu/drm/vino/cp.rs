@@ -182,12 +182,44 @@ pub(super) struct Timing {
     pub vsync_front: u16,
     pub vsync_width: u16,
     pub refresh_hz: u16,
-    /// Pixel clock in 10 kHz units, serialized at offset 70.
-    pub pixel_clock_10khz: u16,
+    /// Pixel clock in 10 kHz units, serialized as a `u32` at offsets 70 through 73.
+    ///
+    /// It is a full 32-bit field, not the 16-bit one this was until 2026-08-03. No Ridge capture
+    /// could show that, because Ridge is never driven above 497.75 MHz and the high half is
+    /// always zero there -- but the DL7400 sends `0x0001113d` (699.49 MHz) for 2560x1440p165,
+    /// so the upper word is real. Truncating to `u16` made every mode past 655.35 MHz fail the
+    /// conversion and never reach the dock at all.
+    pub pixel_clock_10khz: u32,
     /// Link configuration word at offset 42, selected by [`mode_profile`].
     pub field42: u16,
+    /// Word at offset 46. Resolution-keyed and platform-specific; see [`navarro_mode_words`].
+    pub off46: u16,
+    /// Word at offset 48. Resolution-keyed and platform-specific; see [`navarro_mode_words`].
+    pub off48: u16,
     /// Mode-dependent word at offset 66, selected by [`mode_profile`].
     pub off66: u16,
+}
+
+/// Ridge's offset-46 and offset-48 words, which are fixed across its whole decrypted corpus.
+const RIDGE_OFF46: u16 = 0x4000;
+const RIDGE_OFF48: u16 = 0x6000;
+
+/// The DL7400's offset-46 and offset-48 words for `hactive`, or `None` if no capture covers it.
+///
+/// These are *not* Ridge's constants, which vino sent on every DL7400 mode set until this was
+/// measured. Both words track resolution alone: all three decrypted 2560x1440 mode sets carry the
+/// same pair at 60, 120 and 165 Hz, and the one 640x480p60 mode set carries a different pair.
+///
+/// ⚠ Two samples cannot separate a formula from a lookup. `0x0a80`/`0x0300` are both `hactive +
+/// 128`, and `0x66db`/`0x6800` have no proposed derivation at all, so this deliberately refuses to
+/// extrapolate: an unmeasured resolution gets Ridge's words and a log line naming them, which is
+/// the same discipline [`mode_profile`] applies to offsets 42 and 66.
+fn navarro_mode_words(hactive: u16, vactive: u16) -> Option<(u16, u16)> {
+    match (hactive, vactive) {
+        (2560, 1440) => Some((0x0a80, 0x66db)),
+        (640, 480) => Some((0x0300, 0x6800)),
+        _ => None,
+    }
 }
 
 /// Select the offset-42 downstream link word from the mode's width.
@@ -315,8 +347,8 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
         t.vsync_width,
         t.field42,
         t.refresh_hz,
-        0x4000,
-        /* off46 flags */ 0x6000, /* off48 */
+        t.off46,
+        t.off48,
     ] {
         b.extend_from_slice(&v.to_le_bytes(), GFP_KERNEL)?;
     }
@@ -326,7 +358,9 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
     pad_to(&mut b, 66)?;
     b.extend_from_slice(&t.off66.to_le_bytes(), GFP_KERNEL)?; // off66: see `mode_profile`
     b.extend_from_slice(&0x0200u16.to_le_bytes(), GFP_KERNEL)?; // off68: profile constant
-    b.extend_from_slice(&t.pixel_clock_10khz.to_le_bytes(), GFP_KERNEL)?; // off70: 10 kHz units
+    // off70..73: pixel clock in 10 kHz units, a full u32. Ridge only ever fills the low half, so
+    // this is byte-identical there to the old u16 followed by two zero bytes.
+    b.extend_from_slice(&t.pixel_clock_10khz.to_le_bytes(), GFP_KERNEL)?;
     pad_to(&mut b, 74)?;
     let mut tail = [0u8; 6];
     rng::fill(&mut tail);
@@ -334,7 +368,10 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
     Ok(b)
 }
 /// Convert a DRM display mode into the dock's set-mode timing representation.
-pub(super) fn timing_from_drm_mode(mode: &kernel::drm::kms::modes::DisplayMode) -> Result<Timing> {
+pub(super) fn timing_from_drm_mode(
+    mode: &kernel::drm::kms::modes::DisplayMode,
+    navarro: bool,
+) -> Result<Timing> {
     let refresh = mode.vrefresh() as u16;
     let sub = |a: u16, b: u16| a.saturating_sub(b);
     let profile = mode_profile(mode).ok_or(EINVAL)?;
@@ -354,7 +391,22 @@ pub(super) fn timing_from_drm_mode(mode: &kernel::drm::kms::modes::DisplayMode) 
             profile.off66
         );
     }
-    let pixel_clock_10khz = u16::try_from((clock as u32) / 10).map_err(|_| EINVAL)?;
+    let pixel_clock_10khz = (clock as u32) / 10;
+    let (off46, off48) = if navarro {
+        navarro_mode_words(mode.hdisplay(), mode.vdisplay()).unwrap_or_else(|| {
+            pr_info!(
+                "vino: {}x{} has no measured DL7400 mode words; sending Ridge's off46={:#06x} \
+                 off48={:#06x}\n",
+                mode.hdisplay(),
+                mode.vdisplay(),
+                RIDGE_OFF46,
+                RIDGE_OFF48
+            );
+            (RIDGE_OFF46, RIDGE_OFF48)
+        })
+    } else {
+        (RIDGE_OFF46, RIDGE_OFF48)
+    };
     Ok(Timing {
         hactive: mode.hdisplay(),
         hblank: sub(mode.htotal(), mode.hdisplay()),
@@ -367,6 +419,8 @@ pub(super) fn timing_from_drm_mode(mode: &kernel::drm::kms::modes::DisplayMode) 
         refresh_hz: refresh,
         pixel_clock_10khz,
         field42: profile.off42,
+        off46,
+        off48,
         off66: profile.off66,
     })
 }

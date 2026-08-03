@@ -778,6 +778,8 @@ pub(super) struct VinoDrmData {
     /// Whether presence comes from the probe reply's status word rather than from which handler
     /// answered; see `DockProfile::presence_from_status`.
     presence_from_status: core::sync::atomic::AtomicBool,
+    /// Whether the mode set carries the DL7400's offset-46/48 words; see `DockProfile`.
+    navarro_mode_words: core::sync::atomic::AtomicBool,
     /// How many downstream connectors this dock answers a presence probe for; see
     /// `DockProfile::connectors`. Ridge: 2; Navarro: all four physical sockets.
     connectors: core::sync::atomic::AtomicU8,
@@ -968,6 +970,7 @@ impl VinoDrmData {
             self_blanked: core::sync::atomic::AtomicU32::new(0),
             video_supported: core::sync::atomic::AtomicBool::new(true),
             presence_from_status: core::sync::atomic::AtomicBool::new(false),
+            navarro_mode_words: core::sync::atomic::AtomicBool::new(false),
             connectors: core::sync::atomic::AtomicU8::new(HEADS as u8),
             video_arm: core::sync::atomic::AtomicBool::new(true),
             video_keys <- new_mutex!(core::array::from_fn(
@@ -1177,6 +1180,16 @@ impl VinoDrmData {
     /// means that this polling round did not recover the status word.
     pub(super) fn presence_from_status(&self) -> bool {
         self.presence_from_status.load(Ordering::Acquire)
+    }
+
+    /// Record whether mode sets carry the DL7400's offset-46/48 words.
+    pub(super) fn set_navarro_mode_words(&self, on: bool) {
+        self.navarro_mode_words.store(on, Ordering::Release);
+    }
+
+    /// Whether mode sets carry the DL7400's offset-46/48 words.
+    pub(super) fn navarro_mode_words(&self) -> bool {
+        self.navarro_mode_words.load(Ordering::Acquire)
     }
 
     /// Record how many connectors this dock exposes; see [`DockProfile::connectors`].
@@ -3643,7 +3656,7 @@ impl crtc::DriverCrtc for VinoCrtc {
         // Whatever this head's sink state was, the enable path re-runs the full bracket and
         // mode-set, so any silence from here is the dock's news, not vino's.
         data.set_self_blanked(head as usize, false);
-        let timing = match super::cp::timing_from_drm_mode(new.mode()) {
+        let timing = match super::cp::timing_from_drm_mode(new.mode(), data.navarro_mode_words()) {
             Ok(timing) => timing,
             Err(e) => {
                 pr_err!(

@@ -121,6 +121,12 @@ pub(crate) struct DockProfile {
     /// Presence is instead bit `0x10` of inner byte 23, i.e. `status & 0x1000`: an occupied
     /// connector answers `05 11 27 00`, an empty one `05 01 <20|21|60|61> 00`.
     pub(crate) presence_from_status: bool,
+    /// Whether the mode set carries the DL7400's offset-46/48 words rather than Ridge's.
+    ///
+    /// Both words are platform- and resolution-specific, and vino sent Ridge's `0x4000`/`0x6000`
+    /// on every DL7400 mode set until the decrypted Navarro corpus was read. See
+    /// [`cp::navarro_mode_words`].
+    pub(crate) navarro_mode_words: bool,
     /// Number of downstream connectors the dock answers a presence probe for.
     ///
     /// This is the range of the selector at probe byte 22, and it is **not** the head count: Ridge
@@ -146,6 +152,7 @@ static PROFILE_D6000: DockProfile = DockProfile {
     strip_blocks_x: 8,
     interlaced_bands: false,
     presence_from_status: false,
+    navarro_mode_words: false,
     connectors: 2,
 };
 
@@ -170,6 +177,7 @@ static PROFILE_DL7400: DockProfile = DockProfile {
     strip_blocks_x: 16,
     interlaced_bands: true,
     presence_from_status: true,
+    navarro_mode_words: true,
     connectors: 4,
 };
 
@@ -2673,6 +2681,7 @@ impl usb::Driver for VinoDriver {
             drm_sink::set_interlaced_bands(info.interlaced_bands);
             d.set_video_arm(info.video_arm);
             d.set_presence_from_status(info.presence_from_status);
+            d.set_navarro_mode_words(info.navarro_mode_words);
             d.set_connectors(info.connectors);
         }
         let bringup = BringUp::new(ddev.clone(), info)?;
@@ -3456,7 +3465,7 @@ mod tests {
             flags: ModeFlags::PHSYNC | ModeFlags::PVSYNC,
         })?;
         assert_eq!(mode.cea_vic(), 16);
-        let t = cp::timing_from_drm_mode(&mode)?;
+        let t = cp::timing_from_drm_mode(&mode, false)?;
         assert_eq!(t.hactive, 1920);
         assert_eq!(t.hblank, 280); // htotal - hdisplay
         assert_eq!(t.hsync_front, 88); // hsync_start - hdisplay
@@ -3553,7 +3562,7 @@ mod tests {
                     ModeFlags::PHSYNC | ModeFlags::NVSYNC
                 },
             })?;
-            let t = cp::timing_from_drm_mode(&mode)?;
+            let t = cp::timing_from_drm_mode(&mode, false)?;
             let w = cp::set_mode(7, 1, &t)?;
             assert_eq!(w.len(), 80);
             let u16_at = |off: usize| u16::from_le_bytes([w[off], w[off + 1]]);
@@ -3595,8 +3604,12 @@ mod tests {
         assert!(cp::mode_supported(&mode));
         // Still out of the dock's envelope, so userspace never sees it.
         assert!(mode.clock() > 655_350 || !drm_sink::refresh_within_limit(mode.vrefresh()));
-        // The 10 kHz clock field cannot carry it either, so a forced mode-set fails loudly.
-        assert!(cp::timing_from_drm_mode(&mode).is_err());
+        // The clock field itself carries it fine: offsets 70..73 are a u32, as the DL7400's
+        // 2560x1440p165 mode set proves (0x0001113d = 699.49 MHz). Admission is the refresh
+        // limit's job, not a silent conversion failure.
+        let t = cp::timing_from_drm_mode(&mode, false)?;
+        assert_eq!(t.pixel_clock_10khz, (mode.clock() as u32) / 10);
+        assert!(t.pixel_clock_10khz > u32::from(u16::MAX));
         Ok(())
     }
 
@@ -3617,7 +3630,7 @@ mod tests {
             vtotal: 1080,
             flags: ModeFlags::PHSYNC | ModeFlags::NVSYNC,
         })?;
-        let t = cp::timing_from_drm_mode(&mode)?;
+        let t = cp::timing_from_drm_mode(&mode, false)?;
         // 1680 wide, so the bottom step of the off42 ladder.
         assert_eq!(t.field42, 0x0400);
         // No VIC, so the low byte is zero and the base is the common 0x0800.
@@ -3928,6 +3941,8 @@ mod tests {
             refresh_hz: 60,
             pixel_clock_10khz: 0xd040,
             field42: 0x0604,
+            off46: 0x4000,
+            off48: 0x6000,
             off66: 0x0800,
         };
         let m = cp::set_mode(0x1234, 1, &timing)?;
@@ -3937,7 +3952,7 @@ mod tests {
         assert_eq!(&m[22..26], &[1, 2, 0, 0]);
         assert_eq!(u16::from_le_bytes([m[26], m[27]]), 3840);
         assert_eq!(u16::from_le_bytes([m[34], m[35]]), 2160);
-        assert_eq!(u16::from_le_bytes([m[70], m[71]]), 0xd040);
+        assert_eq!(u32::from_le_bytes([m[70], m[71], m[72], m[73]]), 0xd040);
         assert_eq!(u16::from_le_bytes([m[68], m[69]]), 0x0200);
         Ok(())
     }
