@@ -142,6 +142,13 @@ pub(crate) struct DockProfile {
     /// connectors 0 then 2, `0x0a` carried 1 then 3, measured across cable moves). Connector index
     /// is the physical socket number minus one.
     pub(crate) connectors: u8,
+    /// How many buffers the dock rotates through as it presents frames.
+    ///
+    /// Ridge is double buffered. The DL7400 rotates three slots -- `video::wht::ring_phase()`
+    /// steps `seq0 % 3` and its pipe descriptor names three ring addresses. This drives both the
+    /// keyframe presentation count and the per-strip retransmit debt, so getting it wrong leaves
+    /// one slot holding stale pixels and the panel ghosts on anything detailed.
+    pub(crate) dock_buffers: u8,
     /// Outstanding EP84 reads to keep posted.
     ///
     /// Navarro needs exactly one, which is what DLM keeps: with four posted through a round-robin
@@ -174,6 +181,7 @@ static PROFILE_D6000: DockProfile = DockProfile {
     presence_from_status: false,
     navarro_mode_words: false,
     connectors: 2,
+    dock_buffers: 2,
     ep84_queue_depth: 4,
 };
 
@@ -203,6 +211,7 @@ static PROFILE_DL7400: DockProfile = DockProfile {
     presence_from_status: true,
     navarro_mode_words: true,
     connectors: 4,
+    dock_buffers: 3,
     ep84_queue_depth: 1,
 };
 
@@ -3331,6 +3340,7 @@ impl usb::Driver for VinoDriver {
             drm_sink::set_aux_is_pad_count(info.aux_is_pad_count);
             drm_sink::set_strip_blocks_x(info.strip_blocks_x);
             drm_sink::set_interlaced_bands(info.interlaced_bands);
+            drm_sink::set_dock_buffers(info.dock_buffers);
             d.set_video_arm(info.video_arm);
             d.set_presence_from_status(info.presence_from_status);
             d.set_navarro_mode_words(info.navarro_mode_words);

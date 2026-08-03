@@ -165,11 +165,39 @@ const FRAME_PERIOD_MS: i64 = 5;
 /// and forced a 1 ms minimum sleep, so a frame could wait materially longer than the window.
 const FRAME_PERIOD_US: i64 = FRAME_PERIOD_MS * 1000;
 
+/// How deep the dock's presentation ring is -- how many distinct buffers a strip must be written
+/// into before every one of them holds the new pixels.
+///
+/// Ridge is double buffered. The DL7400 rotates **three** slots: `video::wht::ring_phase()` steps
+/// `seq0 % 3` and the pipe descriptor names three ring addresses.
+///
+/// ⚠ This was a hardcoded 2 until 2026-08-03, which silently left one of the DL7400's three slots
+/// holding stale pixels on every keyframe. Because the dock scans the slots in turn, a strip
+/// present in two of three ghosts -- the panel alternates between new and old content -- which is
+/// invisible to any analysis that decodes the wire, since the *bytes* are correct.
+static DOCK_BUFFERS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
+
+/// Record how many buffers this dock rotates; see [`DOCK_BUFFERS`].
+pub(super) fn set_dock_buffers(n: u8) {
+    DOCK_BUFFERS.store(n.max(1), Ordering::Release);
+}
+
+/// The dock's ring depth; see [`DOCK_BUFFERS`].
+#[inline]
+fn dock_buffers() -> u8 {
+    DOCK_BUFFERS.load(Ordering::Acquire)
+}
+
 /// How many consecutive frames must carry a strip after its content changes, so that every one of
-/// the dock's buffers receives it. Two is the theoretical minimum for a double-buffered sink; a
-/// window drag still left an occasional stale frame at two, so this carries one frame of margin
-/// for a presentation the dock drops or applies to the buffer it just used.
-const DAMAGE_REPEATS: u8 = 3;
+/// the dock's buffers receives it.
+///
+/// The ring depth is the theoretical minimum; a window drag still left an occasional stale frame
+/// at exactly the minimum, so this carries one frame of margin for a presentation the dock drops
+/// or applies to the buffer it just used.
+#[inline]
+fn damage_repeats() -> u8 {
+    dock_buffers().saturating_add(1)
+}
 /// Activation timing relative to the mode-set submission.
 const PROMPT_VIDEO_MS: i64 = 110;
 const PROMPT_CLOSE_2F_MS: i64 = 123;
@@ -178,7 +206,7 @@ const PROMPT_CLOSE_2E_MS: i64 = 125;
 const PROMPT_KEEPALIVE_QUIESCE_MS: i64 = 40;
 /// Minimum interval between streaming status polls (`id=0x14 sub=0x0c`).
 ///
-/// This was issued once per *presentation*, so two heads at ~100 fps with `DAMAGE_REPEATS`
+/// This was issued once per *presentation*, so two heads at ~100 fps with `damage_repeats()`
 /// presentations each drove 200-600 CP round-trips a second, every one of them serialising on the
 /// single control link. Whichever head looped fastest re-acquired it immediately and starved the
 /// other for seconds at a time. DLM issues ~3.8 of these per second
@@ -189,7 +217,7 @@ const PROMPT_TRAINING_OPEN_MS: i64 = 0;
 const PROMPT_TRAINING_TAIL_MS: i64 = 400;
 /// How long [`VinoDrmData::blank_head`] keeps presenting black when a CRTC is disabled.
 ///
-/// It only has to outlast the dock's buffer rotation, which `DAMAGE_REPEATS` puts at three
+/// It only has to outlast the dock's buffer rotation, which `damage_repeats` puts at three
 /// presentations; a black frame is ~200 KB and presents in a couple of milliseconds, so this is
 /// generous by an order of magnitude and still finishes well inside a DPMS transition. It is not a
 /// training window -- nothing downstream needs settling -- so it does not reuse
@@ -1539,7 +1567,7 @@ impl VinoDrmData {
             interlaced_bands(),
         )?;
         // Present for long enough to reach every dock buffer. The dock is multi-buffered and a
-        // single presentation lands in one buffer only -- the same reason `DAMAGE_REPEATS` exists
+        // single presentation lands in one buffer only -- the same reason `damage_repeats` exists
         // -- so a one-shot blank leaves the other buffer holding the frozen desktop and the panel
         // alternates between black and stale content.
         let sent = self.submit_prompt_training(
@@ -4885,7 +4913,7 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
                 }
             } else {
                 // Repaint the same framebuffer while strips still have retransmit debt. This is a
-                // delta, not a keyframe, and terminates after at most `DAMAGE_REPEATS` accepted
+                // delta, not a keyframe, and terminates after at most `damage_repeats()` accepted
                 // presentations because each pass decrements the debt ledger.
                 let owes = data.dirty_ttl.lock()[head_i]
                     .as_ref()
@@ -5595,7 +5623,7 @@ fn encode_and_send_wht(
                     let debt = ttl[head_i].as_mut().ok_or(kernel::error::code::ENOMEM)?;
                     for i in 0..hashes.len() {
                         if state.hashes[i] != hashes[i] {
-                            debt[i] = DAMAGE_REPEATS;
+                            debt[i] = damage_repeats();
                         }
                     }
                     // Reuse the hash differ: mark an owed strip by handing it a baseline value that
@@ -5861,12 +5889,14 @@ fn encode_and_send_wht(
     let repeat_count = if training {
         COLD_TRAINING_PRESENTATIONS
     } else if full {
-        // A keyframe must reach both dock buffers. One presentation updates only one buffer, while
-        // later deltas repair only their selected regions.
-        2
+        // A keyframe must reach EVERY dock buffer. One presentation updates only one of them,
+        // while later deltas repair only their selected regions -- and the ledger is cleared
+        // outright below on the strength of this, so a keyframe that comes up short leaves stale
+        // pixels nothing will ever repair.
+        u32::from(dock_buffers())
     } else {
         // Consecutive copies land in the same dock buffer. Spread delta retransmissions across
-        // successive frames through `DAMAGE_REPEATS` and the debt repaint instead.
+        // successive frames through `damage_repeats` and the debt repaint instead.
         1
     };
     let first_opener_len = data
@@ -6126,7 +6156,7 @@ fn encode_and_send_wht(
         }
     }
     // Publish the content shadow, and with it the encoded body of every strip this frame carried,
-    // so the retransmissions `DAMAGE_REPEATS` owes can re-use the bytes instead of re-running the
+    // so the retransmissions `damage_repeats` owes can re-use the bytes instead of re-running the
     // codec (see `StripHashState::bodies`). Bodies for strips this frame did NOT touch are carried
     // forward from the previous state -- they are still what the dock holds, and a later debt pass
     // may select them. Best-effort throughout: a failed allocation costs a cache miss, never a
