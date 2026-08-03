@@ -149,6 +149,23 @@ pub(crate) struct DockProfile {
     /// keyframe presentation count and the per-strip retransmit debt, so getting it wrong leaves
     /// one slot holding stale pixels and the panel ghosts on anything detailed.
     pub(crate) dock_buffers: u8,
+    /// Whether this dock's inbound frames are authenticated by their trailing Dl3Cmac.
+    ///
+    /// ⚠ Ungated change in 498a10040294, the commit a user bisect landed the D6000's "no pixels
+    /// at all" regression on. `open_in` there began verifying the tag over the whole body and
+    /// callers dropped the plaintext plausibility tests that had stood in for it. Navarro needs
+    /// the strict form -- it puts a one-hot connector selector in inner bytes 6..7, which the old
+    /// heuristic rejected for connectors 2 and 3. Ridge is decoded the historical way until the
+    /// strict form is measured on it.
+    pub(crate) cp_authenticated_in: bool,
+    /// Whether a control write waits for the reply whose inner counter echoes its own.
+    ///
+    /// ⚠ Also ungated in 498a10040294. Navarro interleaves unprompted `id=2/sub=0x86` status
+    /// pushes with its replies, and treating the first such push as the paired reply advances
+    /// EP02 before the dock has finished the transaction -- the 100-ms staircase in its failed
+    /// captures. Ridge reaped exactly one reply per write for the whole life of the driver
+    /// before that.
+    pub(crate) cp_reply_counter_match: bool,
     /// Outstanding EP84 reads to keep posted.
     ///
     /// Navarro needs exactly one, which is what DLM keeps: with four posted through a round-robin
@@ -200,6 +217,8 @@ static PROFILE_D6000: DockProfile = DockProfile {
     navarro_mode_words: false,
     connectors: 2,
     dock_buffers: 2,
+    cp_authenticated_in: false,
+    cp_reply_counter_match: false,
     ep84_queue_depth: 4,
 };
 
@@ -230,6 +249,8 @@ static PROFILE_DL7400: DockProfile = DockProfile {
     navarro_mode_words: true,
     connectors: 4,
     dock_buffers: 3,
+    cp_authenticated_in: true,
+    cp_reply_counter_match: true,
     ep84_queue_depth: 1,
 };
 
@@ -502,6 +523,9 @@ mod video_arm;
 struct Session {
     ks: kernel::crypto::Secret<{ drm_hdcp::ENCRYPTED_SESSION_KEY_LEN }>,
     riv: [u8; drm_hdcp::RIV_LEN],
+    /// See `DockProfile::cp_authenticated_in`. Carried here because the EP84 decode helpers are
+    /// free functions that already take the session and nothing else about the dock.
+    authenticated_in: bool,
     /// Next inner sequence counter after the AKE messages sent by [`run_ake`].
     next_ctr: u16,
     /// Receiver key retained for each downstream repeater authentication.
@@ -744,7 +768,7 @@ impl WorkItem for BringUp {
             let result = (|| -> Result {
                 VinoDriver::bring_up(dev, profile)?;
                 vino_dev_debug!(cdev, "vino: plaintext session initialized\n");
-                let mut session = VinoDriver::run_ake(dev)?;
+                let mut session = VinoDriver::run_ake(dev, profile)?;
                 vino_dev_debug!(cdev, "vino: HDCP AKE + LC + SKE complete\n");
 
                 let mut edid_out: Option<KVec<u8>> = None;
@@ -781,6 +805,8 @@ impl WorkItem for BringUp {
                     wseq_end,
                     ctr_end,
                     profile.ep84_queue_depth,
+                    profile.cp_authenticated_in,
+                    profile.cp_reply_counter_match,
                 );
                 data.set_video_keys(video_keys);
 
@@ -1519,7 +1545,7 @@ impl VinoDriver {
     /// * ctr=1 session-init ACK (id=0x14/0x76), ctr=2 AKE_Init, ctr=3 AKE_Transmitter_Info
     /// * ctr=4 AKE_No_Stored_km, ctr=5 LC_Init, ctr=6 SKE_Send_Eks
     /// * ctr=7 RepeaterAuth_Send_Ack, ctr=8 RepeaterAuth_Stream_Manage  (then msg0 at ctr=9)
-    fn run_ake(dev: &UsbLink<'_>) -> Result<Session> {
+    fn run_ake(dev: &UsbLink<'_>, profile: &DockProfile) -> Result<Session> {
         use ake::id;
 
         let mut saw_cap_complete = false;
@@ -1711,6 +1737,7 @@ impl VinoDriver {
         Ok(Session {
             ks,
             riv,
+            authenticated_in: profile.cp_authenticated_in,
             next_ctr: hseq as u16,
             rsa,
             rxid_list,
@@ -2991,7 +3018,7 @@ impl VinoDriver {
                 }
             }
         }
-        match cp::decode_any(&session.ks, &session.riv, frame) {
+        match cp::decode_any(&session.ks, &session.riv, frame, session.authenticated_in) {
             Some((rivtag, rid, rsub, rictr, _)) => {
                 vino_debug!("vino: EP84 {rivtag} id={rid:#x} sub={rsub:#x} ctr={rictr:#x}\n");
             }
@@ -3045,14 +3072,14 @@ impl VinoDriver {
                     // envelope acknowledgment does not mean the downstream authentication has
                     // advanced; L', V' and M' are the state-machine gates.
                     if let Some(push) =
-                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len])
+                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
                     {
                         out.observe_perhead(push);
                     }
                     if len >= 10 && u16::from_le_bytes([buf[8], buf[9]]) == 0x45 {
                         // The 0x45 wire tag is shared by status traffic. Only a valid decrypted
                         // inner header proves that this session's cipher is engaged.
-                        match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len]) {
+                        match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len], session.authenticated_in) {
                             Some((id, sub, ctr)) => {
                                 out.acks += 1;
                                 vino_debug!(
@@ -3070,6 +3097,7 @@ impl VinoDriver {
                                         &session.ks,
                                         &session.riv,
                                         &buf[..len],
+                        session.authenticated_in,
                                     ) {
                                         vino_debug!(
                                             "vino: EDID read from dock ({} bytes)\n",
@@ -3081,13 +3109,13 @@ impl VinoDriver {
                                 // Track the downstream-DDC readiness bit so
                                 // the EDID loop can distinguish pending work.
                                 if let Some(true) =
-                                    cp::edid_poll_ready(&session.ks, &session.riv, &buf[..len])
+                                    cp::edid_poll_ready(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
                                 {
                                     out.edid_ready = true;
                                 }
                             }
                             None => {
-                                match cp::decode_in_lenient(&session.ks, &session.riv, &buf[..len])
+                                match cp::decode_in_lenient(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
                                 {
                                     // A structurally valid header with an uncatalogued sub-id still
                                     // proves possession of the session key.
@@ -3101,6 +3129,7 @@ impl VinoDriver {
                                                 &session.ks,
                                                 &session.riv,
                                                 &buf[..len],
+                        session.authenticated_in,
                                             ) {
                                                 if let Some(line) = cp::dock_trace_line(&inner) {
                                                     pr_info!(
@@ -3119,6 +3148,7 @@ impl VinoDriver {
                                         &session.ks,
                                         &session.riv,
                                         &buf[..len],
+                        session.authenticated_in,
                                     ) {
                                         Some(inner) => {
                                             out.acks += 1;
@@ -3168,7 +3198,7 @@ impl VinoDriver {
                     out.reads += 1;
                     Self::log_ep84(session, &buf[..len]);
                     if let Some(push) =
-                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len])
+                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
                     {
                         out.observe_perhead(push);
                         if out.saw_perhead(want_msg_id) {
@@ -3179,7 +3209,7 @@ impl VinoDriver {
                     if u16::from_le_bytes([buf[8], buf[9]]) != 0x45 {
                         continue;
                     }
-                    match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len]) {
+                    match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len], session.authenticated_in) {
                         Some((id, sub, ctr)) => {
                             out.acks += 1;
                             vino_debug!(
@@ -3190,6 +3220,7 @@ impl VinoDriver {
                             &session.ks,
                             &session.riv,
                             &buf[..len],
+                        session.authenticated_in,
                         )
                         .is_some() => {
                             out.acks += 1;
@@ -3229,11 +3260,11 @@ impl VinoDriver {
                         continue;
                     }
                     if let Some(push) =
-                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len])
+                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
                     {
                         out.observe_perhead(push);
                     }
-                    match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len]) {
+                    match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len], session.authenticated_in) {
                         Some((id, sub, ctr)) => {
                             out.acks += 1;
                             let echo = if ctr == ictr {
@@ -3248,6 +3279,7 @@ impl VinoDriver {
                                     &session.ks,
                                     &session.riv,
                                     &buf[..len],
+                        session.authenticated_in,
                                 ) {
                                     vino_debug!("vino: EDID read from dock ({} bytes)\n", e.len());
                                     *edid_out = Some(e);
@@ -3258,7 +3290,7 @@ impl VinoDriver {
                                 break;
                             }
                         }
-                        None => match cp::decode_in_lenient(&session.ks, &session.riv, &buf[..len])
+                        None => match cp::decode_in_lenient(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
                         {
                             // Decrypts to a plausible CP header, just an unlisted `sub` -- a valid
                             // ack (cipher engaged), not a rejection. See the drain_ep84 branch.
@@ -3850,18 +3882,18 @@ mod tests {
         let body = &frame[16..];
         let ct = &frame[16..16 + 32];
         // `open_in` verifies the appended Dl3Cmac, then applies AES-CTR with the supplied nonce.
-        assert_eq!(&cp::open_in(&ks, &riv, 4, body)?[..], &content[..]);
+        assert_eq!(&cp::open_in(&ks, &riv, 4, body, true)?[..], &content[..]);
         // And pin that contract rather than leaving it implicit: the IN nonce really is different,
         // so both its MAC nonce and content keystream reject this fixture.
         assert_ne!(cp::in_riv(&riv), riv);
-        assert!(cp::open_in(&ks, &cp::in_riv(&riv), 4, body).is_err());
+        assert!(cp::open_in(&ks, &cp::in_riv(&riv), 4, body, true).is_err());
         assert_eq!(&frame[16 + 32..], &cp::dl3cmac_tag(&ks, &riv, 4, ct)?[..]);
 
         let mut damaged = KVec::new();
         damaged.extend_from_slice(body, GFP_KERNEL)?;
         let last = damaged.len() - 1;
         damaged[last] ^= 1;
-        assert!(cp::open_in(&ks, &riv, 4, &damaged).is_err());
+        assert!(cp::open_in(&ks, &riv, 4, &damaged, true).is_err());
         Ok(())
     }
 
@@ -3883,11 +3915,11 @@ mod tests {
         for riv in [in_head0, in_head1, out_head0, out_head1] {
             let frame = cp::seal_livemac(&ks, &riv, &header, &inner)?;
             assert_eq!(
-                cp::verify_in_ack(&ks, &out_head0, &frame),
+                cp::verify_in_ack(&ks, &out_head0, &frame, true),
                 Some((0x14, 0x30, 9))
             );
             assert_eq!(
-                cp::decode_in_lenient(&ks, &out_head0, &frame),
+                cp::decode_in_lenient(&ks, &out_head0, &frame, true),
                 Some((0x14, 0x30, 9))
             );
         }
@@ -3897,11 +3929,11 @@ mod tests {
         let selector_push = [0x10, 0, 0x84, 0, 0, 0, 0, 0x80];
         let frame = cp::seal_livemac(&ks, &in_head0, &header, &selector_push)?;
         assert_eq!(
-            cp::decode_in_lenient(&ks, &out_head0, &frame),
+            cp::decode_in_lenient(&ks, &out_head0, &frame, true),
             Some((0x10, 0x84, 0))
         );
         assert_eq!(
-            &cp::inner_plaintext(&ks, &out_head0, &frame).unwrap()[..],
+            &cp::inner_plaintext(&ks, &out_head0, &frame, true).unwrap()[..],
             &selector_push
         );
         Ok(())
@@ -4094,10 +4126,10 @@ mod tests {
         // The pre-decrypt guards reject non-EDID frames without touching the cipher.
         let ks = [0u8; 16];
         let riv = [0u8; 8];
-        assert!(cp::parse_edid_from_reply(&ks, &riv, &[0u8; 10])?.is_none());
+        assert!(cp::parse_edid_from_reply(&ks, &riv, &[0u8; 10], true)?.is_none());
         let mut wrong_sub = [0u8; 20];
         wrong_sub[8] = 0x44; // wire sub != 0x45
-        assert!(cp::parse_edid_from_reply(&ks, &riv, &wrong_sub)?.is_none());
+        assert!(cp::parse_edid_from_reply(&ks, &riv, &wrong_sub, true)?.is_none());
         Ok(())
     }
 
@@ -4169,8 +4201,8 @@ mod tests {
             0xc2, 0x49, 0xfb, 0x67, 0x54, 0xd5, 0x47, 0x72, 0xb7, 0x19, 0x24, 0x8f, 0xb1, 0xb0,
             0xb2, 0x83, 0x89, 0x62, 0x4b, 0xcb, 0x59, 0x15, 0x1f, 0x8f, 0x85, 0xc3, 0xa5, 0x9d,
         ];
-        assert_eq!(cp::edid_poll_ready(&KS, &OUT_RIV, &NOT_READY), Some(false));
-        assert_eq!(cp::edid_poll_ready(&KS, &OUT_RIV, &READY), Some(true));
+        assert_eq!(cp::edid_poll_ready(&KS, &OUT_RIV, &NOT_READY, true), Some(false));
+        assert_eq!(cp::edid_poll_ready(&KS, &OUT_RIV, &READY, true), Some(true));
         Ok(())
     }
 
@@ -4688,7 +4720,7 @@ mod tests {
         wire[8..10].copy_from_slice(&0x45u16.to_le_bytes());
 
         assert_eq!(
-            cp::probe_reply_status(&key, &riv, &wire),
+            cp::probe_reply_status(&key, &riv, &wire, true),
             Some((0x78, 0x1234, true))
         );
         Ok(())
