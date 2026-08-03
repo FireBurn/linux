@@ -1401,25 +1401,51 @@ pub(crate) mod wht {
     /// codec's `01 28` magic -- which is what terminates the walk when a record's trailing
     /// padding is reached, since `aux` is a producer lane on this dock and not a pad count.
     fn framed_strip_extents(frames: &[KVec<u8>]) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
-        frames.iter().flat_map(|rec| {
-            let body = rec.get(16..).unwrap_or(&[]);
+        frames.iter().flat_map(|chunk| {
+            // ⚠ Each element of `frames` is an ALLOCATION chunk, not one record: the loop above
+            // packs complete records into `CHUNK`-sized buffers. Skipping a single 16-byte header
+            // and walking strips to the end therefore stopped at the first *inner* record
+            // boundary, because the next record's zero `pad` word reads as a strip length of 0.
+            // Only the strips of each chunk's first record were measured, and every other position
+            // stayed size class 0 -- "under 512 bytes" -- which is exactly the artifact this map
+            // exists to prevent: busy strips decode to coloured noise while flat fills stay exact.
+            // At 2560x1440 a chunk holds about four of the 4080-byte records, so roughly three
+            // quarters of the frame was mis-declared.
+            //
+            // Walk records by their own stride instead. A record is `[u16 pad][u16 size][12 B
+            // header][ (u16 len ++ strip)* ][ 0..15 pad ]` and the next one begins `size + 4`
+            // bytes on.
+            let mut next_record = 0usize;
             let mut p = 0usize;
-            core::iter::from_fn(move || {
-                loop {
-                    let hdr = body.get(p..p + 2)?;
-                    let sl = u16::from_le_bytes([hdr[0], hdr[1]]) as usize;
-                    if sl < 16 {
+            let mut record_end = 0usize;
+            core::iter::from_fn(move || loop {
+                if p + 2 > record_end {
+                    // This record is exhausted (or none has started yet): step to the next.
+                    let hdr = chunk.get(next_record..next_record + 16)?;
+                    let stride = usize::from(u16::from_le_bytes([hdr[2], hdr[3]])) + 4;
+                    if stride < 16 || next_record + stride > chunk.len() {
                         return None;
                     }
-                    let s = body.get(p + 2..p + 2 + sl)?;
-                    p += 2 + sl;
-                    if s[0] != 0x01 || s[1] != 0x28 {
-                        return None;
-                    }
-                    let x = u16::from_le_bytes([s[2], s[3]]) as usize;
-                    let y = u16::from_le_bytes([s[4], s[5]]) as usize;
-                    return Some((x, y, sl));
+                    p = next_record + 16;
+                    record_end = next_record + stride;
+                    next_record = record_end;
+                    continue;
                 }
+                let sl = usize::from(u16::from_le_bytes([chunk[p], chunk[p + 1]]));
+                // A length that cannot be a strip is this record's trailing zero padding.
+                if sl < 16 || p + 2 + sl > record_end {
+                    p = record_end;
+                    continue;
+                }
+                let s = &chunk[p + 2..p + 2 + sl];
+                p += 2 + sl;
+                if s[0] != 0x01 || s[1] != 0x28 {
+                    p = record_end;
+                    continue;
+                }
+                let x = usize::from(u16::from_le_bytes([s[2], s[3]]));
+                let y = usize::from(u16::from_le_bytes([s[4], s[5]]));
+                return Some((x, y, sl));
             })
         })
     }
@@ -1457,13 +1483,22 @@ pub(crate) mod wht {
         // One byte per map slot, laid out exactly as the sub-records carry it.
         let mut values: KVec<u8> = KVec::new();
         values.resize(bands * PARAM_BAND_STRIDE, 0, GFP_KERNEL)?;
+        let mut described = 0usize;
         for (x, y, len) in framed_strip_extents(frames) {
             let (bx, by) = (x / geom.strip_w(), y / geom.strip_h());
             if bx >= across || by >= bands {
                 continue;
             }
             values[by * PARAM_BAND_STRIDE + bx] = strip_size_class(len);
+            described += 1;
         }
+        // How many of the frame's strips the map actually accounts for. A position the walk misses
+        // is announced as size class 0, so this must equal the strip count of the records handed
+        // in -- it read one record per allocation chunk until 2026-08-04.
+        vino_debug!(
+            "vino: connector={connector} strip map describes {described} strip(s) over {} record chunk(s)\n",
+            frames.len()
+        );
 
         let mut band = 0usize;
         let mut record = 0usize;
