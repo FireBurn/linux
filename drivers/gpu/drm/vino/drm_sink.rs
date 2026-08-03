@@ -1416,11 +1416,13 @@ impl VinoDrmData {
         riv: &[u8; 8],
         wire_seq: u32,
         counter: u16,
+        ep84_depth: usize,
     ) {
         // EP84 must remain posted between runtime EP02 writes. A queue drained synchronously leaves
         // the endpoint unposted between calls and can stall the control protocol.
-        // Match `super::EP84_QUEUE_DEPTH` so one URB stays posted while others are reaped.
-        let ep84_q = match dev.ctrl_in_queue(super::EP84_QUEUE_DEPTH, 4096) {
+        // `ep84_depth` is the matched profile's `ep84_queue_depth`, so the runtime queue keeps the
+        // same number of reads posted that bring-up did.
+        let ep84_q = match dev.ctrl_in_queue(ep84_depth, 4096) {
             Ok(q) => Some(q),
             Err(e) => {
                 pr_warn!("vino: persistent EP84 queue open failed ({e:?}); using sync fallback\n");

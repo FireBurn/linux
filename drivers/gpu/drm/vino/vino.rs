@@ -142,6 +142,18 @@ pub(crate) struct DockProfile {
     /// connectors 0 then 2, `0x0a` carried 1 then 3, measured across cable moves). Connector index
     /// is the physical socket number minus one.
     pub(crate) connectors: u8,
+    /// Outstanding EP84 reads to keep posted.
+    ///
+    /// Navarro needs exactly one, which is what DLM keeps: with four posted through a round-robin
+    /// cursor an EDID reply arrived 145 ms after its request instead of DLM's 45 ms, and EP02
+    /// NAKed everything behind the un-reaped slot.
+    ///
+    /// ⚠ Ridge needs the deeper queue and regressed to `control session failed after 3 attempts
+    /// (ETIMEDOUT)` when Navarro's depth of one was applied to both. It drains replies through the
+    /// older retry-heavy discovery path, which interleaves far more unsolicited dock pushes with
+    /// the replies it is waiting for, so a single outstanding read loses the reply it needs. This
+    /// is per-profile for that reason and must not be collapsed back to one constant.
+    pub(crate) ep84_queue_depth: usize,
 }
 
 /// Dell D6000 and other Ridge-platform docks. HW-verified.
@@ -162,6 +174,7 @@ static PROFILE_D6000: DockProfile = DockProfile {
     presence_from_status: false,
     navarro_mode_words: false,
     connectors: 2,
+    ep84_queue_depth: 4,
 };
 
 /// DL-7400 quad-display docks (Navarro).
@@ -190,6 +203,7 @@ static PROFILE_DL7400: DockProfile = DockProfile {
     presence_from_status: true,
     navarro_mode_words: true,
     connectors: 4,
+    ep84_queue_depth: 1,
 };
 
 /// Control and per-head bulk endpoints.
@@ -408,12 +422,6 @@ impl<'a> UsbLink<'a> {
 const EP84_BUF: usize = 4096;
 /// Depth of the persistent EP84 IN reader.
 ///
-/// DLM keeps exactly one 4096-byte read outstanding. Vino previously posted four and consumed
-/// them through a fixed round-robin cursor; on Navarro an EDID reply then arrived 145 ms after its
-/// request instead of DLM's 45 ms, and EP02 NAKed every following message until that delayed slot
-/// was reaped. `BulkInQueue::recv()` re-submits the completed slot before returning, so depth one
-/// remains continuously posted without the cursor-induced reply skew.
-const EP84_QUEUE_DEPTH: usize = 1;
 
 /// USB transfer timeout used during session setup.
 fn timeout() -> Delta {
@@ -739,7 +747,14 @@ impl WorkItem for BringUp {
                 let drm_dev: &drm_sink::VinoDrmDevice = ddev;
                 let data: &drm_sink::VinoDrmData = drm_dev;
                 data.set_cp_engaged(true);
-                data.publish_session(dev, &session.ks, &session.riv, wseq_end, ctr_end);
+                data.publish_session(
+                    dev,
+                    &session.ks,
+                    &session.riv,
+                    wseq_end,
+                    ctr_end,
+                    profile.ep84_queue_depth,
+                );
                 data.set_video_keys(video_keys);
 
                 // Cache complete per-head discovery results before emitting the single initial
@@ -1728,9 +1743,10 @@ impl VinoDriver {
 
         // Post the persistent EP84 reader before arming so asynchronous replies cannot fill the
         // dock's IN FIFO while the host submits control traffic.
-        let mut ep84_q = match dev.ctrl_in_queue(EP84_QUEUE_DEPTH, EP84_BUF) {
+        let ep84_depth = profile.ep84_queue_depth;
+        let mut ep84_q = match dev.ctrl_in_queue(ep84_depth, EP84_BUF) {
             Ok(q) => {
-                vino_debug!("vino: EP84 async IN queue opened (depth={EP84_QUEUE_DEPTH})\n");
+                vino_debug!("vino: EP84 async IN queue opened (depth={ep84_depth})\n");
                 Some(q)
             }
             Err(e) => {
