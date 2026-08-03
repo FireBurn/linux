@@ -1022,6 +1022,67 @@ pub(super) fn navarro_pipe_ring(connector: u8, index: u16) -> u32 {
     NAVARRO_RING_BASE - u32::from(navarro_pipe_slot(connector, index)) * NAVARRO_RING_STEP
 }
 
+/// The quiescent body of a DL7400 per-frame stream report, as `[len=0x0052][kind=0x000a]` and
+/// thirty-five `u16` values.
+///
+/// DLM sends one of these on a connector's *stream* sub for every frame it sends on the frame sub
+/// -- 165 and 306 of them across a 4.3 s and a 4.7 s session, a median 9-19 ms apart and never
+/// more than ~1.0 s apart. vino sent none, and the dock tore the link down a few seconds after
+/// its first frame.
+///
+/// The five-value preamble (`1, 1, 0, 64, 64`) and the trailing zero are fixed. The thirty
+/// values between them are three blocks of three `(a, a, b)` triples separated by `(1, 1, 1)`,
+/// where the third triple of each block carries twice the `a` of the first two. These are the
+/// values DLM sends on a quiescent stream, identical on both connectors in both captures; under
+/// load `a` and `b` grow with the frame's cost, but the mapping from a frame to them is not
+/// established, so this reports the quiescent set.
+const NAVARRO_STREAM_REPORT: [u16; 42] = [
+    0x0052, 0x000a, // len, kind
+    1, 1, 0, 64, 64, // fixed preamble
+    16, // per-report scalar: 16 quiescent, larger under load
+    16, 16, 16, 16, 16, 16, 32, 32, 32, // block A
+    1, 1, 1, //
+    16, 16, 4, 16, 16, 4, 32, 32, 8, // block B
+    1, 1, 1, //
+    32, 32, 2, 32, 32, 2, 64, 64, 4, // block C
+    0,
+];
+
+/// Build the 84-byte body shared by both forms of the DL7400 per-frame stream report.
+fn navarro_stream_report_body(out: &mut [u8; 84]) {
+    for (i, v) in NAVARRO_STREAM_REPORT.iter().enumerate() {
+        out[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// Build the 96-byte plaintext of the DL7400's ordinary per-frame stream report (`aux=0x000c`).
+///
+/// The report body followed by a 12-byte host-random tail. This is the form DLM sends for all but
+/// a handful of frames: 159 of 164 on one connector, 304 of 306 on the other.
+pub(super) fn navarro_stream_report() -> [u8; 96] {
+    let mut out = [0u8; 96];
+    let mut body = [0u8; 84];
+    navarro_stream_report_body(&mut body);
+    out[..84].copy_from_slice(&body);
+    rng::fill(&mut out[84..]);
+    out
+}
+
+/// Build the 112-byte plaintext of the DL7400's mode-restating stream report (`aux=0x0002`).
+///
+/// The same body, prefixed by the 26-byte mode header that also opens the decoder configuration,
+/// and followed by a two-byte host-random tail. DLM sends this form only a handful of times per
+/// session, around a mode change.
+pub(super) fn navarro_stream_report_mode(mode_header: &[u8; 26]) -> [u8; 112] {
+    let mut out = [0u8; 112];
+    out[..26].copy_from_slice(mode_header);
+    let mut body = [0u8; 84];
+    navarro_stream_report_body(&mut body);
+    out[26..110].copy_from_slice(&body);
+    rng::fill(&mut out[110..]);
+    out
+}
+
 /// Build a DL7400 pipe descriptor for one connector.
 ///
 /// The 304-byte plaintext is [`NAVARRO_STREAM_MARKER`], six `[len=0x002c][kind=0x000e][slot]`

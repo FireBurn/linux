@@ -876,6 +876,9 @@ impl WorkItem for BringUp {
                         next_presence = Instant::<Monotonic>::now() + PRESENCE_PERIOD;
                     }
                 }
+                // A dock that tears the link down over a silent video endpoint needs feeding even
+                // when the compositor has nothing to redraw.
+                data.send_video_keepalive(dev);
                 fsleep(Delta::from_millis(13));
             }
             vino_dev_debug!(cdev, "vino: CP keepalive finished ({sent} polls)\n");
@@ -1633,9 +1636,14 @@ impl VinoDriver {
             // Layout: key(16) || nonce(8) || pad(8).
             let stream_id = video::wht::stream_id(head as u8);
             video_keys[head] = kernel::crypto::Secret::zeroed();
-            // The dock applies the control-plane whitening constant to each per-head SKE key.
-            let video_key = cp::cp_session_key(&ske_ks_h);
-            video_keys[head][..16].copy_from_slice(&video_key[..]);
+            // Whether the dock applies the control-plane whitening constant to a per-head SKE key
+            // is proven only for the link stream; the per-head rule is carried over from Ridge.
+            if *crate::module_parameters::video_key_raw.value() != 0 {
+                video_keys[head][..16].copy_from_slice(&ske_ks_h[..]);
+            } else {
+                let video_key = cp::cp_session_key(&ske_ks_h);
+                video_keys[head][..16].copy_from_slice(&video_key[..]);
+            }
             let vnonce = cp::stream_content_nonce(&riv_h, stream_id);
             video_keys[head][16..24].copy_from_slice(&vnonce);
             for (i, (id, sub, content_len)) in cp::CP_SETUP_PER_HEAD.iter().copied().enumerate() {
@@ -2705,6 +2713,22 @@ kernel::module_usb_driver! {
         force_video: u8 {
             default: 0,
             description: "Drive video on docks whose profile disables it (experiment; may reset the dock)",
+        },
+        idle_opens: u8 {
+            default: 0,
+            description: "Send the short sealed open on connectors with no monitor, as DLM does",
+        },
+        video_key_raw: u8 {
+            default: 0,
+            description: "Diagnostic: seal per-head video with the raw SKE key instead of the whitened one",
+        },
+        break_mac: u8 {
+            default: 0,
+            description: "Diagnostic: corrupt the sealed prologue's Dl3Cmac to test whether the dock authenticates it",
+        },
+        video_records: u32 {
+            default: 0,
+            description: "Diagnostic: send only this many 4048-byte image records per frame (0 = all)",
         },
     },
 }
