@@ -389,6 +389,19 @@ impl<'a> UsbLink<'a> {
         self.io.clear_halt(self.eps.video.get(head).ok_or(EINVAL)?)
     }
 
+    /// Resets the control endpoints' sequence state before a session is claimed.
+    ///
+    /// ⚠ Warm re-attach only. A physical plug resets a SuperSpeed bulk endpoint's sequence number
+    /// on both sides; a driver rebind does not. Once the D6000 stopped hard-resetting itself, a
+    /// second `bring_up` on the same power cycle NAKed `init_0` forever -- the dock answered every
+    /// control request, and `interface state` read all zeros, but would not drain EP02.
+    /// `clear_halt` issues CLEAR_FEATURE(ENDPOINT_HALT) and resets the host-side sequence with it,
+    /// which is what a cold plug would have done.
+    pub(crate) fn reset_control_endpoints(&self) -> Result {
+        self.io.clear_halt(&self.eps.ctrl_out)?;
+        self.io.clear_halt(&self.eps.ctrl_in)
+    }
+
     /// Reads the standard two-byte status word for a video endpoint.
     ///
     /// Bit zero is `ENDPOINT_HALT`.  This is deliberately read-only: it distinguishes a dock
@@ -1271,6 +1284,24 @@ impl VinoDriver {
         // and an exact EP02 transcript, but leaves Navarro's video-side state machine different
         // before its later value-0 commit.
         let vendor_state = if profile.navarro_mode_words { 0 } else { 3 };
+        // ⚠ Warm re-attach. Once the fix for its reset loop landed, the D6000 stopped
+        // re-enumerating -- and then a second `bring_up` on the same power cycle NAKed `init_0`
+        // forever, because the dock was still in the vendor state the previous session left it in.
+        // The DL7400 never showed this, and it is the platform that already asks for state 0.
+        // Drive the state machine back to 0 before claiming it, so a rebind starts where a cold
+        // plug does.
+        if vendor_state != 0 && *crate::module_parameters::vendor_state_reset.value() != 0 {
+            match dev.control_send(0x24, VENDOR_OUT, 0, 0, &[], timeout(), GFP_KERNEL) {
+                Ok(()) => vino_debug!("vino: vendor state reset to 0 before claiming\n"),
+                Err(e) => vino_debug!("vino: vendor state reset stalled ({e:?})\n"),
+            }
+        }
+        if *crate::module_parameters::ctrl_clear_halt.value() != 0 {
+            match dev.reset_control_endpoints() {
+                Ok(()) => vino_debug!("vino: EP02/EP84 sequence state reset\n"),
+                Err(e) => vino_debug!("vino: control endpoint reset stalled ({e:?})\n"),
+            }
+        }
         match dev.control_send(
             0x24,
             VENDOR_OUT,
@@ -3552,6 +3583,14 @@ kernel::module_usb_driver! {
         video_clear_each: u8 {
             default: 0,
             description: "Diagnostic: clear the video endpoint halt before every transfer, to test whether the dock halts it after each one",
+        },
+        ctrl_clear_halt: u8 {
+            default: 0,
+            description: "Diagnostic: reset EP02/EP84 sequence state at bring-up. Tried against the D6000's warm-reattach wedge on 2026-08-04 and did NOT clear it, so it is off by default rather than unproven wire behaviour",
+        },
+        vendor_state_reset: u8 {
+            default: 0,
+            description: "Diagnostic: drive the dock's vendor state machine back to 0 (request 0x24) before claiming it. Tried against the D6000's warm-reattach wedge on 2026-08-04 and did NOT clear it",
         },
         strip_map_persist: u8 {
             default: 1,
