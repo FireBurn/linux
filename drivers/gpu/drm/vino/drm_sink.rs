@@ -3218,6 +3218,16 @@ impl VinoDrmData {
         if head >= HEADS {
             return;
         }
+        // Tagged with the dock's connector count (Navarro 4, Ridge 2). With both docks bound only
+        // one ever ends up with a `connected` DRM connector, and vino logs
+        // `head 0 monitor connected` for the loser on a path that does call `set_connected` --
+        // so something clears it afterwards and this says which dock, and when.
+        if self.heads_present.load(Ordering::Acquire) & (1u32 << head) != 0 {
+            pr_info!(
+                "vino: [{}conn] head {head} presence CLEARED (connector goes disconnected)\n",
+                self.connector_count()
+            );
+        }
         self.heads_present
             .fetch_and(!(1u32 << head), core::sync::atomic::Ordering::Release);
         if let Some(slot) = self.cached_edids.lock().get_mut(head) {
@@ -3397,9 +3407,13 @@ impl VinoDrmData {
             // presence flap can only be read as "monitor disconnected", which says nothing about
             // whether the dock changed its mind or vino changed the question. It is one line per
             // *changed* reply per head, so a steady link prints nothing at all.
+            // Tagged with the dock's connector count -- Navarro exposes four, Ridge two -- because
+            // an untagged line cannot be attributed when both docks are bound, and reading these
+            // as the wrong dock's is exactly how this session lost time.
             pr_info!(
-                "vino: head {head} presence reply id={id:#06x} status={status:#010x} \
+                "vino: [{}conn] head {head} presence reply id={id:#06x} status={status:#010x} \
                  -> present={present} (was id={:#06x} status={:#06x})\n",
+                self.connector_count(),
                 prev >> 16,
                 prev & 0xffff
             );
