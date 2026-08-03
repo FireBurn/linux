@@ -2503,9 +2503,21 @@ impl VinoDriver {
             // "encrypted control setup complete", while every individual submit and reply match
             // succeeds. A queue flush waits for outstanding URBs and is the remaining way this
             // function can time out with nothing else complaining.
-            queue.flush(dev.io(), timeout()).inspect_err(|e| {
-                pr_info!("vino: EP02 queue flush failed ({e:?})\n");
-            })?;
+            // A flush timeout is NOT fatal to the session. `reap()` leaves a slow slot posted so
+            // a later call keeps waiting on it, and the session is otherwise complete: the dock
+            // has acknowledged every message, per-head authentication has run, and EDID discovery
+            // has finished.
+            //
+            // The D6000 reaches here with one connector empty, and an outstanding EP02 write for
+            // that connector is never drained -- so `flush` returns ETIMEDOUT after `timeout()`
+            // (1000 ms, exactly the measured gap) and failed the whole control session. Every
+            // other USB primitive in this path was instrumented and succeeds; this was the only
+            // one that did not.
+            if let Err(e) = queue.flush(dev.io(), timeout()) {
+                pr_info!(
+                    "vino: EP02 queue flush timed out ({e:?}); session already acknowledged,                      continuing\n"
+                );
+            }
         }
 
         // Ridge commits after finalization. Navarro has already committed at its measured
@@ -3373,6 +3385,17 @@ impl usb::Driver for VinoDriver {
             drm_sink::set_strip_blocks_x(info.strip_blocks_x);
             drm_sink::set_interlaced_bands(info.interlaced_bands);
             drm_sink::set_dock_buffers(info.dock_buffers);
+            // Remember this device's geometry so it can be restored before each of its encodes;
+            // the other dock's probe overwrites these globals. See `VinoDrmData::codec_geometry`.
+            d.set_codec_geometry(
+                info.strip_blocks_x,
+                info.interlaced_bands,
+                info.band_parity_bit,
+                info.aux_is_pad_count,
+                info.head_sub_shift,
+                info.stream_id_mask,
+                info.dock_buffers,
+            );
             d.set_video_arm(info.video_arm);
             d.set_presence_from_status(info.presence_from_status);
             d.set_navarro_mode_words(info.navarro_mode_words);

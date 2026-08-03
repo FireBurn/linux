@@ -925,6 +925,17 @@ pub(super) struct VinoDrmData {
     /// control session, EDID, modes, hotplug -- works either way, and a dock that resets every few
     /// seconds cannot be developed against at all.
     video_supported: core::sync::atomic::AtomicBool,
+    /// This device's codec geometry, mirrored so it can be re-applied before every encode.
+    ///
+    /// ⚠ The codec's geometry lives in module-global statics (`STRIP_W_SHIFT`, `STRIP_H_SHIFT`,
+    /// `INTERLACED_BANDS`, `BAND_PARITY_BIT`, `AUX_IS_PAD_COUNT`, `HEAD_SUB_SHIFT`,
+    /// `STREAM_ID_MASK`, `DOCK_BUFFERS`), set once per probe. With a Ridge dock and a DL7400 bound
+    /// at the same time, whichever probed last wins and the other encodes with the wrong geometry:
+    /// Ridge lays 16 blocks 8 across x 2 down over 64x16 px, Navarro 16 across x 1 down over
+    /// 128x8. Measured consequence -- the D6000 was fed Navarro-shaped records, answered
+    /// `head=0 endpoint=0x08 stopped accepting video`, and **reset itself**, looping its whole
+    /// bring-up every ~8 s.
+    codec_geometry: core::sync::atomic::AtomicU32,
     /// Whether to prefix the cold ARM burst to the first frame; see `DockProfile::video_arm`.
     video_arm: core::sync::atomic::AtomicBool,
     /// Whether presence comes from the probe reply's status word rather than from which handler
@@ -1130,6 +1141,7 @@ impl VinoDrmData {
             edid_caught <- new_mutex!(None),
             self_blanked: core::sync::atomic::AtomicU32::new(0),
             video_supported: core::sync::atomic::AtomicBool::new(true),
+            codec_geometry: core::sync::atomic::AtomicU32::new(0),
             presence_from_status: core::sync::atomic::AtomicBool::new(false),
             navarro_mode_words: core::sync::atomic::AtomicBool::new(false),
             connectors: core::sync::atomic::AtomicU8::new(HEADS as u8),
@@ -1328,6 +1340,46 @@ impl VinoDrmData {
     /// Whether video writes are permitted for this dock.
     pub(super) fn video_supported(&self) -> bool {
         self.video_supported.load(Ordering::Acquire)
+    }
+
+    /// Remember this device's codec geometry so [`Self::apply_codec_geometry`] can restore it.
+    pub(super) fn set_codec_geometry(
+        &self,
+        strip_blocks_x: usize,
+        interlaced: bool,
+        band_parity: bool,
+        aux_is_pad: bool,
+        head_sub_shift: u8,
+        stream_id_mask: u8,
+        dock_buffers: u8,
+    ) {
+        let packed = (strip_blocks_x as u32 & 0xff)
+            | ((interlaced as u32) << 8)
+            | ((band_parity as u32) << 9)
+            | ((aux_is_pad as u32) << 10)
+            | ((head_sub_shift as u32) << 16)
+            | ((stream_id_mask as u32) << 20)
+            | ((dock_buffers as u32) << 28);
+        self.codec_geometry
+            .store(packed | 0x8000, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Re-apply this device's geometry to the codec's globals before encoding for it.
+    ///
+    /// Called on every encode rather than once at probe, because the other dock's probe may have
+    /// overwritten the globals in between. See [`Self::codec_geometry`].
+    pub(super) fn apply_codec_geometry(&self) {
+        let p = self.codec_geometry.load(core::sync::atomic::Ordering::Acquire);
+        if p & 0x8000 == 0 {
+            return;
+        }
+        super::video::wht::set_strip_blocks_x(((p & 0xff) as usize).max(1));
+        super::video::wht::set_interlaced_bands(p & (1 << 8) != 0);
+        super::video::wht::set_band_parity_bit(p & (1 << 9) != 0);
+        super::video::wht::set_aux_is_pad_count(p & (1 << 10) != 0);
+        super::video::wht::set_head_sub_shift(((p >> 16) & 0xf) as u8);
+        super::video::wht::set_stream_id_mask(((p >> 20) & 0xff) as u8);
+        set_dock_buffers(((p >> 28) & 0xf) as u8);
     }
 
     /// Record how this dock reports monitor presence; see [`DockProfile::presence_from_status`].
@@ -1730,6 +1782,10 @@ impl VinoDrmData {
         if frames.is_empty() {
             return Err(kernel::error::code::EINVAL);
         }
+        // The first frames of a stream go out through this path, not `encode_and_send_wht`, and
+        // they carry the ARM burst. The other dock's probe may have overwritten the codec's global
+        // geometry since this device last used it. See `VinoDrmData::codec_geometry`.
+        self.apply_codec_geometry();
         // Diagnostic: shrink the transfer so a dock that stops after one *transfer* can be told
         // apart from one that stops after a fixed *byte count*. Both look identical at the default
         // 65536, because exactly one transfer and exactly 65536 bytes are the same event.
@@ -5547,6 +5603,9 @@ fn encode_and_send_wht(
     w: usize,
     h: usize,
 ) -> Result {
+    // The other dock's probe may have overwritten the codec's global geometry since this device
+    // last encoded; restore this device's before touching the codec. See `codec_geometry`.
+    data.apply_codec_geometry();
     // Gate video on the matching mode-set reaching the dock. Plane updates run before the CRTC
     // enable queues that mode-set, and the dock rejects video on an unconfigured stream. Deferring
     // does not advance the codec sequence; the next scanout pass retries the frame.
