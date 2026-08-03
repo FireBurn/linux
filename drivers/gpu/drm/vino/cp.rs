@@ -1162,15 +1162,23 @@ pub(super) fn navarro_stream_report_mode(mode_header: &[u8; 26]) -> [u8; 112] {
 
 /// Build a DL7400 pipe descriptor for one connector.
 ///
-/// The 304-byte plaintext is [`NAVARRO_STREAM_MARKER`], six `[len=0x002c][kind=0x000e][slot]`
-/// records of 40 configuration bytes, and a 14-byte host-random tail. Records advance by
+/// The 304-byte plaintext is [`NAVARRO_STREAM_MARKER`] **twice**, then six
+/// `[len=0x002c][kind=0x000e][slot]` records of 40 configuration bytes. Records advance by
 /// `len + 2`. Each configuration names the connector's slot id and the three dock-side addresses
-/// that slot is given.
+/// that slot is given. 14 + 14 + 6 * 46 = 304 exactly, so there is no padding and no tail.
+///
+/// ⚠ The marker count is **not** a settled constant. A capture from 2026-08-02 has it once,
+/// followed by the six records and then fourteen unexplained bytes; a same-day capture taken while
+/// DLM was demonstrably driving both panels on this dock has it twice and no trailing bytes at
+/// all. Both plaintexts are 304 bytes. This follows the capture that was working, and it is the
+/// reason the fourteen bytes must not be dismissed as AES padding for *this* record: in the
+/// working capture they are consumed by a second marker at the front.
 ///
 /// Only 2560x1440 has been observed, and the fixed header carries mode-derived bytes, so callers
 /// must not use this for another mode.
 pub(super) fn navarro_pipe_descriptor(connector: u8) -> Result<KVec<u8>> {
     let mut b = KVec::with_capacity(304, GFP_KERNEL)?;
+    b.extend_from_slice(&NAVARRO_STREAM_MARKER, GFP_KERNEL)?;
     b.extend_from_slice(&NAVARRO_STREAM_MARKER, GFP_KERNEL)?;
     for index in 0..NAVARRO_SLOTS_PER_CONNECTOR {
         let alloc = u32::from((connector as u16) * NAVARRO_SLOTS_PER_CONNECTOR + index);
@@ -1187,9 +1195,7 @@ pub(super) fn navarro_pipe_descriptor(connector: u8) -> Result<KVec<u8>> {
         b.extend_from_slice(&plane1.to_le_bytes(), GFP_KERNEL)?;
         b.extend_from_slice(&NAVARRO_SLOT_TRAILER, GFP_KERNEL)?;
     }
-    let mut tail = [0u8; 14];
-    rng::fill(&mut tail);
-    b.extend_from_slice(&tail, GFP_KERNEL)?;
+    debug_assert_eq!(b.len(), 304);
     debug_assert_eq!(b.len(), 304);
     Ok(b)
 }
