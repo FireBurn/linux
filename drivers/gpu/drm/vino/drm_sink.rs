@@ -1731,7 +1731,7 @@ impl VinoDrmData {
                     let sh = super::video::wht::strip_h();
                     let w_pad = (t.hactive as usize).div_ceil(sw) * sw;
                     let h_pad = (t.vactive as usize).div_ceil(sh) * sh;
-                    super::video::wht::navarro_strip_params(head, w_pad, h_pad)?
+                    super::video::wht::navarro_strip_params(head, w_pad, h_pad, &frames)?
                 }
                 None => KVec::new(),
             }
@@ -5826,7 +5826,7 @@ fn encode_and_send_wht(
     let params: KVec<u8> = if super::video::wht::head_sub_shift() == 0 {
         KVec::new()
     } else {
-        super::video::wht::navarro_strip_params(head, w_pad, h_pad)?
+        super::video::wht::navarro_strip_params(head, w_pad, h_pad, &frames)?
     };
     vino_debug!(
         "vino: head={} shift={} params={} B ({}x{} pad)\n",

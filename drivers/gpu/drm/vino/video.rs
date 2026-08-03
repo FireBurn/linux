@@ -1420,6 +1420,52 @@ pub(crate) mod wht {
     /// 120 + 60, which is this many full sub-records and then the remainder.
     const PARAM_TLVS_PER_RECORD: usize = 15;
 
+    /// A strip's size class, as carried in the `kind=0x200f` map.
+    ///
+    /// The dock needs each strip's length before it parses the strip, because a strip is a
+    /// self-delimiting bitstream whose end it cannot otherwise find. The class is simply the
+    /// length in 512-byte units.
+    ///
+    /// Measured over 68,347 `(strip, map value)` pairs in the authenticated DLM capture
+    /// `~/dlm-today-124144/wire.pcapng`, with **zero** disagreements: value 0 covers 54..510
+    /// bytes, 1 covers 512..1022, 2 covers 1024..1498 and 3 covers 1594..1670. Every boundary
+    /// falls on a multiple of 512.
+    #[inline]
+    fn strip_size_class(len: usize) -> u8 {
+        (len >> 9) as u8
+    }
+
+    /// Collect `(x, y, byte length)` for every strip in an already-framed set of image records.
+    ///
+    /// The map is derived from the exact bytes about to go on the wire rather than from the
+    /// encoder's intermediate state, so it cannot drift from what the dock actually receives.
+    /// Each record body holds strips as `[u16 len][body]`, and every strip body opens with the
+    /// codec's `01 28` magic -- which is what terminates the walk when a record's trailing
+    /// padding is reached, since `aux` is a producer lane on this dock and not a pad count.
+    fn framed_strip_extents(frames: &[KVec<u8>]) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        frames.iter().flat_map(|rec| {
+            let body = rec.get(16..).unwrap_or(&[]);
+            let mut p = 0usize;
+            core::iter::from_fn(move || {
+                loop {
+                    let hdr = body.get(p..p + 2)?;
+                    let sl = u16::from_le_bytes([hdr[0], hdr[1]]) as usize;
+                    if sl < 16 {
+                        return None;
+                    }
+                    let s = body.get(p + 2..p + 2 + sl)?;
+                    p += 2 + sl;
+                    if s[0] != 0x01 || s[1] != 0x28 {
+                        return None;
+                    }
+                    let x = u16::from_le_bytes([s[2], s[3]]) as usize;
+                    let y = u16::from_le_bytes([s[4], s[5]]) as usize;
+                    return Some((x, y, sl));
+                }
+            })
+        })
+    }
+
     /// Build the DL7400's per-strip parameter map for one frame, as the pair of `kind=0x200f`
     /// records DLM sends.
     ///
@@ -1428,17 +1474,37 @@ pub(crate) mod wht {
     /// 180 bands of 20 strips, which is exactly what every DLM map in
     /// `captures/navarro-dlm-modeset-20260802-005453` contains, split 120 + 60 across two records.
     ///
-    /// The values are 0..3 and track picture content -- a quiescent frame's map is all zero and a
-    /// busy one is a mix. Their meaning is **not** established, so this sends the all-zero map,
-    /// which is byte-for-byte what DLM sends on the quiescent startup frames that do light this
-    /// dock. Do not invent values here without a capture to check them against.
+    /// Values come from [`strip_size_class`] applied to the strips in `frames`. A position this
+    /// frame does not carry stays zero, which is what DLM sends for it.
+    ///
+    /// ⚠ Sending the all-zero map -- what vino did until this was measured -- is not a harmless
+    /// approximation. It announces every strip as "under 512 bytes", so the dock mis-parses
+    /// exactly the detailed strips and renders them as coloured noise while flat fills stay
+    /// perfect. That was the on-panel artifact.
     ///
     /// vino sent no map at all until 2026-08-03: it is the only record kind in DLM's video stream
     /// that vino never emitted.
-    pub(crate) fn navarro_strip_params(connector: u8, width: usize, height: usize) -> Result<KVec<u8>> {
+    pub(crate) fn navarro_strip_params(
+        connector: u8,
+        width: usize,
+        height: usize,
+        frames: &[KVec<u8>],
+    ) -> Result<KVec<u8>> {
         let bands = height.div_ceil(strip_h());
+        let across = width.div_ceil(strip_w()).min(PARAM_BAND_STRIDE);
         let sub = u16::from(head_sub(connector));
         let mut out = KVec::new();
+
+        // One byte per map slot, laid out exactly as the sub-records carry it.
+        let mut values: KVec<u8> = KVec::new();
+        values.resize(bands * PARAM_BAND_STRIDE, 0, GFP_KERNEL)?;
+        for (x, y, len) in framed_strip_extents(frames) {
+            let (bx, by) = (x / strip_w(), y / strip_h());
+            if bx >= across || by >= bands {
+                continue;
+            }
+            values[by * PARAM_BAND_STRIDE + bx] = strip_size_class(len);
+        }
 
         let mut band = 0usize;
         let mut record = 0usize;
@@ -1460,8 +1526,8 @@ pub(crate) mod wht {
                 body.extend_from_slice(&0x200fu16.to_le_bytes(), GFP_KERNEL)?;
                 body.extend_from_slice(&(band as u16).to_le_bytes(), GFP_KERNEL)?;
                 body.extend_from_slice(&(count as u16).to_le_bytes(), GFP_KERNEL)?;
-                // All-zero values; see the note above before changing this.
-                body.resize(body.len() + payload, 0, GFP_KERNEL)?;
+                let from = band * PARAM_BAND_STRIDE;
+                body.extend_from_slice(&values[from..from + payload], GFP_KERNEL)?;
                 band += count;
             }
             // DLM pads the first record's body to 3968 bytes and leaves the second exact.
@@ -1479,7 +1545,6 @@ pub(crate) mod wht {
             out.extend_from_slice(&body, GFP_KERNEL)?;
             record += 1;
         }
-        let _ = width;
         Ok(out)
     }
 
