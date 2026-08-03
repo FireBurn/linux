@@ -5188,6 +5188,14 @@ fn encode_and_send_wht(
     // whole-frame coalescing allocation.
     let frame_count = frames.len();
     let image_len: usize = frames.iter().take(frame_count).map(|f| f.len()).sum();
+    // The DL7400's per-strip parameter map, which describes every strip in the frame and which
+    // vino sent none of until 2026-08-03. It goes ahead of the image records: it is what tells the
+    // dock how to read them. Ridge has no equivalent record and gets an empty slice.
+    let params: KVec<u8> = if super::video::wht::head_sub_shift() == 0 {
+        KVec::new()
+    } else {
+        super::video::wht::navarro_strip_params(head, w_pad, h_pad)?
+    };
     if arm.is_some() {
         data.send_stream_open(dev, head_i)?;
     }
@@ -5209,7 +5217,8 @@ fn encode_and_send_wht(
         // successive frames through `DAMAGE_REPEATS` and the debt repaint instead.
         1
     };
-    let first_wire_len = arm_len + image_len + data.build_frame_trailer(head, seq0).len();
+    let first_wire_len =
+        arm_len + params.len() + image_len + data.build_frame_trailer(head, seq0).len();
     vino_debug!(
         "vino: head={} chunks={} arm={} first={} presentations={}\n",
         head,
@@ -5250,7 +5259,7 @@ fn encode_and_send_wht(
         } else {
             &[]
         };
-        let wire_len = arm_slice.len() + image_len + frame_trailer.len();
+        let wire_len = arm_slice.len() + params.len() + image_len + frame_trailer.len();
         last_wire_len = wire_len;
         {
             // Take this head's staging buffer while submitting, then restore it. The queue mutex
@@ -5296,8 +5305,9 @@ fn encode_and_send_wht(
                     // transfer at a time in the reusable bounded staging allocation, avoiding a
                     // contiguous allocation spanning the complete frame.
                     let arm_parts = usize::from(!arm_slice.is_empty());
+                    let param_parts = usize::from(!params.is_empty());
                     let trailer_parts = 1usize;
-                    let part_count = arm_parts + frame_count + trailer_parts;
+                    let part_count = arm_parts + param_parts + frame_count + trailer_parts;
                     let mut part_i = 0usize;
                     let mut part_off = 0usize;
                     let mut wire_off = 0usize;
@@ -5308,8 +5318,10 @@ fn encode_and_send_wht(
                         while dst_off < dst.len() && part_i < part_count {
                             let part: &[u8] = if part_i < arm_parts {
                                 arm_slice
-                            } else if part_i < arm_parts + frame_count {
-                                &frames[part_i - arm_parts][..]
+                            } else if part_i < arm_parts + param_parts {
+                                &params[..]
+                            } else if part_i < arm_parts + param_parts + frame_count {
+                                &frames[part_i - arm_parts - param_parts][..]
                             } else {
                                 &frame_trailer[..]
                             };

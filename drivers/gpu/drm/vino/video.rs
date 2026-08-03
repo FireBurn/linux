@@ -1143,6 +1143,11 @@ pub(crate) mod wht {
         HEAD_SUB_SHIFT.store(shift, core::sync::atomic::Ordering::Release);
     }
 
+    /// The head encoding this dock uses; see [`HEAD_SUB_SHIFT`]. Ridge is 0, Navarro 3.
+    pub(crate) fn head_sub_shift() -> u8 {
+        HEAD_SUB_SHIFT.load(core::sync::atomic::Ordering::Acquire)
+    }
+
     /// Encode `head` the way this dock expects it in a record `sub` field.
     #[inline]
     pub(crate) fn head_sub(head: u8) -> u8 {
@@ -1210,6 +1215,83 @@ pub(crate) mod wht {
     #[inline]
     pub(crate) fn stream_id(head: u8) -> u16 {
         (head_sub(head) | STREAM_ID_MASK.load(core::sync::atomic::Ordering::Acquire)) as u16
+    }
+
+    /// Bands described by one `kind=0x200f` sub-record, and the row stride of a band's values.
+    ///
+    /// Measured: every full sub-record carries eight bands and 256 payload bytes, so a band is a
+    /// fixed 32 bytes regardless of how many strips actually occupy it -- at 2560 wide only the
+    /// first 20 are ever non-zero and bytes 20..32 are zero in all 5760 bytes of every map.
+    ///
+    /// ⚠ 32 covers any width up to 4096 px, but nothing wider has been captured, so a mode past
+    /// that must not assume the stride still holds.
+    const PARAM_BANDS_PER_TLV: usize = 8;
+    const PARAM_BAND_STRIDE: usize = 32;
+    /// Sub-records in the first of the pair; the rest go in the second. DLM splits 180 bands as
+    /// 120 + 60, which is this many full sub-records and then the remainder.
+    const PARAM_TLVS_PER_RECORD: usize = 15;
+
+    /// Build the DL7400's per-strip parameter map for one frame, as the pair of `kind=0x200f`
+    /// records DLM sends.
+    ///
+    /// The map covers the whole frame: one byte per strip, `height / strip_h` bands of
+    /// `width / strip_w` strips, each band padded to [`PARAM_BAND_STRIDE`]. At 2560x1440 that is
+    /// 180 bands of 20 strips, which is exactly what every DLM map in
+    /// `captures/navarro-dlm-modeset-20260802-005453` contains, split 120 + 60 across two records.
+    ///
+    /// The values are 0..3 and track picture content -- a quiescent frame's map is all zero and a
+    /// busy one is a mix. Their meaning is **not** established, so this sends the all-zero map,
+    /// which is byte-for-byte what DLM sends on the quiescent startup frames that do light this
+    /// dock. Do not invent values here without a capture to check them against.
+    ///
+    /// vino sent no map at all until 2026-08-03: it is the only record kind in DLM's video stream
+    /// that vino never emitted.
+    pub(crate) fn navarro_strip_params(connector: u8, width: usize, height: usize) -> Result<KVec<u8>> {
+        let bands = height.div_ceil(strip_h());
+        let sub = u16::from(head_sub(connector));
+        let mut out = KVec::new();
+
+        let mut band = 0usize;
+        let mut record = 0usize;
+        while band < bands {
+            // The first record takes up to PARAM_TLVS_PER_RECORD sub-records, the second the rest.
+            let take_tlvs = if record == 0 {
+                PARAM_TLVS_PER_RECORD
+            } else {
+                bands.div_ceil(PARAM_BANDS_PER_TLV)
+            };
+            let mut body = KVec::new();
+            for _ in 0..take_tlvs {
+                if band >= bands {
+                    break;
+                }
+                let count = PARAM_BANDS_PER_TLV.min(bands - band);
+                let payload = count * PARAM_BAND_STRIDE;
+                body.extend_from_slice(&((6 + payload) as u16).to_le_bytes(), GFP_KERNEL)?;
+                body.extend_from_slice(&0x200fu16.to_le_bytes(), GFP_KERNEL)?;
+                body.extend_from_slice(&(band as u16).to_le_bytes(), GFP_KERNEL)?;
+                body.extend_from_slice(&(count as u16).to_le_bytes(), GFP_KERNEL)?;
+                // All-zero values; see the note above before changing this.
+                body.resize(body.len() + payload, 0, GFP_KERNEL)?;
+                band += count;
+            }
+            // DLM pads the first record's body to 3968 bytes and leaves the second exact.
+            if record == 0 && body.len() < 3968 {
+                body.resize(3968, 0, GFP_KERNEL)?;
+            }
+            let size = (body.len() + 12) as u16;
+            let aux: u16 = if record == 0 { 0x0008 } else { 0x0000 };
+            out.extend_from_slice(&0u16.to_le_bytes(), GFP_KERNEL)?;
+            out.extend_from_slice(&size.to_le_bytes(), GFP_KERNEL)?;
+            out.extend_from_slice(&4u32.to_le_bytes(), GFP_KERNEL)?;
+            out.extend_from_slice(&sub.to_le_bytes(), GFP_KERNEL)?;
+            out.extend_from_slice(&aux.to_le_bytes(), GFP_KERNEL)?;
+            out.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL)?;
+            out.extend_from_slice(&body, GFP_KERNEL)?;
+            record += 1;
+        }
+        let _ = width;
+        Ok(out)
     }
 
     /// A frame's closing records.
