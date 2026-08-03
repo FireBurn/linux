@@ -1986,6 +1986,7 @@ impl VinoDrmData {
                 // Exactly one ARM+carrier presentation keeps the closing markers from being
                 // delayed behind a blocking multi-frame submission.
                 let frames = prompts[head].as_ref().ok_or(EINVAL)?;
+                let t_sub = Instant::<Monotonic>::now();
                 self.submit_prompt_training(
                     dev,
                     head as u8,
@@ -1994,6 +1995,16 @@ impl VinoDrmData {
                     PROMPT_TRAINING_OPEN_MS,
                     true,
                 )?;
+                // The timeline collapses right after this call: head 1's video slipped from its
+                // scheduled +150 ms to +1321 ms, so the markers DLM sends inside the stream never
+                // go out. Report the cost unconditionally until that is understood.
+                pr_info!(
+                    "vino: head {} video submit took {} ms (timeline offset {} ms, {} ms since anchor)\n",
+                    head,
+                    (Instant::<Monotonic>::now() - t_sub).as_millis(),
+                    at,
+                    (Instant::<Monotonic>::now() - anchor).as_millis()
+                );
                 started |= bit;
             }
 
