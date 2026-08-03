@@ -54,11 +54,25 @@ fn push_u32(out: &mut KVec<u8>, value: u32) -> Result {
 
 /// Build the plaintext decoder configuration for a cold pipe-arm record.
 pub(super) fn build(width: u16, height: u16, nonce: &[u8; 14]) -> Result<KVec<u8>> {
+    build_with_layout_word(width, height, 0x4000, nonce)
+}
+
+/// Build a plaintext decoder configuration with the captured repeated layout word.
+///
+/// Ridge uses `0x4000`.  The DL7400's independently authenticated startup records use `0x2100`
+/// at 2560x1440.  Its semantic name is not established, so callers must pass an observed value
+/// rather than treating it as a generic pitch calculation.
+pub(super) fn build_with_layout_word(
+    width: u16,
+    height: u16,
+    layout_word: u16,
+    nonce: &[u8; 14],
+) -> Result<KVec<u8>> {
     let mut out = KVec::with_capacity(CONFIG_LEN, GFP_KERNEL)?;
 
     for value in [
-        0x0018, 0x030b, 0x0204, 0x0002, 0x0002, width, height, 0x4000, 0x0002, width, height,
-        0x4000, 0,
+        0x0018, 0x030b, 0x0204, 0x0002, 0x0002, width, height, layout_word, 0x0002, width,
+        height, layout_word, 0,
     ] {
         push_u16(&mut out, value)?;
     }

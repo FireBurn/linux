@@ -98,10 +98,14 @@ const BLANK_MARKER_STATE: u8 = 1;
 const KMS_RETRY_MS: u32 = 50;
 
 /// Whether image records carry the protocol's y-parity bit in `sub` bit 4.
-const BAND_PARITY_BIT: bool = true;
+fn band_parity_bit() -> bool {
+    super::video::wht::band_parity_bit()
+}
 
-/// Emit image records in raster order.
-const INTERLACED_BANDS: bool = false;
+/// Whether image records are emitted with even y-bands before odd ones.
+fn interlaced_bands() -> bool {
+    super::video::wht::interlaced_bands()
+}
 
 /// Maximum number of physical downstream connectors Vino exposes.
 ///
@@ -110,9 +114,44 @@ const INTERLACED_BANDS: bool = false;
 /// active prefix at runtime, while this constant keeps the DRM object layout fixed at registration.
 pub(crate) const HEADS: usize = 4;
 
+/// Bulk transfer size on the video endpoints: a multiple of the 1024-byte maximum packet size, so
+/// only a frame's final transfer terminates short.
+const VIDEO_XFER: usize = 65536;
+
+/// The repeated layout word in the DL7400's decoder configuration at 2560x1440.
+///
+/// Ridge uses `0x4000` for every mode. Only this value has been observed on the DL7400, and its
+/// derivation from the mode is not established.
+const NAVARRO_LAYOUT_WORD: u16 = 0x2100;
+
 /// Re-export so `probe` can set the dock's head encoding without reaching into the codec module.
 pub(crate) fn set_head_sub_shift(shift: u8) {
     super::video::wht::set_head_sub_shift(shift);
+}
+
+/// Re-export so `probe` can set the dock's stream-id encoding the same way.
+pub(crate) fn set_stream_id_mask(mask: u8) {
+    super::video::wht::set_stream_id_mask(mask);
+}
+
+/// Re-export so `probe` can set the dock's image-record band encoding the same way.
+pub(crate) fn set_band_parity_bit(on: bool) {
+    super::video::wht::set_band_parity_bit(on);
+}
+
+/// Re-export so `probe` can set what an image record's `aux` means on this dock.
+pub(crate) fn set_aux_is_pad_count(on: bool) {
+    super::video::wht::set_aux_is_pad_count(on);
+}
+
+/// Re-export so `probe` can set the dock's strip geometry and band order.
+pub(crate) fn set_strip_blocks_x(n: usize) {
+    super::video::wht::set_strip_blocks_x(n);
+}
+
+/// Re-export so `probe` can set the dock's image-record band order.
+pub(crate) fn set_interlaced_bands(on: bool) {
+    super::video::wht::set_interlaced_bands(on);
 }
 
 /// Maximum number of individual frame-damage rectangles re-converted per flip before they are
@@ -702,6 +741,12 @@ pub(super) struct VinoDrmData {
     last_timing: SpinLock<[Option<super::cp::Timing>; HEADS]>,
     /// Heads whose next video stream must be prefixed with the pipe-arm records.
     arm_prefix_pending: core::sync::atomic::AtomicU32,
+    /// Heads whose video stream has not been opened yet in this mode generation.
+    ///
+    /// Held apart from `arm_prefix_pending` because the opens go out for every head before any
+    /// head's first frame: DLM opens both of its video endpoints back to back and only then
+    /// starts sending pixels.
+    stream_open_pending: core::sync::atomic::AtomicU32,
     /// Per-head "owes a full keyframe" bitmask (bit `h` = head `h`). Set (all heads) after a
     /// `KmsCmd::ModeSet` send: a new mode leaves the dock's framebuffer undefined, so the first
     /// scanout after it must be a FULL frame ([`super::video::wht::colour_frame_ep08`]), not a
@@ -797,6 +842,7 @@ impl VinoDrmData {
             video_staging <- new_mutex!([const { None }; HEADS]),
             last_timing <- new_spinlock!([None; HEADS]),
             arm_prefix_pending: core::sync::atomic::AtomicU32::new(0),
+            stream_open_pending: core::sync::atomic::AtomicU32::new(0),
             keyframe_pending: core::sync::atomic::AtomicU32::new(0),
             cursor_epoch: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
             shadow_rr: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
@@ -1141,16 +1187,16 @@ impl VinoDrmData {
             // Never modeset, so there is nothing lit to blank.
             return Ok(());
         };
-        let w_pad = (timing.hactive as usize + super::video::wht::STRIP_W - 1)
-            & !(super::video::wht::STRIP_W - 1);
-        let h_pad = (timing.vactive as usize + super::video::wht::STRIP_H - 1)
-            & !(super::video::wht::STRIP_H - 1);
+        let w_pad = (timing.hactive as usize + super::video::wht::strip_w() - 1)
+            & !(super::video::wht::strip_w() - 1);
+        let h_pad = (timing.vactive as usize + super::video::wht::strip_h() - 1)
+            & !(super::video::wht::strip_h() - 1);
         let frames = super::video::wht::black_frame_ep08(
             w_pad,
             h_pad,
             head,
-            BAND_PARITY_BIT,
-            INTERLACED_BANDS,
+            band_parity_bit(),
+            interlaced_bands(),
         )?;
         // Present for long enough to reach every dock buffer. The dock is multi-buffered and a
         // single presentation lands in one buffer only -- the same reason `DAMAGE_REPEATS` exists
@@ -1287,7 +1333,7 @@ impl VinoDrmData {
         if frames.is_empty() {
             return Err(kernel::error::code::EINVAL);
         }
-        const XFER: usize = 65536;
+        const XFER: usize = VIDEO_XFER;
         let head_i = head as usize;
         let pipe_i = dev.video_pipe_index(head_i)?;
         let head_bit = 1u32 << head;
@@ -1296,10 +1342,13 @@ impl VinoDrmData {
             if self.arm_prefix_pending.load(Ordering::Acquire) & head_bit == 0 {
                 return Err(ENODEV);
             }
-            Some(self.build_arm_burst_buf(head_i)?)
+            Some(self.build_stream_prefix_buf(head_i)?)
         } else {
             None
         };
+        if arm.is_some() {
+            self.send_stream_open(dev, head_i)?;
+        }
         let startup = arm.is_some();
         let seq0 = self.scanout_seq.lock()[head_i];
         let started = Instant::<Monotonic>::now();
@@ -1314,7 +1363,7 @@ impl VinoDrmData {
             }
 
             let seq = seq0.wrapping_add(repeat);
-            let trailer = super::video::wht::frame_trailer(head, seq);
+            let trailer = self.build_frame_trailer(head, seq);
             let arm_slice: &[u8] = if repeat == 0 {
                 arm.as_ref().map_or(&[], |a| &a[..])
             } else {
@@ -1333,6 +1382,11 @@ impl VinoDrmData {
 
                 let mut queue_slot = self.video_q[pipe_i].lock();
                 if queue_slot.is_none() {
+                    // Clear the endpoint's halt feature before the stream's first byte. DLM does
+                    // this on every video endpoint ahead of its first frame, and the DL7400 stalls
+                    // the pipe on the opening image records without it. Clearing also resets the
+                    // endpoint's sequence number, which is what the dock is really waiting for.
+                    let _ = dev.clear_video_halt(head_i);
                     *queue_slot = Some(dev.video_queue(head_i, 8, XFER)?);
                     vino_debug!(
                         "vino: head={} endpoint={:#04x} persistent video queue opened by prompt training\n",
@@ -1425,16 +1479,16 @@ impl VinoDrmData {
             return Ok(false);
         }
 
-        let w_pad = (timing.hactive as usize + super::video::wht::STRIP_W - 1)
-            & !(super::video::wht::STRIP_W - 1);
-        let h_pad = (timing.vactive as usize + super::video::wht::STRIP_H - 1)
-            & !(super::video::wht::STRIP_H - 1);
+        let w_pad = (timing.hactive as usize + super::video::wht::strip_w() - 1)
+            & !(super::video::wht::strip_w() - 1);
+        let h_pad = (timing.vactive as usize + super::video::wht::strip_h() - 1)
+            & !(super::video::wht::strip_h() - 1);
         let prompt = super::video::wht::black_frame_ep08(
             w_pad,
             h_pad,
             head,
-            BAND_PARITY_BIT,
-            INTERLACED_BANDS,
+            band_parity_bit(),
+            interlaced_bands(),
         )?;
         let wake = self.modeset_active[head_i].load(Ordering::Acquire) == 0;
 
@@ -1454,6 +1508,7 @@ impl VinoDrmData {
                 Some(Instant::<Monotonic>::now() + Delta::from_millis(3000));
             let bit = 1u32 << head;
             self.arm_prefix_pending.fetch_or(bit, Ordering::Release);
+            self.stream_open_pending.fetch_or(bit, Ordering::Release);
             self.owe_keyframe(head_i);
             self.strip_hashes.lock()[head_i] = None;
             self.dirty_ttl.lock()[head_i] = None;
@@ -1531,16 +1586,16 @@ impl VinoDrmData {
                 timing.vactive,
                 timing.refresh_hz
             );
-            let w_pad = (timing.hactive as usize + super::video::wht::STRIP_W - 1)
-                & !(super::video::wht::STRIP_W - 1);
-            let h_pad = (timing.vactive as usize + super::video::wht::STRIP_H - 1)
-                & !(super::video::wht::STRIP_H - 1);
+            let w_pad = (timing.hactive as usize + super::video::wht::strip_w() - 1)
+                & !(super::video::wht::strip_w() - 1);
+            let h_pad = (timing.vactive as usize + super::video::wht::strip_h() - 1)
+                & !(super::video::wht::strip_h() - 1);
             prompts[head] = Some(super::video::wht::black_frame_ep08(
                 w_pad,
                 h_pad,
                 head as u8,
-                BAND_PARITY_BIT,
-                INTERLACED_BANDS,
+                band_parity_bit(),
+                interlaced_bands(),
             )?);
             keys[head] = key;
             valid |= 1u32 << head;
@@ -1627,6 +1682,8 @@ impl VinoDrmData {
                 self.sustain_until.lock()[head] =
                     Some(Instant::<Monotonic>::now() + Delta::from_millis(3000));
                 self.arm_prefix_pending.fetch_or(bit, Ordering::Release);
+                self.stream_open_pending.fetch_or(bit, Ordering::Release);
+            self.stream_open_pending.fetch_or(bit, Ordering::Release);
                 self.owe_keyframe(head);
                 self.strip_hashes.lock()[head] = None;
                 self.dirty_ttl.lock()[head] = None;
@@ -1639,6 +1696,14 @@ impl VinoDrmData {
 
             // Bracket, status polls and the mid-bracket EDID re-read, up to the first video.
             cp_until!(cold::H0_VIDEO - 1);
+
+            // Open every head's stream before any of them sends pixels: DLM opens both video
+            // endpoints back to back and only then starts a frame.
+            for head in 0..HEADS {
+                if sent & (1u32 << head) != 0 {
+                    self.send_stream_open(dev, head)?;
+                }
+            }
 
             for (head, at) in [(0usize, cold::H0_VIDEO), (1usize, cold::H1_VIDEO)] {
                 cp_until!(at - 1);
@@ -1737,7 +1802,67 @@ impl VinoDrmData {
     ///
     /// Sealed with the head's video key like every other video-endpoint message, and prefixed to
     /// the first frame after a mode set so it reaches the dock before any pixels.
-    fn build_stream_open_buf(&self, head: usize) -> Result<KVec<u8>> {
+    /// Build the prefix that opens a head's video stream after a mode set.
+    ///
+    /// Ridge prefixes a cold ARM burst to the first frame; Navarro prefixes a short sealed
+    /// stream-open. Both occupy the same slot ahead of any pixels, and every submission path must
+    /// pick between them the same way: sending one platform's opening to the other's dock leaves
+    /// the stream unopened, and the dock then watchdog-resets a few seconds later.
+    /// Build the records that close a frame, in this dock's format.
+    fn build_frame_trailer(&self, head: u8, seq0: u32) -> super::video::wht::FrameTrailer {
+        if self.video_arm.load(Ordering::Acquire) {
+            super::video::wht::frame_trailer(head, seq0)
+        } else {
+            super::video::wht::navarro_frame_trailer(head, seq0)
+        }
+    }
+
+    /// Open a head's video stream, once per mode generation, ahead of any pixels.
+    ///
+    /// Does nothing on a dock whose opening is the ARM burst carried with the first frame.
+    fn send_stream_open(&self, dev: &BoundInterface<'_>, head: usize) -> Result {
+        let bit = 1u32 << head;
+        if self.stream_open_pending.load(Ordering::Acquire) & bit == 0 {
+            return Ok(());
+        }
+        let Some(open) = self.build_stream_open_buf(head)? else {
+            self.stream_open_pending.fetch_and(!bit, Ordering::Release);
+            return Ok(());
+        };
+        let pipe_i = dev.video_pipe_index(head)?;
+        let mut queue_slot = self.video_q[pipe_i].lock();
+        if queue_slot.is_none() {
+            let _ = dev.clear_video_halt(head);
+            *queue_slot = Some(dev.video_queue(head, 8, VIDEO_XFER)?);
+        }
+        let queue = queue_slot
+            .as_mut()
+            .get_mut()
+            .as_mut()
+            .ok_or(kernel::error::code::ENODEV)?;
+        queue.send(dev.io(), &open, super::timeout())?;
+        self.stream_open_pending.fetch_and(!bit, Ordering::Release);
+        vino_debug!("vino: head {} video stream opened\n", head);
+        Ok(())
+    }
+
+    fn build_stream_prefix_buf(&self, head: usize) -> Result<KVec<u8>> {
+        if self.video_arm.load(Ordering::Acquire) {
+            self.build_arm_burst_buf(head)
+        } else {
+            self.build_navarro_prologue_buf(head)
+        }
+    }
+
+    /// Build the message a head's video stream opens with, sent alone ahead of everything else.
+    ///
+    /// Ridge has none: its ARM burst opens the stream from within the first frame's transfer.
+    /// Navarro's open is a complete 48-byte message of its own, and the dock stalls the endpoint
+    /// when pixel records follow it in the same transfer.
+    fn build_stream_open_buf(&self, head: usize) -> Result<Option<KVec<u8>>> {
+        if self.video_arm.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let keys = self.video_keys.lock();
         let key = keys.get(head).ok_or(EINVAL)?;
         let mut vkey = kernel::crypto::Secret::zeroed();
@@ -1745,17 +1870,88 @@ impl VinoDrmData {
         let mut vnonce = [0u8; 8];
         vnonce.copy_from_slice(&key[16..24]);
         drop(keys);
-        // A live DLM sealer capture establishes this is the complete fourteen-byte content. This
-        // path remains unreachable while the per-selector key derivation is gated.
         let content = super::cp::navarro_stream_open();
-        super::cp::seal_video_arm(
-            &vkey,
-            &vnonce,
-            super::cp::navarro_stream_open_sub(head as u8),
-            0x0002,
-            0,
-            &content,
-        )
+        // The open carries the stream's upper marker sub, the same one the prologue's second
+        // plaintext record uses; the bare stream id names the sealed configuration records.
+        let sub = super::video::wht::stream_id(head as u8) | 0x0010;
+        Ok(Some(super::cp::seal_video_arm(
+            &vkey, &vnonce, sub, 0x0002, 0, &content,
+        )?))
+    }
+
+    /// Build the DL7400 records that precede a head's first frame.
+    ///
+    /// In wire order: two plaintext stream markers, the sealed pipe descriptor, a plaintext frame
+    /// marker, an unsealed record naming the connector's first and fifth ring addresses, and the
+    /// sealed decoder configuration. The two sealed records share the video channel's block
+    /// counter, so the configuration starts at the descriptor's 304 bytes divided into blocks.
+    fn build_navarro_prologue_buf(&self, head: usize) -> Result<KVec<u8>> {
+        let keys = self.video_keys.lock();
+        let key = keys.get(head).ok_or(EINVAL)?;
+        let mut vkey = kernel::crypto::Secret::zeroed();
+        vkey.copy_from_slice(&key[..16]);
+        let mut vnonce = [0u8; 8];
+        vnonce.copy_from_slice(&key[16..24]);
+        drop(keys);
+        let timing = self
+            .last_timing
+            .lock()
+            .get(head)
+            .copied()
+            .flatten()
+            .ok_or(ENODEV)?;
+        let connector = head as u8;
+        let stream = super::video::wht::stream_id(connector);
+        let frame_sub = u16::from(super::video::wht::head_sub(connector));
+
+        let mut buf = KVec::with_capacity(1600, GFP_KERNEL)?;
+        for sub in [stream, stream | 0x0010] {
+            let mut body = [0u8; 16];
+            body[0..2].copy_from_slice(&sub.to_le_bytes());
+            body[2..4].copy_from_slice(&0x0006u16.to_le_bytes());
+            buf.extend_from_slice(&super::cp::video_arm_plain_frame(sub, &body), GFP_KERNEL)?;
+        }
+
+        let descriptor = super::cp::navarro_pipe_descriptor(connector)?;
+        let mut seal_seq = 0u32;
+        buf.extend_from_slice(
+            &super::cp::seal_video_arm(&vkey, &vnonce, stream, 0x000e, seal_seq, &descriptor)?,
+            GFP_KERNEL,
+        )?;
+        seal_seq += (descriptor.len() / 16) as u32;
+
+        let mut body = [0u8; 16];
+        body[0..2].copy_from_slice(&frame_sub.to_le_bytes());
+        buf.extend_from_slice(
+            &super::cp::video_arm_plain_frame(frame_sub, &body),
+            GFP_KERNEL,
+        )?;
+
+        // Unsealed type-4 record: the connector's first and fifth ring addresses.
+        let mut ring = [0u8; 32];
+        ring[2..4].copy_from_slice(&0x001cu16.to_le_bytes());
+        ring[4..8].copy_from_slice(&4u32.to_le_bytes());
+        ring[8..10].copy_from_slice(&frame_sub.to_le_bytes());
+        ring[10..12].copy_from_slice(&0x0004u16.to_le_bytes());
+        ring[16..19].copy_from_slice(&[0x0a, 0x00, 0x04]);
+        ring[19] = frame_sub as u8;
+        ring[22..26].copy_from_slice(&super::cp::navarro_pipe_ring(connector, 0).to_le_bytes());
+        ring[26..30].copy_from_slice(&super::cp::navarro_pipe_ring(connector, 4).to_le_bytes());
+        buf.extend_from_slice(&ring, GFP_KERNEL)?;
+
+        let mut tail = [0u8; 14];
+        super::rng::fill(&mut tail);
+        let config = super::video_arm::build_with_layout_word(
+            timing.hactive,
+            timing.vactive,
+            NAVARRO_LAYOUT_WORD,
+            &tail,
+        )?;
+        buf.extend_from_slice(
+            &super::cp::seal_video_arm(&vkey, &vnonce, stream, 0x000e, seal_seq, &config)?,
+            GFP_KERNEL,
+        )?;
+        Ok(buf)
     }
 
     fn build_arm_burst_buf(&self, head: usize) -> Result<KVec<u8>> {
@@ -3831,8 +4027,8 @@ fn snapshot_to_shadow(
     let pitch = source.pitch();
     let view = source.view();
 
-    let sw = super::video::wht::STRIP_W;
-    let sh = super::video::wht::STRIP_H;
+    let sw = super::video::wht::strip_w();
+    let sh = super::video::wht::strip_h();
     let w_pad = (w + sw - 1) & !(sw - 1);
     let h_pad = (h + sh - 1) & !(sh - 1);
     let tiles_x = w_pad / sw;
@@ -3926,8 +4122,8 @@ fn changed_strip_rects(
     h_pad: usize,
 ) -> Result<KVec<DamageRect>> {
     const MAX_RECTS: usize = 128;
-    let tiles_x = w_pad / super::video::wht::STRIP_W;
-    let tiles_y = h_pad / super::video::wht::STRIP_H;
+    let tiles_x = w_pad >> super::video::wht::strip_w_shift();
+    let tiles_y = h_pad >> super::video::wht::strip_h_shift();
     if old.len() != tiles_x * tiles_y || new.len() != old.len() {
         return Err(EINVAL);
     }
@@ -3943,10 +4139,10 @@ fn changed_strip_rects(
             while tx < tiles_x && old[ty * tiles_x + tx] != new[ty * tiles_x + tx] {
                 tx += 1;
             }
-            let x0 = run_start * super::video::wht::STRIP_W;
-            let x1 = tx * super::video::wht::STRIP_W;
-            let y0 = ty * super::video::wht::STRIP_H;
-            let y1 = y0 + super::video::wht::STRIP_H;
+            let x0 = run_start * super::video::wht::strip_w();
+            let x1 = tx * super::video::wht::strip_w();
+            let y0 = ty * super::video::wht::strip_h();
+            let y1 = y0 + super::video::wht::strip_h();
             let mut merged = false;
             for prior in rects.iter_mut().rev() {
                 if prior.0 == x0 && prior.2 == x1 && prior.3 == y0 {
@@ -4277,8 +4473,8 @@ pub(super) fn parallel_rotation_matches_serial(rotation: plane::Rotation) -> Res
         },
         GFP_KERNEL,
     )?;
-    let w_pad = output_w.next_multiple_of(super::video::wht::STRIP_W);
-    let h_pad = output_h.next_multiple_of(super::video::wht::STRIP_H);
+    let w_pad = output_w.next_multiple_of(super::video::wht::strip_w());
+    let h_pad = output_h.next_multiple_of(super::video::wht::strip_h());
     let coords = super::video::wht::all_strip_coords(w_pad, h_pad)?;
 
     let mut serial: KVec<KVec<u8>> = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
@@ -4386,12 +4582,13 @@ fn encode_and_send_wht(
     // The codec operates on complete 64x16 strips. Pad non-aligned modes to the next strip
     // boundary; the mode-set retains the visible dimensions and the sampler supplies black for
     // pixels outside them.
-    let w_pad = (w + super::video::wht::STRIP_W - 1) & !(super::video::wht::STRIP_W - 1);
-    let h_pad = (h + super::video::wht::STRIP_H - 1) & !(super::video::wht::STRIP_H - 1);
+    let w_pad = (w + super::video::wht::strip_w() - 1) & !(super::video::wht::strip_w() - 1);
+    let h_pad = (h + super::video::wht::strip_h() - 1) & !(super::video::wht::strip_h() - 1);
     let mut content_hashes: Option<KVVec<u64>> = None;
     let mut content_damage: KVec<DamageRect> = KVec::new();
     if identity {
-        let expected = (w_pad / super::video::wht::STRIP_W) * (h_pad / super::video::wht::STRIP_H);
+        let expected = (w_pad >> super::video::wht::strip_w_shift())
+            * (h_pad >> super::video::wht::strip_h_shift());
         if src.hashes.len() != expected {
             return Err(EINVAL);
         }
@@ -4463,8 +4660,8 @@ fn encode_and_send_wht(
                 let records = super::video::wht::frame_records(
                     &strips,
                     head,
-                    BAND_PARITY_BIT,
-                    INTERLACED_BANDS,
+                    band_parity_bit(),
+                    interlaced_bands(),
                 )?;
                 Some((records, seq0.wrapping_add(1)))
             }
@@ -4478,7 +4675,7 @@ fn encode_and_send_wht(
         };
         // Reuse an encoded strip body when its pixels and gamma tag are unchanged. Encode only
         // misses, then restore the required x-order within each Y band.
-        let tiles_x = w_pad / super::video::wht::STRIP_W;
+        let tiles_x = w_pad >> super::video::wht::strip_w_shift();
         let mut reuse: KVec<Option<KVec<u8>>> = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
         let mut misses: KVec<(usize, usize)> = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
         {
@@ -4488,7 +4685,8 @@ fn encode_and_send_wht(
                 .filter(|c| c.w_pad == w_pad && c.h_pad == h_pad && c.tag == gamma_tag);
             for &(sx, sy) in coords.iter() {
                 let idx =
-                    (sy / super::video::wht::STRIP_H) * tiles_x + sx / super::video::wht::STRIP_W;
+                    (sy >> super::video::wht::strip_h_shift()) * tiles_x
+                    + (sx >> super::video::wht::strip_w_shift());
                 let hit = usable.and_then(|c| {
                     // Same pixels as when this body was produced, and a body was kept.
                     let same = c.hashes.get(idx).zip(content_hashes.as_ref()?.get(idx));
@@ -4528,8 +4726,8 @@ fn encode_and_send_wht(
                 let records = super::video::wht::frame_records(
                     &strips,
                     head,
-                    BAND_PARITY_BIT,
-                    INTERLACED_BANDS,
+                    band_parity_bit(),
+                    interlaced_bands(),
                 )?;
                 encoded = Some((coords, strips));
                 Some((records, seq0.wrapping_add(1)))
@@ -4544,8 +4742,8 @@ fn encode_and_send_wht(
             h_pad,
             seq0,
             head,
-            BAND_PARITY_BIT,
-            INTERLACED_BANDS,
+            band_parity_bit(),
+            interlaced_bands(),
             px,
         )?,
         None => super::video::wht::colour_frame_ep08_damage(
@@ -4554,8 +4752,8 @@ fn encode_and_send_wht(
             seq0,
             head,
             &content_damage,
-            BAND_PARITY_BIT,
-            INTERLACED_BANDS,
+            band_parity_bit(),
+            interlaced_bands(),
             px,
         )?,
     };
@@ -4585,14 +4783,7 @@ fn encode_and_send_wht(
         & head_bit
         != 0
     {
-        // Ridge prefixes a cold ARM burst to the first frame after a mode set; this platform
-        // prefixes a short per-head stream-open instead. Both go in the same slot, ahead of any
-        // pixels.
-        if data.video_arm.load(Ordering::Acquire) {
-            Some(data.build_arm_burst_buf(head_i)?)
-        } else {
-            Some(data.build_stream_open_buf(head_i)?)
-        }
+        Some(data.build_stream_prefix_buf(head_i)?)
     } else {
         None
     };
@@ -4630,6 +4821,9 @@ fn encode_and_send_wht(
     // whole-frame coalescing allocation.
     let frame_count = frames.len();
     let image_len: usize = frames.iter().take(frame_count).map(|f| f.len()).sum();
+    if arm.is_some() {
+        data.send_stream_open(dev, head_i)?;
+    }
     let startup = arm.is_some();
     // A cold link requires a bounded back-to-back full-frame burst until the downstream clock is
     // programmed. Reuse the encoded image and advance only its frame trailer and per-frame control
@@ -4648,7 +4842,7 @@ fn encode_and_send_wht(
         // successive frames through `DAMAGE_REPEATS` and the debt repaint instead.
         1
     };
-    let first_wire_len = arm_len + image_len + super::video::wht::frame_trailer(head, seq0).len();
+    let first_wire_len = arm_len + image_len + data.build_frame_trailer(head, seq0).len();
     vino_debug!(
         "vino: head={} chunks={} arm={} first={} presentations={}\n",
         head,
@@ -4661,7 +4855,7 @@ fn encode_and_send_wht(
     // so only the final transfer terminates short. Submit through a persistent eight-deep queue to
     // keep the frame continuous across transfer boundaries. Do not flush between frames: slot reuse
     // reaps completions without introducing a pipeline gap.
-    const XFER: usize = 65536;
+    const XFER: usize = VIDEO_XFER;
     let pipe_i = dev.video_pipe_index(head_i)?;
     let mut last_wire_len = 0usize;
     for repeat in 0..repeat_count {
@@ -4681,7 +4875,7 @@ fn encode_and_send_wht(
         }
 
         let repeat_seq = seq0.wrapping_add(repeat);
-        let frame_trailer = super::video::wht::frame_trailer(head, repeat_seq);
+        let frame_trailer = data.build_frame_trailer(head, repeat_seq);
         // Prefix ARM only to presentation zero. Every later presentation starts directly at the
         // image records and carries a freshly advanced three-record frame trailer.
         let arm_slice: &[u8] = if repeat == 0 {
@@ -4706,6 +4900,7 @@ fn encode_and_send_wht(
             let submitted = {
                 let mut queue_slot = data.video_q[pipe_i].lock();
                 if queue_slot.is_none() {
+                    let _ = dev.clear_video_halt(head_i);
                     match dev.video_queue(head_i, 8, XFER) {
                         Ok(q) => {
                             *queue_slot = Some(q);
@@ -4889,10 +5084,10 @@ fn encode_and_send_wht(
             }
             if bodies.len() == hashes.len() {
                 if let Some((coords, strips)) = encoded {
-                    let tiles_x = w_pad / super::video::wht::STRIP_W;
+                    let tiles_x = w_pad >> super::video::wht::strip_w_shift();
                     for (&(sx, sy), body) in coords.iter().zip(strips) {
-                        let idx = (sy / super::video::wht::STRIP_H) * tiles_x
-                            + sx / super::video::wht::STRIP_W;
+                        let idx = (sy >> super::video::wht::strip_h_shift()) * tiles_x
+                            + (sx >> super::video::wht::strip_w_shift());
                         if let Some(slot) = bodies.get_mut(idx) {
                             *slot = body;
                         }

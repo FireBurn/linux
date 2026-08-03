@@ -27,12 +27,16 @@ pub(super) fn cp_session_key(ske_ks: &[u8; 16]) -> kernel::crypto::Secret<16> {
     kernel::crypto::Secret::new(key)
 }
 
-/// Derive the AES-CTR content nonce for one video head from the RIV carried by that head's
-/// `SKE_Send_Eks` restatement (`id=0x32`). Video uses `byte7 ^= 0x08 | head`, distinct from the
-/// main control channel's `byte7 ^= 0x04`.
-pub(super) fn video_content_nonce(riv: &[u8; 8], head: u8) -> [u8; 8] {
+/// Derive a stream's AES-CTR content nonce from the RIV its `SKE_Send_Eks` restatement
+/// (`id=0x32`) delivered.
+///
+/// Byte 7 is xored with the stream's content-stream id: the value the stream's
+/// `RepeaterAuth_Stream_Manage` restatement declares, which is also the wire `sub` of that
+/// stream's control records. The control channel is stream `0x04`, Ridge's video streams are
+/// `0x08 | head`, and Navarro's are `(connector << 3) | 7`.
+pub(super) fn stream_content_nonce(riv: &[u8; 8], stream_id: u16) -> [u8; 8] {
     let mut nonce = *riv;
-    nonce[7] ^= 0x08 | head;
+    nonce[7] ^= stream_id as u8;
     nonce
 }
 
@@ -501,6 +505,65 @@ pub(super) fn verify_in_ack(
 ///
 /// This distinguishes a valid message using a newly observed sub-id from a frame that cannot be
 /// decrypted under any supported RIV variant.
+/// Recover a dock->host frame's inner plaintext, whichever framing it used.
+///
+/// Ridge seals every reply as wire `sub=0x45`. Navarro also pushes frames framed in the clear as
+/// wire `sub=0x25`, with the inner message at offset 16 and nothing to decrypt.
+pub(super) fn inner_plaintext(
+    ks: &[u8; 16],
+    out_riv: &[u8; 8],
+    wire: &[u8],
+) -> Option<KVec<u8>> {
+    if wire.len() <= 16 {
+        return None;
+    }
+    match u16::from_le_bytes([wire[8], wire[9]]) {
+        0x25 => {
+            let mut pt = KVec::with_capacity(wire.len() - 16, GFP_KERNEL).ok()?;
+            pt.extend_from_slice(&wire[16..], GFP_KERNEL).ok()?;
+            Some(pt)
+        }
+        0x45 => {
+            let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
+            for riv in inbound_reply_rivs(out_riv) {
+                let Ok(pt) = open_in(ks, &riv, seq, &wire[16..]) else {
+                    continue;
+                };
+                if pt.len() >= 8 && u16::from_le_bytes([pt[6], pt[7]]) == 0 {
+                    return Some(pt);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The dock's own log line carried by a `sub=0x0c` push, as printable ASCII.
+///
+/// The dock reports what it is doing, and what it refuses, on this channel. Recovering it costs
+/// one pass over an already-decrypted frame and is the only account of a fault the dock does not
+/// otherwise report.
+pub(super) fn dock_trace_line(inner: &[u8]) -> Option<KVec<u8>> {
+    if inner.len() < 10 || u16::from_le_bytes([inner[2], inner[3]]) != 0x000c {
+        return None;
+    }
+    let mut out = KVec::new();
+    for &b in &inner[8..] {
+        if b == 0 {
+            continue;
+        }
+        if !(0x20..0x7f).contains(&b) {
+            continue;
+        }
+        out.push(b, GFP_KERNEL).ok()?;
+    }
+    if out.len() < 4 {
+        return None;
+    }
+    Some(out)
+}
+
 pub(super) fn decode_in_lenient(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
@@ -800,34 +863,48 @@ pub(super) const CP_SETUP_PER_HEAD: [(u16, u16, usize); 9] = [
 ];
 /// Build a 48-byte `RepeaterAuth_Stream_Manage` restatement for one head.
 ///
-/// Offset 23 contains the one-based head, offset 27 the HDCP message id, offsets 32 and 36 contain
-/// the stream count and sequence, and offsets 40 through 47 contain a fresh token.
-pub(super) fn stream_manage_restatement(counter: u16, head: u8) -> Result<KVec<u8>> {
+/// Offset 27 carries the HDCP message id, offset 32 the stream count and offset 36 the head's
+/// content-stream id, and offsets 40 through 47 a fresh token. `connector_marker` writes the
+/// dock's connector selector into offsets 22 through 25.
+pub(super) fn stream_manage_restatement(
+    counter: u16,
+    head: u8,
+    stream_id: u16,
+    onehot: bool,
+) -> Result<KVec<u8>> {
     let mut b = KVec::from_elem(0u8, 48, GFP_KERNEL)?;
     b[0..2].copy_from_slice(&0x0026u16.to_le_bytes());
     b[2..4].copy_from_slice(&0x0010u16.to_le_bytes());
     b[4..6].copy_from_slice(&counter.to_le_bytes());
-    b[23] = head + 1; // head marker
+    connector_marker(&mut b, head, onehot);
     b[27] = 0x10; // HDCP msg-id (RepeaterAuth_Stream_Manage)
     b[32..36].copy_from_slice(&1u32.to_le_bytes());
-    b[36..40].copy_from_slice(&(head as u32 + 8).to_le_bytes()); // seq: 8 head0 / 9 head1
+    b[36..40].copy_from_slice(&(stream_id as u32).to_le_bytes());
     let mut tail = [0u8; 8];
     rng::fill(&mut tail);
     b[40..48].copy_from_slice(&tail);
     Ok(b)
 }
+
+/// Write a per-head record's connector selector.
+///
+/// Ridge names the connector by a one-based head number at offset 23. Navarro sets a one-hot bit
+/// at offset `22 + head`, which is why it can address four connectors where Ridge addresses two.
+pub(super) fn connector_marker(content: &mut [u8], head: u8, onehot: bool) {
+    if onehot {
+        if let Some(byte) = content.get_mut(22 + head as usize) {
+            *byte = 0x80;
+        }
+    } else if let Some(byte) = content.get_mut(23) {
+        *byte = head + 1;
+    }
+}
 /// Stream-finalization sequence sent after both [`CP_SETUP_PER_HEAD`] blocks.
 ///
 /// Each tuple is `(id, sub, value at offset 22)`. Finalization messages are 32 bytes, use
 /// `0x01` at offset 23 for `sub=0x4c`, and end with a fresh token.
-pub(super) const CP_SETUP_FINALIZE: [(u16, u16, u8); 6] = [
-    (0x0016, 0x004c, 0),
-    (0x0015, 0x004a, 0),
-    (0x0016, 0x004c, 0),
-    (0x0016, 0x004c, 1),
-    (0x0015, 0x004a, 1),
-    (0x0016, 0x004c, 1),
-];
+pub(super) const CP_SETUP_FINALIZE_STEPS: [(u16, u16); 3] =
+    [(0x0016, 0x004c), (0x0015, 0x004a), (0x0016, 0x004c)];
 
 /// Video-channel arm sequence prepended to the first frame on each head's bulk endpoint.
 ///
@@ -890,24 +967,93 @@ pub(super) fn video_arm_plain_frame(sub: u16, body: &[u8; 16]) -> [u8; 32] {
 }
 
 /// Build a sealed type-4 video-arm frame from its header fields and plaintext content.
-/// Build the 14-byte plaintext of a Navarro video stream-open.
+/// The fixed 14-byte stream marker that opens every Navarro video stream record.
 ///
-/// This is not a normal CP header.  A live DLM sealer capture proves that the content passed to
-/// AES-CTR is exactly these fourteen bytes: the apparent trailing u16 in an older decrypted-wire
-/// reconstruction was not part of the stream-open content. In particular, the connector is
-/// encoded solely in the *wire* sub, not in this plaintext.
-pub(super) fn navarro_stream_open() -> [u8; 14] {
-    [
-        0x04, 0x00, 0x08, 0x04, 0x05, 0x00, 0x06, 0x00, 0x07, 0x01, 0x08, 0x02, 0x07, 0x00,
-    ]
+/// It is not a normal CP header. The connector is carried solely by the *wire* sub, never here:
+/// all four connectors send these same fourteen bytes.
+pub(super) const NAVARRO_STREAM_MARKER: [u8; 14] = [
+    0x04, 0x00, 0x08, 0x04, 0x05, 0x00, 0x06, 0x00, 0x07, 0x01, 0x08, 0x02, 0x07, 0x00,
+];
+
+/// Build the 16-byte plaintext of a Navarro video stream-open, sent once per connector on that
+/// connector's video endpoint before any pixels.
+///
+/// The content is [`NAVARRO_STREAM_MARKER`] followed by a two-byte opaque tail. The tail is host
+/// random and differs between observed opens; it is covered by the Dl3Cmac, so its length matters
+/// and its value does not.
+pub(super) fn navarro_stream_open() -> [u8; 16] {
+    let mut open = [0u8; 16];
+    open[..14].copy_from_slice(&NAVARRO_STREAM_MARKER);
+    rng::fill(&mut open[14..]);
+    open
 }
 
-/// The wire `sub` of a Navarro connector's stream-open.
+/// Fixed leader of one slot record in a DL7400 pipe descriptor, observed at 2560x1440.
+const NAVARRO_SLOT_HEADER: [u8; 12] = [
+    0x00, 0x10, 0xb4, 0x00, 0x14, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00,
+];
+
+/// Fixed trailer of one slot record.
+const NAVARRO_SLOT_TRAILER: [u8; 10] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x50, 0x00, 0x80, 0x01, 0x09];
+
+/// Slot records per connector, and the connector stride in the dock's slot-id space.
+const NAVARRO_SLOTS_PER_CONNECTOR: u16 = 6;
+const NAVARRO_SLOT_STRIDE: u16 = 8;
+
+/// Dock-side addresses each slot record names, as `base - n * step`.
 ///
-/// Navarro has four connectors, even though its two video endpoints multiplex them.  Frame
-/// records use `connector << 3`, while this one-time stream-open uses `(connector << 3) | 7`.
-pub(super) fn navarro_stream_open_sub(connector: u8) -> u16 {
-    ((connector as u16) << 3) | 0x0007
+/// The ring index counts in slot ids, so it skips the two ids each connector leaves unused; the
+/// two plane pools count in allocated slots and do not. Both forms are fixed by twelve records
+/// across two independently keyed connectors.
+const NAVARRO_RING_BASE: u32 = 0x6fcc;
+const NAVARRO_RING_STEP: u32 = 0x21c;
+const NAVARRO_PLANE0_BASE: u32 = 0x71fb_9000;
+const NAVARRO_PLANE0_STEP: u32 = 0x5000;
+const NAVARRO_PLANE1_BASE: u32 = 0x7216_6000;
+const NAVARRO_PLANE1_STEP: u32 = 0x8000;
+
+/// The dock's slot id for one of a connector's pipe buffers.
+pub(super) fn navarro_pipe_slot(connector: u8, index: u16) -> u16 {
+    (connector as u16) * NAVARRO_SLOT_STRIDE + index
+}
+
+/// The ring address a connector's pipe buffer is given.
+pub(super) fn navarro_pipe_ring(connector: u8, index: u16) -> u32 {
+    NAVARRO_RING_BASE - u32::from(navarro_pipe_slot(connector, index)) * NAVARRO_RING_STEP
+}
+
+/// Build a DL7400 pipe descriptor for one connector.
+///
+/// The 304-byte plaintext is [`NAVARRO_STREAM_MARKER`], six `[len=0x002c][kind=0x000e][slot]`
+/// records of 40 configuration bytes, and a 14-byte host-random tail. Records advance by
+/// `len + 2`. Each configuration names the connector's slot id and the three dock-side addresses
+/// that slot is given.
+///
+/// Only 2560x1440 has been observed, and the fixed header carries mode-derived bytes, so callers
+/// must not use this for another mode.
+pub(super) fn navarro_pipe_descriptor(connector: u8) -> Result<KVec<u8>> {
+    let mut b = KVec::with_capacity(304, GFP_KERNEL)?;
+    b.extend_from_slice(&NAVARRO_STREAM_MARKER, GFP_KERNEL)?;
+    for index in 0..NAVARRO_SLOTS_PER_CONNECTOR {
+        let alloc = u32::from((connector as u16) * NAVARRO_SLOTS_PER_CONNECTOR + index);
+        b.extend_from_slice(&0x002cu16.to_le_bytes(), GFP_KERNEL)?;
+        b.extend_from_slice(&0x000eu16.to_le_bytes(), GFP_KERNEL)?;
+        b.extend_from_slice(&navarro_pipe_slot(connector, index).to_le_bytes(), GFP_KERNEL)?;
+        b.extend_from_slice(&NAVARRO_SLOT_HEADER, GFP_KERNEL)?;
+        b.extend_from_slice(&navarro_pipe_ring(connector, index).to_le_bytes(), GFP_KERNEL)?;
+        b.extend_from_slice(&[0, 0], GFP_KERNEL)?;
+        let plane0 = NAVARRO_PLANE0_BASE - alloc * NAVARRO_PLANE0_STEP;
+        b.extend_from_slice(&plane0.to_le_bytes(), GFP_KERNEL)?;
+        b.extend_from_slice(&[0, 0, 0, 0], GFP_KERNEL)?;
+        let plane1 = NAVARRO_PLANE1_BASE - alloc * NAVARRO_PLANE1_STEP;
+        b.extend_from_slice(&plane1.to_le_bytes(), GFP_KERNEL)?;
+        b.extend_from_slice(&NAVARRO_SLOT_TRAILER, GFP_KERNEL)?;
+    }
+    let mut tail = [0u8; 14];
+    rng::fill(&mut tail);
+    b.extend_from_slice(&tail, GFP_KERNEL)?;
+    debug_assert_eq!(b.len(), 304);
+    Ok(b)
 }
 
 pub(super) fn seal_video_arm(

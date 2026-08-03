@@ -84,15 +84,30 @@ pub(crate) struct DockProfile {
     pub(crate) video_supported: bool,
     /// Whether the dock runs a per-head HDCP repeater authentication after the main-link AKE.
     ///
-    /// Both supported platforms do. Navarro's sequence is structurally identical to Ridge's, but
-    /// changes the connector marker and uses its delivered RIV directly for video.
+    /// Both supported platforms do. Navarro's sequence is structurally identical to Ridge's and
+    /// differs only in the connector marker and the stream ids it names.
     pub(crate) per_head_auth: bool,
     /// Whether per-head HDCP records select a connector as a one-hot bit at byte `22 + head`.
     /// Ridge instead has a one-based head number at byte 23.
     pub(crate) per_head_onehot: bool,
-    /// Whether video uses the RIV delivered by its per-head SKE unchanged.
-    /// Ridge xors byte 7 with `0x08 | head`; Navarro does not.
-    pub(crate) video_riv_direct: bool,
+    /// The bits a head's content-stream id sets over its record `sub`.
+    ///
+    /// Ridge streams are `0x08 | head`, Navarro's `(connector << 3) | 7`. See
+    /// [`video::wht::STREAM_ID_MASK`], which this configures.
+    pub(crate) stream_id_mask: u8,
+    /// The connector-count marker byte the per-head `strm2` record carries at offset 24.
+    pub(crate) strm2_marker: u8,
+    /// Whether an image record's `sub` carries the y-band parity; see
+    /// [`video::wht::BAND_PARITY_BIT`].
+    pub(crate) band_parity_bit: bool,
+    /// Whether an image record's `aux` carries its zero-padding count; see
+    /// [`video::wht::AUX_IS_PAD_COUNT`].
+    pub(crate) aux_is_pad_count: bool,
+    /// Blocks across one strip; see [`video::wht::STRIP_W_SHIFT`]. Ridge lays a strip's sixteen
+    /// blocks 8 across x 2 down (64x16 px), the DL7400 16 across x 1 down (128x8 px).
+    pub(crate) strip_blocks_x: usize,
+    /// Whether image records interlace y bands; see [`video::wht::INTERLACED_BANDS`].
+    pub(crate) interlaced_bands: bool,
     /// Whether monitor presence must be read from the probe reply's status word rather than from
     /// which handler answered.
     ///
@@ -124,7 +139,12 @@ static PROFILE_D6000: DockProfile = DockProfile {
     video_supported: true,
     per_head_auth: true,
     per_head_onehot: false,
-    video_riv_direct: false,
+    stream_id_mask: 0x08,
+    strm2_marker: 0x06,
+    band_parity_bit: true,
+    aux_is_pad_count: true,
+    strip_blocks_x: 8,
+    interlaced_bands: false,
     presence_from_status: false,
     connectors: 2,
 };
@@ -138,13 +158,17 @@ static PROFILE_DL7400: DockProfile = DockProfile {
     video_eps: [0x08, 0x0a, 0x08, 0x0a],
     video_arm: false,
     head_sub_shift: 3,
-    // The control/authentication path is verified, but the first shared-pipe video transaction
-    // still differs from DLM's captured endpoint preamble. Keep scanout gated until that
-    // transaction is reconstructed and validated offline.
-    video_supported: false,
+    // The shared-pipe stream-open is sent before pixels by `build_stream_open_buf()`.  Its
+    // remaining per-session material is established by the connector authentication sequence.
+    video_supported: true,
     per_head_auth: true,
     per_head_onehot: true,
-    video_riv_direct: true,
+    stream_id_mask: 0x07,
+    strm2_marker: 0x0c,
+    band_parity_bit: false,
+    aux_is_pad_count: false,
+    strip_blocks_x: 16,
+    interlaced_bands: true,
     presence_from_status: true,
     connectors: 4,
 };
@@ -582,12 +606,26 @@ impl WorkItem for BringUp {
                     if discovery_deferred[head] {
                         continue;
                     }
+                    let have_edid = slot.is_some();
                     if let Some(blob) = slot {
                         let n = blob.len();
                         data.set_edid(head, blob);
                         vino_dev_debug!(cdev, "vino: cached head {head} EDID ({n} bytes)\n");
                     }
-                    if head == 0 || heads_present[head] {
+                    // Ridge cannot report presence for head 0 before its first probe, so it is
+                    // assumed present and corrected by the watcher.
+                    //
+                    // A dock that answers a probe for all of its connectors has no such gap, and
+                    // its display-capability reply cannot separate them either. There a recovered
+                    // EDID is the presence signal: without one there is no monitor to drive, and
+                    // publishing the connector anyway puts a fallback mode into an empty socket
+                    // and makes the dock lay out buffers for outputs that do not exist.
+                    let present = if data.presence_from_status() {
+                        heads_present[head] && have_edid
+                    } else {
+                        head == 0 || heads_present[head]
+                    };
+                    if present {
                         data.set_connected(head);
                         dev_info!(cdev, "vino: head {head} monitor connected\n");
                     }
@@ -1593,15 +1631,12 @@ impl VinoDriver {
             // SKE_Send_Eks establishes this head's video key. Store the whitened key and the video
             // nonce derived from the delivered RIV for the scanout arm burst.
             // Layout: key(16) || nonce(8) || pad(8).
+            let stream_id = video::wht::stream_id(head as u8);
             video_keys[head] = kernel::crypto::Secret::zeroed();
             // The dock applies the control-plane whitening constant to each per-head SKE key.
             let video_key = cp::cp_session_key(&ske_ks_h);
             video_keys[head][..16].copy_from_slice(&video_key[..]);
-            let vnonce = if profile.video_riv_direct {
-                riv_h
-            } else {
-                cp::video_content_nonce(&riv_h, head as u8)
-            };
+            let vnonce = cp::stream_content_nonce(&riv_h, stream_id);
             video_keys[head][16..24].copy_from_slice(&vnonce);
             for (i, (id, sub, content_len)) in cp::CP_SETUP_PER_HEAD.iter().copied().enumerate() {
                 // The per-head `rrx` arrives with the response to AKE_No_Stored_km. It is mandatory
@@ -1633,7 +1668,12 @@ impl VinoDriver {
                 // id=0x26 (Stream_Manage restatement) is fully decoded -- deterministic content,
                 // not the generic path below. See `cp::stream_manage_restatement`'s doc comment.
                 if id == 0x0026 {
-                    let content = cp::stream_manage_restatement(cp_ctr, head as u8)?;
+                    let content = cp::stream_manage_restatement(
+                        cp_ctr,
+                        head as u8,
+                        stream_id,
+                        profile.per_head_onehot,
+                    )?;
                     let frame =
                         cp::seal_interactive(&session.ks, &session.riv, id, wseq, &content)?;
                     Self::submit_cp_frame(dev, &mut out_q, &frame)?;
@@ -1665,11 +1705,7 @@ impl VinoDriver {
                 match i {
                     // AKE restatements: head marker @23, HDCP msg-id tag @27, HDCP field @28..
                     0 | 1 | 2 | 3 | 4 | 5 => {
-                        if profile.per_head_onehot {
-                            c[22 + head] = 0x80;
-                        } else {
-                            c[23] = head as u8 + 1;
-                        }
+                        cp::connector_marker(&mut c, head as u8, profile.per_head_onehot);
                         c[27] = match i {
                             0 => 0x02, // AKE_Init (rtx)
                             1 => 0x13, // AKE_Transmitter_Info
@@ -1723,11 +1759,12 @@ impl VinoDriver {
                         }
                         rng::fill(&mut c[22..]);
                     }
-                    // strm2: head index @22, then the fixed `06 [head*4] 04` triple @24..27, then
-                    // a fresh 5-byte host-random tail.
+                    // strm2: head index @22, then the `<marker> [head*4] 04` triple @24..27, then
+                    // a fresh 5-byte host-random tail. The marker counts the dock's connectors:
+                    // Ridge has two and sends 0x06, Navarro has four and sends 0x0c.
                     8 => {
                         c[22] = head as u8;
-                        c[24] = 0x06;
+                        c[24] = profile.strm2_marker;
                         c[25] = (head as u8) * 4;
                         c[26] = 0x04;
                         rng::fill(&mut c[27..]);
@@ -1816,7 +1853,8 @@ impl VinoDriver {
             for head in 0..connector_count {
                 video_keys[head] = kernel::crypto::Secret::zeroed();
                 video_keys[head][..16].copy_from_slice(&session.ks[..]);
-                let vnonce = cp::video_content_nonce(&session.riv, head as u8);
+                let vnonce =
+                    cp::stream_content_nonce(&session.riv, video::wht::stream_id(head as u8));
                 video_keys[head][16..24].copy_from_slice(&vnonce);
             }
             pr_info!(
@@ -1830,7 +1868,14 @@ impl VinoDriver {
         // Only those heads: finalizing a stream whose downstream authentication never ran makes
         // the dock hard-reset a few seconds later and re-enumerate, which reads as a spontaneous
         // dock reset rather than as a message it refused.
-        for (id, sub, off22) in cp::CP_SETUP_FINALIZE {
+        // The sequence is per connector, so it follows the dock's connector count rather than a
+        // fixed pair: a four-connector dock finalizes four, and DLM does the same.
+        let finalize = (0..connector_count).flat_map(|c| {
+            cp::CP_SETUP_FINALIZE_STEPS
+                .iter()
+                .map(move |&(id, sub)| (id, sub, c as u8))
+        });
+        for (id, sub, off22) in finalize {
             if (off22 as usize) < Self::CP_SETUP_HEADS && !head_ok[off22 as usize] {
                 continue;
             }
@@ -2338,12 +2383,44 @@ impl VinoDriver {
                                         vino_debug!(
                                             "vino: CP reply id={id:#x} sub={sub:#x} ctr={ctr}\n"
                                         );
+                                        if sub == 0x000c {
+                                            if let Some(inner) = cp::inner_plaintext(
+                                                &session.ks,
+                                                &session.riv,
+                                                &buf[..len],
+                                            ) {
+                                                if let Some(line) = cp::dock_trace_line(&inner) {
+                                                    pr_info!(
+                                                        "vino: dock: {}\n",
+                                                        core::str::from_utf8(&line).unwrap_or("?")
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
-                                    // No supported reply nonce produces a valid header.
-                                    None => {
-                                        out.rejects += 1;
-                                        pr_warn!("vino: invalid encrypted CP reply\n");
-                                    }
+                                    // Not a sealed reply. Navarro pushes plaintext-framed
+                                    // messages the dock originates rather than answers, so a
+                                    // frame vino cannot open is only a rejection once that
+                                    // framing has been ruled out too.
+                                    None => match cp::inner_plaintext(
+                                        &session.ks,
+                                        &session.riv,
+                                        &buf[..len],
+                                    ) {
+                                        Some(inner) => {
+                                            out.acks += 1;
+                                            if let Some(line) = cp::dock_trace_line(&inner) {
+                                                pr_info!(
+                                                    "vino: dock: {}\n",
+                                                    core::str::from_utf8(&line).unwrap_or("?")
+                                                );
+                                            }
+                                        }
+                                        None => {
+                                            out.rejects += 1;
+                                            pr_warn!("vino: invalid encrypted CP reply\n");
+                                        }
+                                    },
                                 }
                             }
                         }
@@ -2549,6 +2626,11 @@ impl usb::Driver for VinoDriver {
             }
             d.set_video_supported(info.video_supported || forced_supported);
             drm_sink::set_head_sub_shift(info.head_sub_shift);
+            drm_sink::set_stream_id_mask(info.stream_id_mask);
+            drm_sink::set_band_parity_bit(info.band_parity_bit);
+            drm_sink::set_aux_is_pad_count(info.aux_is_pad_count);
+            drm_sink::set_strip_blocks_x(info.strip_blocks_x);
+            drm_sink::set_interlaced_bands(info.interlaced_bands);
             d.set_video_arm(info.video_arm);
             d.set_presence_from_status(info.presence_from_status);
             d.set_connectors(info.connectors);
@@ -2990,13 +3072,47 @@ mod tests {
     }
 
     #[test]
-    fn video_content_nonce_matches_golden_vectors() {
-        // Golden vectors cover each head's video seal channel.
-        let h0 = cp::video_content_nonce(&[0xa1, 0x2b, 0xaa, 0xb7, 0x0e, 0x0b, 0x02, 0x74], 0);
+    fn stream_content_nonce_matches_golden_vectors() {
+        // Ridge: each head's video stream is `0x08 | head`.
+        let h0 = cp::stream_content_nonce(&[0xa1, 0x2b, 0xaa, 0xb7, 0x0e, 0x0b, 0x02, 0x74], 0x08);
         assert_eq!(h0, [0xa1, 0x2b, 0xaa, 0xb7, 0x0e, 0x0b, 0x02, 0x7c]);
 
-        let h1 = cp::video_content_nonce(&[0xd0, 0x2a, 0xc0, 0x83, 0xb6, 0x42, 0x72, 0x57], 1);
+        let h1 = cp::stream_content_nonce(&[0xd0, 0x2a, 0xc0, 0x83, 0xb6, 0x42, 0x72, 0x57], 0x09);
         assert_eq!(h1, [0xd0, 0x2a, 0xc0, 0x83, 0xb6, 0x42, 0x72, 0x5e]);
+
+        // Navarro: the RIV each connector's SKE_Send_Eks delivered, and the AES-CTR nonce the
+        // dock then expects for that connector's stream.
+        let riv = [0x7d, 0x2c, 0xb6, 0x6b, 0x2c, 0xd1, 0x75, 0x7c];
+        let link = cp::stream_content_nonce(&riv, 0x04);
+        assert_eq!(link, [0x7d, 0x2c, 0xb6, 0x6b, 0x2c, 0xd1, 0x75, 0x78]);
+
+        let c0 = cp::stream_content_nonce(&[0xc3, 0x45, 0xfe, 0x55, 0x93, 0x61, 0x39, 0x01], 0x07);
+        assert_eq!(c0, [0xc3, 0x45, 0xfe, 0x55, 0x93, 0x61, 0x39, 0x06]);
+
+        let c1 = cp::stream_content_nonce(&[0x94, 0x46, 0xc8, 0x3d, 0xa5, 0xfa, 0x39, 0xe3], 0x0f);
+        assert_eq!(c1, [0x94, 0x46, 0xc8, 0x3d, 0xa5, 0xfa, 0x39, 0xec]);
+    }
+
+    #[test]
+    fn stream_ids_follow_the_dock_profile() {
+        use core::sync::atomic::Ordering;
+        let saved_shift = video::wht::HEAD_SUB_SHIFT.load(Ordering::Acquire);
+        let saved_mask = video::wht::STREAM_ID_MASK.load(Ordering::Acquire);
+
+        drm_sink::set_head_sub_shift(PROFILE_D6000.head_sub_shift);
+        drm_sink::set_stream_id_mask(PROFILE_D6000.stream_id_mask);
+        assert_eq!(video::wht::stream_id(0), 0x0008);
+        assert_eq!(video::wht::stream_id(1), 0x0009);
+
+        drm_sink::set_head_sub_shift(PROFILE_DL7400.head_sub_shift);
+        drm_sink::set_stream_id_mask(PROFILE_DL7400.stream_id_mask);
+        assert_eq!(video::wht::stream_id(0), 0x0007);
+        assert_eq!(video::wht::stream_id(1), 0x000f);
+        assert_eq!(video::wht::stream_id(2), 0x0017);
+        assert_eq!(video::wht::stream_id(3), 0x001f);
+
+        drm_sink::set_head_sub_shift(saved_shift);
+        drm_sink::set_stream_id_mask(saved_mask);
     }
 
     #[test]
@@ -3030,18 +3146,11 @@ mod tests {
             (0x05, 48),
         ];
         // Finalization bodies contain 32 bytes of content and a 16-byte tag. Keep one fingerprint
-        // per `CP_SETUP_FINALIZE` entry so table growth cannot cause an out-of-bounds test access.
-        const FINALIZE_FINGERPRINT: [(u16, usize); 6] = [
-            (0x08, 48),
-            (0x09, 48),
-            (0x08, 48),
-            (0x08, 48),
-            (0x09, 48),
-            (0x08, 48),
-        ];
-        // Keep the fingerprint table and the burst table in lockstep: growing one without the
+        // per step so table growth cannot cause an out-of-bounds test access.
+        const FINALIZE_FINGERPRINT: [(u16, usize); 3] = [(0x08, 48), (0x09, 48), (0x08, 48)];
+        // Keep the fingerprint table and the step table in lockstep: growing one without the
         // other is exactly the defect above.
-        build_assert!(FINALIZE_FINGERPRINT.len() == cp::CP_SETUP_FINALIZE.len());
+        build_assert!(FINALIZE_FINGERPRINT.len() == cp::CP_SETUP_FINALIZE_STEPS.len());
 
         let ks = [0x5au8; 16];
         let riv = [0x11u8; 8];
@@ -3052,7 +3161,7 @@ mod tests {
             assert_eq!(frame.len(), 16 + want_body);
             assert_eq!(u16::from_le_bytes([frame[10], frame[11]]), want_aux);
         }
-        for (i, &(id, _sub, _off22)) in cp::CP_SETUP_FINALIZE.iter().enumerate() {
+        for (i, &(id, _sub)) in cp::CP_SETUP_FINALIZE_STEPS.iter().enumerate() {
             let frame = cp::seal_interactive(&ks, &riv, id, 0, &[0u8; 32])?;
             let (want_aux, want_body) = FINALIZE_FINGERPRINT[i];
             assert_eq!(frame.len(), 16 + want_body);
@@ -3131,20 +3240,21 @@ mod tests {
     }
 
     #[test]
-    fn navarro_stream_open_matches_live_sealer_input() {
-        // DLM's live AES-CTR entry sees exactly these fourteen bytes. The connector lives solely
-        // in the wire sub, never in an invented token or normal CP `[id, sub, counter]` layout.
-        assert_eq!(
-            cp::navarro_stream_open(),
-            [
-                0x04, 0x00, 0x08, 0x04, 0x05, 0x00, 0x06, 0x00, 0x07, 0x01, 0x08, 0x02, 0x07,
-                0x00,
-            ]
-        );
-        assert_eq!(cp::navarro_stream_open_sub(0), 0x0007);
-        assert_eq!(cp::navarro_stream_open_sub(1), 0x000f);
-        assert_eq!(cp::navarro_stream_open_sub(2), 0x0017);
-        assert_eq!(cp::navarro_stream_open_sub(3), 0x001f);
+    fn navarro_stream_open_matches_the_wire() -> Result {
+        // The connector lives solely in the wire sub, never in the content: all four connectors
+        // send the same marker, followed by a two-byte opaque tail.
+        let open = cp::navarro_stream_open();
+        assert_eq!(open.len(), 16);
+        assert_eq!(open[..14], cp::NAVARRO_STREAM_MARKER);
+
+        // Sealing it produces the 48-byte frame the dock is sent: a 16-byte header, the 16-byte
+        // ciphertext and a 16-byte Dl3Cmac, with `size` covering all but the first four bytes.
+        let frame = cp::seal_video_arm(&[0u8; 16], &[0u8; 8], 0x0007, 0x0002, 0, &open)?;
+        assert_eq!(frame.len(), 48);
+        assert_eq!(u16::from_le_bytes([frame[2], frame[3]]), 0x002c);
+        assert_eq!(u16::from_le_bytes([frame[8], frame[9]]), 0x0007);
+        assert_eq!(u16::from_le_bytes([frame[10], frame[11]]), 0x0002);
+        Ok(())
     }
 
     #[test]
@@ -3837,6 +3947,63 @@ mod tests {
         assert_eq!(&config[10..14], &[0x80, 0x07, 0x38, 0x04]);
         assert_eq!(&config[18..22], &[0x80, 0x07, 0x38, 0x04]);
         assert_eq!(&config[1090..], &nonce);
+        Ok(())
+    }
+
+    #[test]
+    fn navarro_pipe_descriptor_matches_authenticated_capture() -> Result {
+        // Slot ids and the three dock-side addresses of every record, for both connectors of the
+        // authenticated capture.
+        for (connector, slots) in [
+            (0u8, [
+                (0x0000u16, 0x6fccu32, 0x71fb_9000u32, 0x7216_6000u32),
+                (0x0001, 0x6db0, 0x71fb_4000, 0x7215_e000),
+                (0x0002, 0x6b94, 0x71fa_f000, 0x7215_6000),
+                (0x0003, 0x6978, 0x71fa_a000, 0x7214_e000),
+                (0x0004, 0x675c, 0x71fa_5000, 0x7214_6000),
+                (0x0005, 0x6540, 0x71fa_0000, 0x7213_e000),
+            ]),
+            (1u8, [
+                (0x0008, 0x5eec, 0x71f9_b000, 0x7213_6000),
+                (0x0009, 0x5cd0, 0x71f9_6000, 0x7212_e000),
+                (0x000a, 0x5ab4, 0x71f9_1000, 0x7212_6000),
+                (0x000b, 0x5898, 0x71f8_c000, 0x7211_e000),
+                (0x000c, 0x567c, 0x71f8_7000, 0x7211_6000),
+                (0x000d, 0x5460, 0x71f8_2000, 0x7210_e000),
+            ]),
+        ] {
+            let descriptor = cp::navarro_pipe_descriptor(connector)?;
+            assert_eq!(descriptor.len(), 304);
+            assert_eq!(&descriptor[..14], &cp::NAVARRO_STREAM_MARKER);
+            for (index, &(slot, ring, plane0, plane1)) in slots.iter().enumerate() {
+                let at = 14 + index * 46;
+                assert_eq!(&descriptor[at..at + 4], &[0x2c, 0x00, 0x0e, 0x00]);
+                assert_eq!(
+                    u16::from_le_bytes([descriptor[at + 4], descriptor[at + 5]]),
+                    slot
+                );
+                let cfg = &descriptor[at + 6..at + 46];
+                let word = |o: usize| {
+                    u32::from_le_bytes([cfg[o], cfg[o + 1], cfg[o + 2], cfg[o + 3]])
+                };
+                assert_eq!(word(12), ring);
+                assert_eq!(word(18), plane0);
+                assert_eq!(word(26), plane1);
+            }
+        }
+
+        // The decoder configuration is the same message Ridge sends, with the DL7400's layout word.
+        let tail = [0x5a; 14];
+        let config = video_arm::build_with_layout_word(2560, 1440, 0x2100, &tail)?;
+        assert_eq!(config.len(), 1104);
+        assert_eq!(
+            &config[..26],
+            &[
+                0x18, 0x00, 0x0b, 0x03, 0x04, 0x02, 0x02, 0x00, 0x02, 0x00, 0x00, 0x0a, 0xa0,
+                0x05, 0x00, 0x21, 0x02, 0x00, 0x00, 0x0a, 0xa0, 0x05, 0x00, 0x21, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(&config[1090..], &tail);
         Ok(())
     }
 }

@@ -461,10 +461,69 @@ pub(crate) mod wht {
         }
     }
 
-    /// Number of blocks across a 64-px-wide strip and the rows of blocks within its 16-px height.
-    const STRIP_BLOCKS_X: usize = 8;
-    const STRIP_ROW_BLOCKS: usize = 8; // blocks in one 8-row half (8 across x 1 down)
-    const STRIP_BLOCKS: usize = 16; // 8 across x 2 down
+    /// A strip is always [`STRIP_BLOCKS`] blocks of `DIM` x `DIM`, and the coder always splits it
+    /// into two halves of [`STRIP_ROW_BLOCKS`]. The docks differ only in how those blocks are laid
+    /// over pixels: Ridge puts them 8 across x 2 down (64x16), the DL7400 16 across x 1 down
+    /// (128x8). Same block count, same coded strip, different geometry -- so this is one parameter
+    /// rather than a second codec, carried as the shifts below.
+    /// Strip width and height as shifts. A strip is always a power of two in each direction, so
+    /// every geometry query is a shift or a mask: dividing by a value the compiler cannot bound
+    /// would put a panic path into the codec's hot functions.
+    pub(crate) static STRIP_W_SHIFT: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(6); // 64 px
+    pub(crate) static STRIP_H_SHIFT: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(4); // 16 px
+    const STRIP_ROW_BLOCKS: usize = 8; // blocks in one coded half
+    const STRIP_BLOCKS: usize = 16;
+
+    /// Whether image records are emitted with even y-bands before odd ones.
+    ///
+    /// Ridge sends them in raster order; the DL7400 interlaces, which its own records show as a
+    /// y sequence of 0, 16, 32 ... over 8-row strips before it returns for 8, 24, 40 ...
+    ///
+    /// `false` -- the Ridge order -- is the default, so a profile that says nothing is unchanged.
+    pub(crate) static INTERLACED_BANDS: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// Set the band order for this dock; see [`INTERLACED_BANDS`].
+    pub(crate) fn set_interlaced_bands(on: bool) {
+        INTERLACED_BANDS.store(on, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether image records interlace y bands on this dock; see [`INTERLACED_BANDS`].
+    #[inline]
+    pub(crate) fn interlaced_bands() -> bool {
+        INTERLACED_BANDS.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set the strip block layout for this dock; see [`STRIP_W_SHIFT`].
+    ///
+    /// `across` must divide [`STRIP_BLOCKS`]; anything else is ignored, leaving the layout the
+    /// dock already had rather than producing a strip that is not a whole number of blocks.
+    pub(crate) fn set_strip_blocks_x(across: usize) {
+        let (w_shift, h_shift) = match across {
+            8 => (6, 4),   // 64 x 16
+            16 => (7, 3),  // 128 x 8
+            _ => return,
+        };
+        STRIP_W_SHIFT.store(w_shift, core::sync::atomic::Ordering::Release);
+        STRIP_H_SHIFT.store(h_shift, core::sync::atomic::Ordering::Release);
+    }
+
+    /// `log2` of the strip width and height; see [`STRIP_W_SHIFT`].
+    #[inline]
+    pub(crate) fn strip_w_shift() -> u32 {
+        STRIP_W_SHIFT.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// See [`strip_w_shift`].
+    #[inline]
+    pub(crate) fn strip_h_shift() -> u32 {
+        STRIP_H_SHIFT.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// `log2(DIM)`, so a block index splits into (x, y) by shift and mask rather than division.
+    const DIM_SHIFT: u32 = 3;
 
     /// Round a byte count up to an even number (every coder sub-region is even-aligned).
     fn round_even(n: usize) -> usize {
@@ -703,15 +762,31 @@ pub(crate) mod wht {
         Ok(out)
     }
 
-    /// Strip pixel geometry: a strip is 64 px wide and 16 px tall
-    /// (`STRIP_BLOCKS_X * DIM` x `2 * DIM`).
-    pub(crate) const STRIP_W: usize = STRIP_BLOCKS_X * DIM; // 64
-    pub(crate) const STRIP_H: usize = 2 * DIM; // 16
+    /// Strip pixel geometry: [`strip_blocks_x`] blocks across, the rest down, each `DIM` square.
+    /// Ridge is 64x16 and the DL7400 128x8.
+    #[inline]
+    pub(crate) fn strip_w() -> usize {
+        1usize << strip_w_shift()
+    }
 
-    /// Damage macro-tile: 256x64 pixels, or 4x4 strips. A touched macro-tile must be resent in full
-    /// because the dock rotates its backing buffers at this granularity.
-    pub(crate) const MACRO_W: usize = 4 * STRIP_W; // 256
-    pub(crate) const MACRO_H: usize = 4 * STRIP_H; // 64
+    /// Strip height in pixels; see [`strip_w`].
+    #[inline]
+    pub(crate) fn strip_h() -> usize {
+        1usize << strip_h_shift()
+    }
+
+    /// Damage macro-tile: 4x4 strips. A touched macro-tile must be resent in full because the dock
+    /// rotates its backing buffers at this granularity.
+    #[inline]
+    pub(crate) fn macro_w() -> usize {
+        4 * strip_w()
+    }
+
+    /// Damage macro-tile height; see [`macro_w`].
+    #[inline]
+    pub(crate) fn macro_h() -> usize {
+        4 * strip_h()
+    }
 
     /// Gather one 64x16 strip's 16 colour blocks from a pixel source. `px(x, y)` returns the
     /// 8-bit `(R, G, B)` at absolute frame coordinate `(x, y)`; `(ox, oy)` is the strip's
@@ -730,7 +805,8 @@ pub(crate) mod wht {
     ) -> Result<KVec<ColourBlock>> {
         let mut blocks = KVec::with_capacity(STRIP_BLOCKS, GFP_KERNEL)?;
         for k in 0..STRIP_BLOCKS {
-            let (bx, by) = (k % STRIP_BLOCKS_X, k / STRIP_BLOCKS_X);
+            let across_shift = strip_w_shift() - DIM_SHIFT;
+            let (bx, by) = (k & ((1usize << across_shift) - 1), k >> across_shift);
             // One `px` call per pixel, in the same row-major order as before -- it is the
             // expensive accessor, so the converted values are gathered once and then split into
             // the three planes. `from_fn` avoids the zeroing that filling `[0i32; PIXELS]`
@@ -775,7 +851,7 @@ pub(crate) mod wht {
         interlaced: bool,
         mut px: impl FnMut(usize, usize) -> (u8, u8, u8),
     ) -> Result<(KVec<KVec<u8>>, u32)> {
-        if width % STRIP_W != 0 || height % STRIP_H != 0 {
+        if width & (strip_w() - 1) != 0 || height & (strip_h() - 1) != 0 {
             return Err(kernel::error::code::EINVAL);
         }
         // Build every strip body (raster order; each strip's natural row1 tail, no echo).
@@ -786,9 +862,9 @@ pub(crate) mod wht {
             while sx < width {
                 let blocks = colour_strip_blocks(sx, sy, &mut px)?;
                 strips.push(colour_strip(&blocks, sx as u16, sy as u16)?, GFP_KERNEL)?;
-                sx += STRIP_W;
+                sx += strip_w();
             }
-            sy += STRIP_H;
+            sy += strip_h();
         }
         Ok((
             frame_records(&strips, head, band_parity, interlaced)?,
@@ -808,7 +884,7 @@ pub(crate) mod wht {
         band_parity: bool,
         interlaced: bool,
     ) -> Result<KVec<KVec<u8>>> {
-        if width % STRIP_W != 0 || height % STRIP_H != 0 {
+        if width & (strip_w() - 1) != 0 || height & (strip_h() - 1) != 0 {
             return Err(kernel::error::code::EINVAL);
         }
         let mut blocks: KVec<ColourBlock> = KVec::with_capacity(STRIP_BLOCKS, GFP_KERNEL)?;
@@ -831,9 +907,9 @@ pub(crate) mod wht {
             let mut sx = 0usize;
             while sx < width {
                 strips.push(colour_strip(&blocks, sx as u16, sy as u16)?, GFP_KERNEL)?;
-                sx += STRIP_W;
+                sx += strip_w();
             }
-            sy += STRIP_H;
+            sy += strip_h();
         }
         frame_records(&strips, head, band_parity, interlaced)
     }
@@ -872,17 +948,17 @@ pub(crate) mod wht {
         while sy < height {
             let mut sx = 0usize;
             while sx < width {
-                let mx = (sx / MACRO_W) * MACRO_W;
-                let my = (sy / MACRO_H) * MACRO_H;
+                let mx = sx & !(macro_w() - 1);
+                let my = sy & !(macro_h() - 1);
                 let hit = clips.iter().any(|&(x0, y0, x1, y1)| {
-                    mx < x1 && x0 < mx + MACRO_W && my < y1 && y0 < my + MACRO_H
+                    mx < x1 && x0 < mx + macro_w() && my < y1 && y0 < my + macro_h()
                 });
                 if hit {
                     coords.push((sx, sy), GFP_KERNEL)?;
                 }
-                sx += STRIP_W;
+                sx += strip_w();
             }
-            sy += STRIP_H;
+            sy += strip_h();
         }
         Ok(coords)
     }
@@ -895,9 +971,9 @@ pub(crate) mod wht {
             let mut sx = 0usize;
             while sx < width {
                 coords.push((sx, sy), GFP_KERNEL)?;
-                sx += STRIP_W;
+                sx += strip_w();
             }
-            sy += STRIP_H;
+            sy += strip_h();
         }
         Ok(coords)
     }
@@ -908,7 +984,7 @@ pub(crate) mod wht {
     /// `clips` are `(x0, y0, x1, y1)` half-open rectangles in output/source pixels (identity
     /// rotation only -- the caller sends a full [`colour_frame_ep08`] otherwise). A strip at
     /// `(sx, sy)` is included iff some clip overlaps
-    /// `[sx, sx+STRIP_W) x [sy, sy+STRIP_H)`. Raster iteration keeps strips
+    /// `[sx, sx+strip_w()) x [sy, sy+strip_h())`. Raster iteration keeps strips
     /// x-ordered within each y-band, so [`frame_records`] groups them as the
     /// full-frame path does. Returns an **empty** frame list when no strip is
     /// touched -- the caller must skip the USB write in that case (no-op
@@ -927,7 +1003,7 @@ pub(crate) mod wht {
         interlaced: bool,
         mut px: impl FnMut(usize, usize) -> (u8, u8, u8),
     ) -> Result<(KVec<KVec<u8>>, u32)> {
-        if width % STRIP_W != 0 || height % STRIP_H != 0 {
+        if width & (strip_w() - 1) != 0 || height & (strip_h() - 1) != 0 {
             return Err(kernel::error::code::EINVAL);
         }
         let coords = damage_strip_coords(width, height, clips)?;
@@ -969,6 +1045,7 @@ pub(crate) mod wht {
         band_parity_bit: bool,
         interlaced_bands: bool,
     ) -> Result<KVec<KVec<u8>>> {
+        let aux_is_pad_count = aux_is_pad_count();
         const PREFIX: usize = 8;
         const STRIDE_CAP: usize = 0x0ff0;
         // Allocation boundary only, not wire framing.
@@ -980,7 +1057,7 @@ pub(crate) mod wht {
         if interlaced_bands {
             for pass in 0..2u16 {
                 for (n, s) in strips.iter().enumerate() {
-                    if (strip_y(s) / STRIP_H as u16) & 1 == pass {
+                    if (strip_y(s) >> strip_h_shift()) & 1 == pass {
                         order.push(n, GFP_KERNEL)?;
                     }
                 }
@@ -998,11 +1075,16 @@ pub(crate) mod wht {
             // profile requires it.
             record.extend_from_slice(&[0u8; 8 + PREFIX], GFP_KERNEL)?;
             record[4..8].copy_from_slice(&4u32.to_le_bytes());
-            let parity = u16::from(band_parity_bit) & ((y0 / STRIP_H as u16) & 1);
+            let parity = u16::from(band_parity_bit) & ((y0 >> strip_h_shift()) & 1);
             let sub = head_sub(head) as u16 | (parity << 4);
             record[8..10].copy_from_slice(&sub.to_le_bytes());
             let mut n = 0usize;
-            while i < order.len() && strip_y(&strips[order[i]]) == y0 {
+            // A record ends at a y-band boundary only where the band is part of its identity.
+            // Ridge carries the band parity in `sub`, so a record cannot span two bands; Navarro
+            // does not, and fills each record to the stride cap instead.
+            while i < order.len()
+                && (!band_parity_bit || strip_y(&strips[order[i]]) == y0)
+            {
                 let s = &strips[order[i]];
                 let projected = record.len() + 2 + s.len();
                 let projected_aligned = (projected + 15) & !15;
@@ -1014,11 +1096,17 @@ pub(crate) mod wht {
                 n += 1;
                 i += 1;
             }
-            // The wire format pads each complete record stride to 16 bytes and carries that count
-            // in `aux`. There is no additional trailer or inter-record gap: `size` counts from
-            // after the four-byte pad+size prefix, so `stride = size + 4` lands on the next record.
+            // The wire format pads each complete record stride to 16 bytes. There is no
+            // additional trailer or inter-record gap: `size` counts from after the four-byte
+            // pad+size prefix, so `stride = size + 4` lands on the next record.
+            //
+            // Ridge carries the pad count in `aux`. Navarro does not: there `aux` names a record
+            // type, and every one of its image records carries zero, so a pad count written there
+            // would be read as some other kind of record entirely.
             let pad = (16 - (record.len() & 15)) & 15;
-            record[10..12].copy_from_slice(&(pad as u16).to_le_bytes());
+            if aux_is_pad_count {
+                record[10..12].copy_from_slice(&(pad as u16).to_le_bytes());
+            }
             record.extend_from_slice(&[0u8; 15][..pad], GFP_KERNEL)?;
             let size = (record.len() - 4) as u16;
             record[2..4].copy_from_slice(&size.to_le_bytes());
@@ -1061,12 +1149,136 @@ pub(crate) mod wht {
         head << HEAD_SUB_SHIFT.load(core::sync::atomic::Ordering::Acquire)
     }
 
+    /// The bits a head's stream id sets over its record `sub`.
+    ///
+    /// A dock names each video stream by its head's record `sub` with a fixed low pattern set:
+    /// Ridge uses `0x08 | head`, Navarro `(connector << 3) | 7`. The same id is the wire `sub` of
+    /// the stream's control records, the value its `RepeaterAuth_Stream_Manage` restatement
+    /// declares, and the byte-7 tweak deriving the stream's AES-CTR nonce from its SKE RIV.
+    ///
+    /// `0x08`, the Ridge encoding, is the default so that a profile which says nothing keeps the
+    /// behaviour it had.
+    pub(crate) static STREAM_ID_MASK: core::sync::atomic::AtomicU8 =
+        core::sync::atomic::AtomicU8::new(0x08);
+
+    /// Whether an image record's `sub` carries the y-band parity in bit 4.
+    ///
+    /// Ridge does, which also means one of its records can never span two bands. Navarro's image
+    /// records carry only the connector, and fill to the stride cap across band boundaries.
+    ///
+    /// `true` -- the Ridge encoding -- is the default, so a profile that says nothing is unchanged.
+    pub(crate) static BAND_PARITY_BIT: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(true);
+
+    /// Whether an image record's `aux` carries its zero-padding count.
+    ///
+    /// Ridge counts the 0..15 bytes each record is padded by. Navarro uses `aux` to name a record
+    /// type instead, and every one of its image records carries zero there.
+    ///
+    /// `true` -- the Ridge encoding -- is the default, so a profile that says nothing is unchanged.
+    pub(crate) static AUX_IS_PAD_COUNT: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(true);
+
+    /// Set the record-`aux` meaning for this dock; see [`AUX_IS_PAD_COUNT`].
+    pub(crate) fn set_aux_is_pad_count(on: bool) {
+        AUX_IS_PAD_COUNT.store(on, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether image records report their padding in `aux`; see [`AUX_IS_PAD_COUNT`].
+    #[inline]
+    pub(crate) fn aux_is_pad_count() -> bool {
+        AUX_IS_PAD_COUNT.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set the band encoding for this dock; see [`BAND_PARITY_BIT`].
+    pub(crate) fn set_band_parity_bit(on: bool) {
+        BAND_PARITY_BIT.store(on, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether image records key on the y band on this dock; see [`BAND_PARITY_BIT`].
+    #[inline]
+    pub(crate) fn band_parity_bit() -> bool {
+        BAND_PARITY_BIT.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set the stream-id encoding for this dock; see [`STREAM_ID_MASK`].
+    pub(crate) fn set_stream_id_mask(mask: u8) {
+        STREAM_ID_MASK.store(mask, core::sync::atomic::Ordering::Release);
+    }
+
+    /// The content-stream id of `head` on this dock; see [`STREAM_ID_MASK`].
+    #[inline]
+    pub(crate) fn stream_id(head: u8) -> u16 {
+        (head_sub(head) | STREAM_ID_MASK.load(core::sync::atomic::Ordering::Acquire)) as u16
+    }
+
+    /// A frame's closing records.
+    ///
+    /// The two platforms delimit a frame with a different number of records, so this carries its
+    /// own length and derefs to exactly the bytes that go on the wire.
+    pub(crate) struct FrameTrailer {
+        bytes: [u8; 96],
+        len: usize,
+    }
+
+    impl core::ops::Deref for FrameTrailer {
+        type Target = [u8];
+
+        fn deref(&self) -> &[u8] {
+            &self.bytes[..self.len]
+        }
+    }
+
+    /// The ring slot a frame writes, and the one it writes next.
+    ///
+    /// Both platforms cycle a head's frames through three buffers. Ridge names them by a phase of
+    /// `0`, `2` or `4`; Navarro names the dock-side slot id and address of each.
+    fn ring_phase(seq0: u32) -> (u8, u8) {
+        let phase = ((seq0 % 3) as u8) * 2;
+        (phase, (phase + 2) % 6)
+    }
+
+    /// Build the DL7400's two closing records: the ring slot this frame filled, and the slot the
+    /// next frame will fill. The dock is told each slot's id and its ring address, and the first
+    /// of the pair carries a wrapping one-based frame counter.
+    pub(crate) fn navarro_frame_trailer(connector: u8, seq0: u32) -> FrameTrailer {
+        let (phase, next_phase) = ring_phase(seq0);
+        let slot = super::super::cp::navarro_pipe_slot(connector, u16::from(phase));
+        let next_slot = super::super::cp::navarro_pipe_slot(connector, u16::from(next_phase));
+        let ring = super::super::cp::navarro_pipe_ring(connector, u16::from(phase)) as u16;
+        let next_ring =
+            super::super::cp::navarro_pipe_ring(connector, u16::from(next_phase)) as u16;
+        let sub = u16::from(head_sub(connector));
+
+        let mut out = [0u8; 96];
+        for (i, aux) in [0x0006u16, 0x0004].into_iter().enumerate() {
+            let o = i * 32;
+            out[o + 2] = 0x1c; // size=28 -> 32-byte record
+            out[o + 4] = 0x04; // type=4
+            out[o + 8..o + 10].copy_from_slice(&sub.to_le_bytes());
+            out[o + 10..o + 12].copy_from_slice(&aux.to_le_bytes());
+        }
+
+        // Slot complete: its id, its ring address, and this frame's number.
+        out[16..19].copy_from_slice(&[0x08, 0x00, 0x05]);
+        out[19] = slot as u8;
+        out[22..24].copy_from_slice(&ring.to_le_bytes());
+        out[25] = (seq0 as u8).wrapping_add(1);
+
+        // Next slot: its id and ring address, then the address just completed.
+        out[48..51].copy_from_slice(&[0x0a, 0x00, 0x04]);
+        out[51] = next_slot as u8;
+        out[54..56].copy_from_slice(&next_ring.to_le_bytes());
+        out[58..60].copy_from_slice(&ring.to_le_bytes());
+
+        FrameTrailer { bytes: out, len: 64 }
+    }
+
     /// They delimit every logical frame, including the ARM-prefixed first frame. The first record
     /// carries a wrapping one-based frame counter; all three carry a three-slot phase (`0,2,4`) and
     /// the selected head.
-    pub(crate) fn frame_trailer(head: u8, seq0: u32) -> [u8; 96] {
-        let phase = ((seq0 % 3) as u8) * 2;
-        let next_phase = (phase + 2) % 6;
+    pub(crate) fn frame_trailer(head: u8, seq0: u32) -> FrameTrailer {
+        let (phase, next_phase) = ring_phase(seq0);
         let phase_off = phase * 4;
         let next_off = next_phase * 4;
         let frame_no = (seq0 as u8).wrapping_add(1);
@@ -1097,6 +1309,9 @@ pub(crate) mod wht {
             out[o + 23] = next_off;
             out[o + 27] = phase_off;
         }
-        out
+        FrameTrailer {
+            bytes: out,
+            len: 96,
+        }
     }
 }
