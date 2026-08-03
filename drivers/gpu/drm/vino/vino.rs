@@ -1848,6 +1848,12 @@ impl VinoDriver {
                 const TRIES: usize = 40;
                 let mut last_err = ETIMEDOUT;
                 let mut accepted = false;
+                // Name what the dock is refusing. `control session failed ... (ETIMEDOUT)` is
+                // returned from here, and until this existed it was indistinguishable from a
+                // reply that never arrived -- which sent four commits chasing the wrong half of
+                // the protocol on the D6000. This is the send side: the dock has stopped taking
+                // EP02 writes.
+                let mut nak_reported = false;
                 for _ in 0..TRIES {
                     match dev.ctrl_send(&frame, Delta::from_millis(5), GFP_KERNEL) {
                         Ok(_) => {
@@ -1857,6 +1863,13 @@ impl VinoDriver {
                         // OUT NAK'd (nothing transferred) -- let the dock push on EP84, then retry.
                         Err(e) => {
                             last_err = e;
+                            if !nak_reported {
+                                nak_reported = true;
+                                pr_info!(
+                                    "vino: EP02 NAKed a {} B control frame (cp_ctr={cp_ctr},                                      wseq={wseq}); retrying up to {TRIES}x\n",
+                                    frame.len()
+                                );
+                            }
                             let d = Self::drain_ep84(
                                 dev,
                                 ep84_q.as_mut(),
@@ -1872,6 +1885,10 @@ impl VinoDriver {
                     }
                 }
                 if !accepted {
+                    pr_info!(
+                        "vino: EP02 refused {TRIES} submissions of a {} B frame                          (cp_ctr={cp_ctr}, wseq={wseq}) -- giving up\n",
+                        frame.len()
+                    );
                     return Err(last_err);
                 }
             }
