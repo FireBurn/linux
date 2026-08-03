@@ -2499,7 +2499,13 @@ impl VinoDriver {
             wseq += 2; // 32 B content = 2 AES blocks
         }
         if let Some(queue) = out_q.as_mut() {
-            queue.flush(dev.io(), timeout())?;
+            // Instrumented: `send_cp_setup` returns ETIMEDOUT for Ridge without ever logging
+            // "encrypted control setup complete", while every individual submit and reply match
+            // succeeds. A queue flush waits for outstanding URBs and is the remaining way this
+            // function can time out with nothing else complaining.
+            queue.flush(dev.io(), timeout()).inspect_err(|e| {
+                pr_info!("vino: EP02 queue flush failed ({e:?})\n");
+            })?;
         }
 
         // Ridge commits after finalization. Navarro has already committed at its measured
