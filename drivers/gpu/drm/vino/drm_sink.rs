@@ -3251,6 +3251,16 @@ impl VinoDrmData {
             if prev != 0 {
                 self.downstream_event.store(true, Ordering::Release);
             }
+            // The decoded answer itself, not just the verdict derived from it. Without this a
+            // presence flap can only be read as "monitor disconnected", which says nothing about
+            // whether the dock changed its mind or vino changed the question. It is one line per
+            // *changed* reply per head, so a steady link prints nothing at all.
+            pr_info!(
+                "vino: head {head} presence reply id={id:#06x} status={status:#010x} \
+                 -> present={present} (was id={:#06x} status={:#06x})\n",
+                prev >> 16,
+                prev & 0xffff
+            );
         }
         Some(present)
     }
