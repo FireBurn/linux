@@ -101,20 +101,20 @@ pub(crate) struct DockProfile {
     /// The bits a head's content-stream id sets over its record `sub`.
     ///
     /// Ridge streams are `0x08 | head`, Navarro's `(connector << 3) | 7`. See
-    /// [`video::wht::STREAM_ID_MASK`], which this configures.
+    /// [`video::wht::Geometry::stream_id_mask`], which this configures.
     pub(crate) stream_id_mask: u8,
     /// The connector-count marker byte the per-head `strm2` record carries at offset 24.
     pub(crate) strm2_marker: u8,
     /// Whether an image record's `sub` carries the y-band parity; see
-    /// [`video::wht::BAND_PARITY_BIT`].
+    /// [`video::wht::Geometry::band_parity_bit`].
     pub(crate) band_parity_bit: bool,
     /// Whether an image record's `aux` carries its zero-padding count; see
-    /// [`video::wht::AUX_IS_PAD_COUNT`].
+    /// [`video::wht::Geometry::aux_is_pad_count`].
     pub(crate) aux_is_pad_count: bool,
-    /// Blocks across one strip; see [`video::wht::STRIP_W_SHIFT`]. Ridge lays a strip's sixteen
+    /// Blocks across one strip; see [`video::wht::Geometry`]. Ridge lays a strip's sixteen
     /// blocks 8 across x 2 down (64x16 px), the DL7400 16 across x 1 down (128x8 px).
     pub(crate) strip_blocks_x: usize,
-    /// Whether image records interlace y bands; see [`video::wht::INTERLACED_BANDS`].
+    /// Whether image records interlace y bands; see [`video::wht::Geometry::interlaced_bands`].
     pub(crate) interlaced_bands: bool,
     /// Whether monitor presence must be read from the probe reply's status word rather than from
     /// which handler answered.
@@ -161,6 +161,24 @@ pub(crate) struct DockProfile {
     /// the replies it is waiting for, so a single outstanding read loses the reply it needs. This
     /// is per-profile for that reason and must not be collapsed back to one constant.
     pub(crate) ep84_queue_depth: usize,
+}
+
+impl DockProfile {
+    /// This dock's codec geometry, for the codec calls made before a DRM device exists.
+    ///
+    /// The steady-state path reads `VinoDrmData::geometry()` instead; both describe the same
+    /// dock, and this exists because CP setup names stream ids before the sink is published.
+    pub(crate) fn geometry(&self) -> video::wht::Geometry {
+        video::wht::Geometry::new(
+            self.strip_blocks_x,
+            self.interlaced_bands,
+            self.band_parity_bit,
+            self.aux_is_pad_count,
+            self.head_sub_shift,
+            self.stream_id_mask,
+            self.dock_buffers,
+        )
+    }
 }
 
 /// Dell D6000 and other Ridge-platform docks. HW-verified.
@@ -2048,7 +2066,7 @@ impl VinoDriver {
             // SKE_Send_Eks establishes this head's video key. Store the whitened key and the video
             // nonce derived from the delivered RIV for the scanout arm burst.
             // Layout: key(16) || nonce(8) || pad(8).
-            let stream_id = video::wht::stream_id(head as u8);
+            let stream_id = profile.geometry().stream_id(head as u8);
             video_keys[head] = kernel::crypto::Secret::zeroed();
             // Whether the dock applies the control-plane whitening constant to a per-head SKE key
             // is proven only for the link stream; the per-head rule is carried over from Ridge.
@@ -2428,7 +2446,7 @@ impl VinoDriver {
                 video_keys[head] = kernel::crypto::Secret::zeroed();
                 video_keys[head][..16].copy_from_slice(&session.ks[..]);
                 let vnonce =
-                    cp::stream_content_nonce(&session.riv, video::wht::stream_id(head as u8));
+                    cp::stream_content_nonce(&session.riv, profile.geometry().stream_id(head as u8));
                 video_keys[head][16..24].copy_from_slice(&vnonce);
             }
             pr_info!(
@@ -3387,15 +3405,9 @@ impl usb::Driver for VinoDriver {
                 }
             }
             d.set_video_supported(info.video_supported || forced_supported);
-            drm_sink::set_head_sub_shift(info.head_sub_shift);
-            drm_sink::set_stream_id_mask(info.stream_id_mask);
-            drm_sink::set_band_parity_bit(info.band_parity_bit);
-            drm_sink::set_aux_is_pad_count(info.aux_is_pad_count);
-            drm_sink::set_strip_blocks_x(info.strip_blocks_x);
-            drm_sink::set_interlaced_bands(info.interlaced_bands);
-            drm_sink::set_dock_buffers(info.dock_buffers);
-            // Remember this device's geometry so it can be restored before each of its encodes;
-            // the other dock's probe overwrites these globals. See `VinoDrmData::codec_geometry`.
+            // This device's codec geometry, passed into every codec call made on its behalf.
+            // It is per device because two docks of different generations lay a strip's sixteen
+            // blocks over different pixels; see `video::wht::Geometry`.
             d.set_codec_geometry(
                 info.strip_blocks_x,
                 info.interlaced_bands,
@@ -3737,23 +3749,24 @@ mod tests {
         //         = 2 x 2 macro-tiles, each 4 strips wide x 4 bands = 16 strips.
         let (w, h) = (512usize, 128usize);
         const STRIPS_PER_MACRO: usize = 16;
-        let (full, _) = video::wht::colour_frame_ep08(w, h, 0, 0, true, false, g)?;
+        let geom = PROFILE_D6000.geometry();
+        let (full, _) = video::wht::colour_frame_ep08(geom, w, h, 0, 0, g)?;
 
         // A damage clip covering the WHOLE surface selects every strip in the same raster order as
         // the full-frame path, so the wire bytes are identical.
         let (dfull, _) =
-            video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(0, 0, w, h)], true, false, g)?;
+            video::wht::colour_frame_ep08_damage(geom, w, h, 0, 0, &[(0, 0, w, h)], g)?;
         assert_eq!(flat(&full)?.as_slice(), flat(&dfull)?.as_slice());
 
         // No damage -> no strips -> empty frame list (caller must skip the USB write).
-        let (empty, _) = video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[], true, false, g)?;
+        let (empty, _) = video::wht::colour_frame_ep08_damage(geom, w, h, 0, 0, &[], g)?;
         assert!(empty.is_empty());
 
         // Selection is exact and macro-tile-quantised. Assert the strip COUNT directly (the shared
         // selector both encoders use) as well as the byte totals -- a count is a far sharper
         // statement than "smaller than full", and it is what actually pins the tiling behaviour.
         let coords = |clips: &[(usize, usize, usize, usize)]| -> Result<usize> {
-            Ok(video::wht::damage_strip_coords(w, h, clips)?.len())
+            Ok(video::wht::damage_strip_coords(geom, w, h, clips)?.len())
         };
         assert_eq!(coords(&[])?, 0);
         assert_eq!(coords(&[(0, 0, w, h)])?, 4 * STRIPS_PER_MACRO); // all four macro-tiles
@@ -3761,28 +3774,19 @@ mod tests {
         // A 1-pixel clip lands in ONE macro-tile and selects all 16 of its strips -- not 1.
         assert_eq!(coords(&[(1, 1, 2, 2)])?, STRIPS_PER_MACRO);
         let (d1, _) =
-            video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(1, 1, 2, 2)], true, false, g)?;
+            video::wht::colour_frame_ep08_damage(geom, w, h, 0, 0, &[(1, 1, 2, 2)], g)?;
         assert!(!d1.is_empty());
         assert!(total(&d1) < total(&full));
 
         // A 1-pixel-wide clip down the whole left edge spans the left macro-tile COLUMN: 2 tiles.
         assert_eq!(coords(&[(0, 0, 1, h)])?, 2 * STRIPS_PER_MACRO);
         let (d2, _) =
-            video::wht::colour_frame_ep08_damage(w, h, 0, 0, &[(0, 0, 1, h)], true, false, g)?;
+            video::wht::colour_frame_ep08_damage(geom, w, h, 0, 0, &[(0, 0, 1, h)], g)?;
         assert!(total(&d1) < total(&d2) && total(&d2) < total(&full));
 
         // Non-aligned geometry is rejected (same contract as colour_frame_ep08).
-        assert!(video::wht::colour_frame_ep08_damage(
-            100,
-            32,
-            0,
-            0,
-            &[(0, 0, 1, 1)],
-            true,
-            false,
-            g
-        )
-        .is_err());
+        assert!(video::wht::colour_frame_ep08_damage(geom, 100, 32, 0, 0, &[(0, 0, 1, 1)], g)
+            .is_err());
         Ok(())
     }
 
@@ -3790,11 +3794,12 @@ mod tests {
     fn black_training_frame_matches_captured_1440p_size() -> Result {
         // Captured first writes are 205,696 bytes:
         // 2,560-byte arm prefix + 203,040-byte black image + 96-byte frame trailer.
-        let frame = video::wht::black_frame_ep08(2560, 1440, 0, true, false)?;
+        let geom = PROFILE_D6000.geometry();
+        let frame = video::wht::black_frame_ep08(geom, 2560, 1440, 0)?;
         let image_len = frame.iter().map(|part| part.len()).sum::<usize>();
         assert_eq!(image_len, 203_040);
         assert_eq!(
-            2_560 + image_len + video::wht::frame_trailer(0, 0).len(),
+            2_560 + image_len + video::wht::frame_trailer(geom, 0, 0).len(),
             205_696
         );
         Ok(())
@@ -3926,24 +3931,20 @@ mod tests {
 
     #[test]
     fn stream_ids_follow_the_dock_profile() {
-        use core::sync::atomic::Ordering;
-        let saved_shift = video::wht::HEAD_SUB_SHIFT.load(Ordering::Acquire);
-        let saved_mask = video::wht::STREAM_ID_MASK.load(Ordering::Acquire);
+        // Each dock's ids come from its own geometry value, so the two cannot interfere --
+        // which is the whole reason this is no longer a pair of module-global statics.
+        let ridge = PROFILE_D6000.geometry();
+        assert_eq!(ridge.stream_id(0), 0x0008);
+        assert_eq!(ridge.stream_id(1), 0x0009);
 
-        drm_sink::set_head_sub_shift(PROFILE_D6000.head_sub_shift);
-        drm_sink::set_stream_id_mask(PROFILE_D6000.stream_id_mask);
-        assert_eq!(video::wht::stream_id(0), 0x0008);
-        assert_eq!(video::wht::stream_id(1), 0x0009);
+        let navarro = PROFILE_DL7400.geometry();
+        assert_eq!(navarro.stream_id(0), 0x0007);
+        assert_eq!(navarro.stream_id(1), 0x000f);
+        assert_eq!(navarro.stream_id(2), 0x0017);
+        assert_eq!(navarro.stream_id(3), 0x001f);
 
-        drm_sink::set_head_sub_shift(PROFILE_DL7400.head_sub_shift);
-        drm_sink::set_stream_id_mask(PROFILE_DL7400.stream_id_mask);
-        assert_eq!(video::wht::stream_id(0), 0x0007);
-        assert_eq!(video::wht::stream_id(1), 0x000f);
-        assert_eq!(video::wht::stream_id(2), 0x0017);
-        assert_eq!(video::wht::stream_id(3), 0x001f);
-
-        drm_sink::set_head_sub_shift(saved_shift);
-        drm_sink::set_stream_id_mask(saved_mask);
+        // And the Ridge values are unchanged by having read the Navarro ones.
+        assert_eq!(ridge.stream_id(0), 0x0008);
     }
 
     #[test]
@@ -4736,7 +4737,8 @@ mod tests {
 
     #[test]
     fn video_frame_trailer_matches_dlm_cycle_and_head() {
-        let t0 = video::wht::frame_trailer(0, 0);
+        let geom = PROFILE_D6000.geometry();
+        let t0 = video::wht::frame_trailer(geom, 0, 0);
         assert_eq!(
             &t0[..32],
             &[
@@ -4762,7 +4764,7 @@ mod tests {
             ]
         );
 
-        let t1 = video::wht::frame_trailer(1, 1);
+        let t1 = video::wht::frame_trailer(geom, 1, 1);
         assert_eq!(u16::from_le_bytes([t1[8], t1[9]]), 0x0001);
         assert_eq!(u16::from_le_bytes([t1[32 + 8], t1[32 + 9]]), 0x0001);
         assert_eq!(u16::from_le_bytes([t1[64 + 8], t1[64 + 9]]), 0x0011);

@@ -97,16 +97,6 @@ const BLANK_MARKER_STATE: u8 = 1;
 /// Delay before retrying a transient asynchronous control operation.
 const KMS_RETRY_MS: u32 = 50;
 
-/// Whether image records carry the protocol's y-parity bit in `sub` bit 4.
-fn band_parity_bit() -> bool {
-    super::video::wht::band_parity_bit()
-}
-
-/// Whether image records are emitted with even y-bands before odd ones.
-fn interlaced_bands() -> bool {
-    super::video::wht::interlaced_bands()
-}
-
 /// Maximum number of physical downstream connectors Vino exposes.
 ///
 /// Ridge docks use the first two. Navarro has four physical DP sockets; connectors 0/2 share
@@ -124,36 +114,6 @@ const VIDEO_XFER: usize = 65536;
 /// derivation from the mode is not established.
 const NAVARRO_LAYOUT_WORD: u16 = 0x2100;
 
-/// Re-export so `probe` can set the dock's head encoding without reaching into the codec module.
-pub(crate) fn set_head_sub_shift(shift: u8) {
-    super::video::wht::set_head_sub_shift(shift);
-}
-
-/// Re-export so `probe` can set the dock's stream-id encoding the same way.
-pub(crate) fn set_stream_id_mask(mask: u8) {
-    super::video::wht::set_stream_id_mask(mask);
-}
-
-/// Re-export so `probe` can set the dock's image-record band encoding the same way.
-pub(crate) fn set_band_parity_bit(on: bool) {
-    super::video::wht::set_band_parity_bit(on);
-}
-
-/// Re-export so `probe` can set what an image record's `aux` means on this dock.
-pub(crate) fn set_aux_is_pad_count(on: bool) {
-    super::video::wht::set_aux_is_pad_count(on);
-}
-
-/// Re-export so `probe` can set the dock's strip geometry and band order.
-pub(crate) fn set_strip_blocks_x(n: usize) {
-    super::video::wht::set_strip_blocks_x(n);
-}
-
-/// Re-export so `probe` can set the dock's image-record band order.
-pub(crate) fn set_interlaced_bands(on: bool) {
-    super::video::wht::set_interlaced_bands(on);
-}
-
 /// Maximum number of individual frame-damage rectangles re-converted per flip before they are
 /// collapsed into a single bounding box. Bounds the stack array used on the atomic-commit path
 /// (no per-flip allocation); a compositor that reports more clips than this just gets a coarser
@@ -165,79 +125,20 @@ const FRAME_PERIOD_MS: i64 = 5;
 /// and forced a 1 ms minimum sleep, so a frame could wait materially longer than the window.
 const FRAME_PERIOD_US: i64 = FRAME_PERIOD_MS * 1000;
 
-/// How deep the dock's presentation ring is -- how many distinct buffers a strip must be written
-/// into before every one of them holds the new pixels.
+/// How many consecutive frames must carry a strip after its content changes, so that every one of
+/// the dock's buffers receives it.
 ///
-/// Ridge is double buffered. The DL7400 rotates **three** slots: `video::wht::ring_phase()` steps
-/// `seq0 % 3` and the pipe descriptor names three ring addresses.
+/// The ring depth (`Geometry::dock_buffers`: Ridge 2, DL7400 3) is the theoretical minimum; a
+/// window drag still left an occasional stale frame at exactly the minimum, so this carries one
+/// frame of margin for a presentation the dock drops or applies to the buffer it just used.
 ///
 /// ⚠ This was a hardcoded 2 until 2026-08-03, which silently left one of the DL7400's three slots
 /// holding stale pixels on every keyframe. Because the dock scans the slots in turn, a strip
 /// present in two of three ghosts -- the panel alternates between new and old content -- which is
 /// invisible to any analysis that decodes the wire, since the *bytes* are correct.
-static DOCK_BUFFERS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(2);
-
-/// Serialises "restore this device's codec geometry, then encode with it".
-///
-/// The geometry lives in module-global statics, so restoring it before an encode is only correct
-/// while no other device is doing the same thing. Two docks of different generations encoding
-/// concurrently interleave their writes and each other's frames come out in the wrong strip
-/// layout -- Ridge 64x16 against Navarro 128x8. Measured: the DL7400's delivered pixels went from
-/// a residual of 0.47 to 22.21 once a D6000 was bound alongside it.
-///
-/// ⚠ This is a stopgap for the shape of the state, not a fix for it. The right change is to pass
-/// geometry into the codec instead of keeping it in globals; then no serialisation is needed and
-/// the two docks encode in parallel again.
-static ENCODE_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// Held for the duration of one device's encode; see [`ENCODE_BUSY`].
-struct EncodeGeometryGuard;
-
-impl EncodeGeometryGuard {
-    /// Waits for any other device's encode to finish, then applies `data`'s geometry.
-    fn acquire(data: &VinoDrmData) -> Self {
-        while ENCODE_BUSY
-            .compare_exchange(
-                false,
-                true,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            fsleep(Delta::from_micros(200));
-        }
-        data.apply_codec_geometry();
-        Self
-    }
-}
-
-impl Drop for EncodeGeometryGuard {
-    fn drop(&mut self) {
-        ENCODE_BUSY.store(false, Ordering::Release);
-    }
-}
-
-/// Record how many buffers this dock rotates; see [`DOCK_BUFFERS`].
-pub(super) fn set_dock_buffers(n: u8) {
-    DOCK_BUFFERS.store(n.max(1), Ordering::Release);
-}
-
-/// The dock's ring depth; see [`DOCK_BUFFERS`].
 #[inline]
-fn dock_buffers() -> u8 {
-    DOCK_BUFFERS.load(Ordering::Acquire)
-}
-
-/// How many consecutive frames must carry a strip after its content changes, so that every one of
-/// the dock's buffers receives it.
-///
-/// The ring depth is the theoretical minimum; a window drag still left an occasional stale frame
-/// at exactly the minimum, so this carries one frame of margin for a presentation the dock drops
-/// or applies to the buffer it just used.
-#[inline]
-fn damage_repeats() -> u8 {
-    dock_buffers().saturating_add(1)
+fn damage_repeats(geom: super::video::wht::Geometry) -> u8 {
+    geom.dock_buffers.saturating_add(1)
 }
 /// Activation timing relative to the mode-set submission.
 const PROMPT_VIDEO_MS: i64 = 110;
@@ -966,16 +867,15 @@ pub(super) struct VinoDrmData {
     /// control session, EDID, modes, hotplug -- works either way, and a dock that resets every few
     /// seconds cannot be developed against at all.
     video_supported: core::sync::atomic::AtomicBool,
-    /// This device's codec geometry, mirrored so it can be re-applied before every encode.
+    /// This device's codec geometry, packed; see [`VinoDrmData::geometry`] and
+    /// [`super::video::wht::Geometry`].
     ///
-    /// ⚠ The codec's geometry lives in module-global statics (`STRIP_W_SHIFT`, `STRIP_H_SHIFT`,
-    /// `INTERLACED_BANDS`, `BAND_PARITY_BIT`, `AUX_IS_PAD_COUNT`, `HEAD_SUB_SHIFT`,
-    /// `STREAM_ID_MASK`, `DOCK_BUFFERS`), set once per probe. With a Ridge dock and a DL7400 bound
-    /// at the same time, whichever probed last wins and the other encodes with the wrong geometry:
-    /// Ridge lays 16 blocks 8 across x 2 down over 64x16 px, Navarro 16 across x 1 down over
-    /// 128x8. Measured consequence -- the D6000 was fed Navarro-shaped records, answered
-    /// `head=0 endpoint=0x08 stopped accepting video`, and **reset itself**, looping its whole
-    /// bring-up every ~8 s.
+    /// ⚠ This used to be *module-global* state the codec read directly. With a Ridge dock and a
+    /// DL7400 bound at the same time, whichever probed last won and the other encoded with the
+    /// wrong geometry: Ridge lays 16 blocks 8 across x 2 down over 64x16 px, Navarro 16 across x
+    /// 1 down over 128x8. Measured consequence -- the D6000 was fed Navarro-shaped records,
+    /// answered `head=0 endpoint=0x08 stopped accepting video`, and **reset itself**, looping its
+    /// whole bring-up every ~8 s.
     codec_geometry: core::sync::atomic::AtomicU32,
     /// Whether to prefix the cold ARM burst to the first frame; see `DockProfile::video_arm`.
     video_arm: core::sync::atomic::AtomicBool,
@@ -1383,7 +1283,7 @@ impl VinoDrmData {
         self.video_supported.load(Ordering::Acquire)
     }
 
-    /// Remember this device's codec geometry so [`Self::apply_codec_geometry`] can restore it.
+    /// Record this device's codec geometry; see [`Self::geometry`].
     pub(super) fn set_codec_geometry(
         &self,
         strip_blocks_x: usize,
@@ -1405,22 +1305,28 @@ impl VinoDrmData {
             .store(packed | 0x8000, core::sync::atomic::Ordering::Release);
     }
 
-    /// Re-apply this device's geometry to the codec's globals before encoding for it.
+    /// This device's codec geometry, to be passed into every codec call made on its behalf.
     ///
-    /// Called on every encode rather than once at probe, because the other dock's probe may have
-    /// overwritten the globals in between. See [`Self::codec_geometry`].
-    pub(super) fn apply_codec_geometry(&self) {
+    /// Stored packed rather than as the struct itself because the DRM device allocation is
+    /// pin-initialised before `probe` knows which dock it matched; unpacking is a handful of
+    /// shifts and every encoder wants the value once, at the top.
+    ///
+    /// A device that never had a profile applied reads the Ridge layout, which is what every
+    /// geometry-free code path assumed before this was a parameter at all.
+    pub(super) fn geometry(&self) -> super::video::wht::Geometry {
         let p = self.codec_geometry.load(core::sync::atomic::Ordering::Acquire);
         if p & 0x8000 == 0 {
-            return;
+            return super::video::wht::RIDGE_GEOMETRY;
         }
-        super::video::wht::set_strip_blocks_x(((p & 0xff) as usize).max(1));
-        super::video::wht::set_interlaced_bands(p & (1 << 8) != 0);
-        super::video::wht::set_band_parity_bit(p & (1 << 9) != 0);
-        super::video::wht::set_aux_is_pad_count(p & (1 << 10) != 0);
-        super::video::wht::set_head_sub_shift(((p >> 16) & 0xf) as u8);
-        super::video::wht::set_stream_id_mask(((p >> 20) & 0xff) as u8);
-        set_dock_buffers(((p >> 28) & 0xf) as u8);
+        super::video::wht::Geometry::new(
+            ((p & 0xff) as usize).max(1),
+            p & (1 << 8) != 0,
+            p & (1 << 9) != 0,
+            p & (1 << 10) != 0,
+            ((p >> 16) & 0xf) as u8,
+            ((p >> 20) & 0xff) as u8,
+            ((p >> 28) & 0xf) as u8,
+        )
     }
 
     /// Record how this dock reports monitor presence; see [`DockProfile::presence_from_status`].
@@ -1641,24 +1547,12 @@ impl VinoDrmData {
             // Never modeset, so there is nothing lit to blank.
             return Ok(());
         };
-        let w_pad = (timing.hactive as usize + super::video::wht::strip_w() - 1)
-            & !(super::video::wht::strip_w() - 1);
-        let h_pad = (timing.vactive as usize + super::video::wht::strip_h() - 1)
-            & !(super::video::wht::strip_h() - 1);
-        let frames = super::video::wht::black_frame_ep08(
-            w_pad,
-            h_pad,
-            head,
-            band_parity_bit(),
-            interlaced_bands(),
-        )?;
-        let ordinary_frames = super::video::wht::black_frame_ep08_ordinary(
-            w_pad,
-            h_pad,
-            head,
-            band_parity_bit(),
-            interlaced_bands(),
-        )?;
+        let geom = self.geometry();
+        let w_pad = (timing.hactive as usize + geom.strip_w() - 1) & !(geom.strip_w() - 1);
+        let h_pad = (timing.vactive as usize + geom.strip_h() - 1) & !(geom.strip_h() - 1);
+        let frames = super::video::wht::black_frame_ep08(geom, w_pad, h_pad, head)?;
+        let ordinary_frames =
+            super::video::wht::black_frame_ep08_ordinary(geom, w_pad, h_pad, head)?;
         // Present for long enough to reach every dock buffer. The dock is multi-buffered and a
         // single presentation lands in one buffer only -- the same reason `damage_repeats` exists
         // -- so a one-shot blank leaves the other buffer holding the frozen desktop and the panel
@@ -1823,9 +1717,7 @@ impl VinoDrmData {
         if frames.is_empty() {
             return Err(kernel::error::code::EINVAL);
         }
-        // The first frames of a stream go out through this path, not `encode_and_send_wht`, and
-        // they carry the ARM burst. See `ENCODE_BUSY`.
-        let _geometry = EncodeGeometryGuard::acquire(self);
+        let geom = self.geometry();
         // Diagnostic: shrink the transfer so a dock that stops after one *transfer* can be told
         // apart from one that stops after a fixed *byte count*. Both look identical at the default
         // 65536, because exactly one transfer and exactly 65536 bytes are the same event.
@@ -1847,17 +1739,16 @@ impl VinoDrmData {
         // the startup/prompt-training submit -- is the one the dock's first frames go out on, so
         // wiring the map only into the steady-state scanout left it absent from every frame that
         // matters. Ridge has no equivalent record and gets an empty slice.
-        let params: KVec<u8> = if super::video::wht::head_sub_shift() == 0 {
+        let params: KVec<u8> = if geom.head_sub_shift == 0 {
             KVec::new()
         } else {
             let t = self.last_timing.lock().get(head_i).copied().flatten();
             match t {
                 Some(t) => {
-                    let sw = super::video::wht::strip_w();
-                    let sh = super::video::wht::strip_h();
+                    let (sw, sh) = (geom.strip_w(), geom.strip_h());
                     let w_pad = (t.hactive as usize).div_ceil(sw) * sw;
                     let h_pad = (t.vactive as usize).div_ceil(sh) * sh;
-                    super::video::wht::navarro_strip_params(head, w_pad, h_pad, &frames)?
+                    super::video::wht::navarro_strip_params(geom, head, w_pad, h_pad, &frames)?
                 }
                 None => KVec::new(),
             }
@@ -2073,7 +1964,7 @@ impl VinoDrmData {
                 const NAVARRO_PROLOGUE_SUBMIT_US: [i64; 4] = [0, 806, 851, 873];
                 let pace_prologue = !arm_slice.is_empty()
                     && xfer == VIDEO_XFER
-                    && super::video::wht::head_sub_shift() != 0
+                    && geom.head_sub_shift != 0
                     && *crate::module_parameters::video_sync.value() == 0;
                 let mut prologue_anchor: Option<Instant<Monotonic>> = None;
                 while wire_off < wire_len {
@@ -2179,24 +2070,12 @@ impl VinoDrmData {
             return Ok(false);
         }
 
-        let w_pad = (timing.hactive as usize + super::video::wht::strip_w() - 1)
-            & !(super::video::wht::strip_w() - 1);
-        let h_pad = (timing.vactive as usize + super::video::wht::strip_h() - 1)
-            & !(super::video::wht::strip_h() - 1);
-        let prompt = super::video::wht::black_frame_ep08(
-            w_pad,
-            h_pad,
-            head,
-            band_parity_bit(),
-            interlaced_bands(),
-        )?;
-        let prompt_ordinary = super::video::wht::black_frame_ep08_ordinary(
-            w_pad,
-            h_pad,
-            head,
-            band_parity_bit(),
-            interlaced_bands(),
-        )?;
+        let geom = self.geometry();
+        let w_pad = (timing.hactive as usize + geom.strip_w() - 1) & !(geom.strip_w() - 1);
+        let h_pad = (timing.vactive as usize + geom.strip_h() - 1) & !(geom.strip_h() - 1);
+        let prompt = super::video::wht::black_frame_ep08(geom, w_pad, h_pad, head)?;
+        let prompt_ordinary =
+            super::video::wht::black_frame_ep08_ordinary(geom, w_pad, h_pad, head)?;
         let wake = self.modeset_active[head_i].load(Ordering::Acquire) == 0;
 
         self.begin_cp_timeline();
@@ -2286,6 +2165,7 @@ impl VinoDrmData {
         dev: &BoundInterface<'_>,
         timings: [Option<super::cp::Timing>; HEADS],
     ) -> Result<bool> {
+        let geom = self.geometry();
         let mut prompts: [Option<KVec<KVec<u8>>>; HEADS] = core::array::from_fn(|_| None);
         let mut ordinary_prompts: [Option<KVec<KVec<u8>>>; HEADS] =
             core::array::from_fn(|_| None);
@@ -2311,23 +2191,19 @@ impl VinoDrmData {
                 timing.vactive,
                 timing.refresh_hz
             );
-            let w_pad = (timing.hactive as usize + super::video::wht::strip_w() - 1)
-                & !(super::video::wht::strip_w() - 1);
-            let h_pad = (timing.vactive as usize + super::video::wht::strip_h() - 1)
-                & !(super::video::wht::strip_h() - 1);
+            let w_pad = (timing.hactive as usize + geom.strip_w() - 1) & !(geom.strip_w() - 1);
+            let h_pad = (timing.vactive as usize + geom.strip_h() - 1) & !(geom.strip_h() - 1);
             prompts[head] = Some(super::video::wht::black_frame_ep08(
+                geom,
                 w_pad,
                 h_pad,
                 head as u8,
-                band_parity_bit(),
-                interlaced_bands(),
             )?);
             ordinary_prompts[head] = Some(super::video::wht::black_frame_ep08_ordinary(
+                geom,
                 w_pad,
                 h_pad,
                 head as u8,
-                band_parity_bit(),
-                interlaced_bands(),
             )?);
             keys[head] = key;
             valid |= 1u32 << head;
@@ -2651,10 +2527,11 @@ impl VinoDrmData {
     /// the stream unopened, and the dock then watchdog-resets a few seconds later.
     /// Build the records that close a frame, in this dock's format.
     fn build_frame_trailer(&self, head: u8, seq0: u32) -> super::video::wht::FrameTrailer {
+        let geom = self.geometry();
         if self.video_arm.load(Ordering::Acquire) {
-            super::video::wht::frame_trailer(head, seq0)
+            super::video::wht::frame_trailer(geom, head, seq0)
         } else {
-            super::video::wht::navarro_frame_trailer(head, seq0)
+            super::video::wht::navarro_frame_trailer(geom, head, seq0)
         }
     }
 
@@ -2666,7 +2543,7 @@ impl VinoDrmData {
         if self.video_arm.load(Ordering::Acquire) || prologue {
             None
         } else {
-            Some(super::video::wht::navarro_frame_opener(head, seq0))
+            Some(super::video::wht::navarro_frame_opener(self.geometry(), head, seq0))
         }
     }
 
@@ -2779,7 +2656,7 @@ impl VinoDrmData {
         vnonce.copy_from_slice(&key[16..24]);
         drop(keys);
         let content = super::cp::navarro_stream_open();
-        let stream = super::video::wht::stream_id(head as u8);
+        let stream = self.geometry().stream_id(head as u8);
         let seq = self.take_seal_seq(head, content.len().div_ceil(16) as u32);
         Ok(Some(super::cp::seal_video_arm(
             &vkey, &vnonce, stream, 0x0002, seq, &content,
@@ -2806,7 +2683,7 @@ impl VinoDrmData {
         let mut vnonce = [0u8; 8];
         vnonce.copy_from_slice(&key[16..24]);
         drop(keys);
-        let stream = super::video::wht::stream_id(head as u8);
+        let stream = self.geometry().stream_id(head as u8);
         let with_mode = self.arm_prefix_pending.load(Ordering::Acquire) & (1u32 << head) != 0;
         let (aux, content): (u16, KVec<u8>) = if with_mode {
             let timing = self
@@ -2858,8 +2735,9 @@ impl VinoDrmData {
             .flatten()
             .ok_or(ENODEV)?;
         let connector = head as u8;
-        let stream = super::video::wht::stream_id(connector);
-        let frame_sub = u16::from(super::video::wht::head_sub(connector));
+        let geom = self.geometry();
+        let stream = geom.stream_id(connector);
+        let frame_sub = u16::from(geom.head_sub(connector));
 
         let mut buf = KVec::with_capacity(1600, GFP_KERNEL)?;
         for sub in [stream, stream | 0x0010] {
@@ -3545,7 +3423,13 @@ impl VinoDrmData {
             (pool.slots[idx].surface.take(), binding, idx)
         };
 
-        let r = snapshot_to_shadow(&mut surface, &binding.mapping, source_w, source_h);
+        let r = snapshot_to_shadow(
+            self.geometry(),
+            &mut surface,
+            &binding.mapping,
+            source_w,
+            source_h,
+        );
 
         let snapshot = {
             let mut pool = self.shadow[head].lock();
@@ -5150,6 +5034,7 @@ fn src_dims(rotation: plane::Rotation, ow: usize, oh: usize) -> (usize, usize) {
 /// than before; a busy one no longer reads the source twice.
 #[inline(never)]
 fn snapshot_to_shadow(
+    geom: super::video::wht::Geometry,
     slot: &mut Option<ShadowSurface>,
     source: &kms::framebuffer::FramebufferVMapOwned<VinoObject>,
     w: usize,
@@ -5164,8 +5049,7 @@ fn snapshot_to_shadow(
     let pitch = source.pitch();
     let view = source.view();
 
-    let sw = super::video::wht::strip_w();
-    let sh = super::video::wht::strip_h();
+    let (sw, sh) = (geom.strip_w(), geom.strip_h());
     let w_pad = (w + sw - 1) & !(sw - 1);
     let h_pad = (h + sh - 1) & !(sh - 1);
     let tiles_x = w_pad / sw;
@@ -5253,14 +5137,15 @@ fn snapshot_to_shadow(
 /// allocation or spending more time testing rectangles than encoding strips.
 #[inline(never)]
 fn changed_strip_rects(
+    geom: super::video::wht::Geometry,
     old: &[u64],
     new: &[u64],
     w_pad: usize,
     h_pad: usize,
 ) -> Result<KVec<DamageRect>> {
     const MAX_RECTS: usize = 128;
-    let tiles_x = w_pad >> super::video::wht::strip_w_shift();
-    let tiles_y = h_pad >> super::video::wht::strip_h_shift();
+    let tiles_x = w_pad >> geom.strip_w_shift();
+    let tiles_y = h_pad >> geom.strip_h_shift();
     if old.len() != tiles_x * tiles_y || new.len() != old.len() {
         return Err(EINVAL);
     }
@@ -5276,10 +5161,10 @@ fn changed_strip_rects(
             while tx < tiles_x && old[ty * tiles_x + tx] != new[ty * tiles_x + tx] {
                 tx += 1;
             }
-            let x0 = run_start * super::video::wht::strip_w();
-            let x1 = tx * super::video::wht::strip_w();
-            let y0 = ty * super::video::wht::strip_h();
-            let y1 = y0 + super::video::wht::strip_h();
+            let x0 = run_start * geom.strip_w();
+            let x1 = tx * geom.strip_w();
+            let y0 = ty * geom.strip_h();
+            let y1 = y0 + geom.strip_h();
             let mut merged = false;
             for prior in rects.iter_mut().rev() {
                 if prior.0 == x0 && prior.2 == x1 && prior.3 == y0 {
@@ -5437,12 +5322,16 @@ fn encode_queue() -> Option<&'static workqueue::Queue> {
 }
 
 /// Encode a batch of strips from `src`, in the order given.
-fn encode_coords(src: &PixelSource, coords: &[(usize, usize)]) -> Result<KVec<KVec<u8>>> {
+fn encode_coords(
+    geom: super::video::wht::Geometry,
+    src: &PixelSource,
+    coords: &[(usize, usize)],
+) -> Result<KVec<KVec<u8>>> {
     let mut out = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
     for &(sx, sy) in coords.iter() {
         let mut px = |dx, dy| src.px(dx, dy);
         out.push(
-            super::video::wht::colour_strip_at(sx, sy, &mut px)?,
+            super::video::wht::colour_strip_at(geom, sx, sy, &mut px)?,
             GFP_KERNEL,
         )?;
     }
@@ -5461,6 +5350,9 @@ struct EncodeChunk {
     done: Completion,
     src: Arc<PixelSource>,
     coords: KVec<(usize, usize)>,
+    /// The dock's strip layout, carried per chunk so two docks of different generations can
+    /// encode concurrently on the same workqueue.
+    geom: super::video::wht::Geometry,
     /// Encoded strip bodies. Written once by the worker, read once by the joiner after `done`;
     /// the lock is uncontended and taken twice per chunk per frame.
     #[pin]
@@ -5472,13 +5364,18 @@ impl_has_work! {
 }
 
 impl EncodeChunk {
-    fn new(src: Arc<PixelSource>, coords: KVec<(usize, usize)>) -> Result<Arc<Self>> {
+    fn new(
+        geom: super::video::wht::Geometry,
+        src: Arc<PixelSource>,
+        coords: KVec<(usize, usize)>,
+    ) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(EncodeChunk {
                 work <- new_work!("vino::EncodeChunk::work"),
                 done <- Completion::new(),
                 src,
                 coords,
+                geom,
                 out <- new_mutex!(KVec::new(), "vino::EncodeChunk::out"),
             }),
             GFP_KERNEL,
@@ -5490,7 +5387,7 @@ impl WorkItem for EncodeChunk {
     type Pointer = Arc<EncodeChunk>;
 
     fn run(this: Arc<EncodeChunk>) {
-        if let Ok(strips) = encode_coords(&this.src, &this.coords) {
+        if let Ok(strips) = encode_coords(this.geom, &this.src, &this.coords) {
             *this.out.lock() = strips;
         }
         // Complete unconditionally. On failure `out` stays short and the joiner detects that by
@@ -5508,6 +5405,7 @@ impl WorkItem for EncodeChunk {
 /// Returns `Ok(None)` when the frame is too small to be worth splitting, so the caller falls
 /// through to the serial encoder rather than paying dispatch cost for a handful of strips.
 fn parallel_strip_encode(
+    geom: super::video::wht::Geometry,
     src: &Arc<PixelSource>,
     coords: &[(usize, usize)],
 ) -> Result<Option<KVec<KVec<u8>>>> {
@@ -5533,7 +5431,7 @@ fn parallel_strip_encode(
         for &c in &coords[start..end] {
             mine.push(c, GFP_KERNEL)?;
         }
-        let chunk = EncodeChunk::new(src.clone(), mine)?;
+        let chunk = EncodeChunk::new(geom, src.clone(), mine)?;
         // `enqueue` gives the item back if it is already pending -- impossible for one allocated
         // a line ago, but if it ever happened, waiting on its completion would hang the scanout
         // worker forever. Record it and encode that chunk inline instead.
@@ -5556,7 +5454,7 @@ fn parallel_strip_encode(
             chunk.done.wait_for_completion();
             core::mem::take(&mut *chunk.out.lock())
         } else {
-            encode_coords(&chunk.src, &chunk.coords)?
+            encode_coords(chunk.geom, &chunk.src, &chunk.coords)?
         };
         if mine.len() != chunk.coords.len() {
             // A chunk failed to allocate. Sending a frame with strips missing would paint a
@@ -5610,9 +5508,10 @@ pub(super) fn parallel_rotation_matches_serial(rotation: plane::Rotation) -> Res
         },
         GFP_KERNEL,
     )?;
-    let w_pad = output_w.next_multiple_of(super::video::wht::strip_w());
-    let h_pad = output_h.next_multiple_of(super::video::wht::strip_h());
-    let coords = super::video::wht::all_strip_coords(w_pad, h_pad)?;
+    let geom = super::video::wht::RIDGE_GEOMETRY;
+    let w_pad = output_w.next_multiple_of(geom.strip_w());
+    let h_pad = output_h.next_multiple_of(geom.strip_h());
+    let coords = super::video::wht::all_strip_coords(geom, w_pad, h_pad)?;
 
     let mut serial: KVec<KVec<u8>> = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
     for &(strip_x, strip_y) in coords.iter() {
@@ -5624,12 +5523,12 @@ pub(super) fn parallel_rotation_matches_serial(rotation: plane::Rotation) -> Res
             src.source_px(sx, sy)
         };
         serial.push(
-            super::video::wht::colour_strip_at(strip_x, strip_y, &mut px)?,
+            super::video::wht::colour_strip_at(geom, strip_x, strip_y, &mut px)?,
             GFP_KERNEL,
         )?;
     }
 
-    let parallel = parallel_strip_encode(&src, &coords)?.ok_or(EINVAL)?;
+    let parallel = parallel_strip_encode(geom, &src, &coords)?.ok_or(EINVAL)?;
     if serial.len() != parallel.len()
         || serial
             .iter()
@@ -5657,9 +5556,7 @@ fn encode_and_send_wht(
     w: usize,
     h: usize,
 ) -> Result {
-    // Restore this device's geometry and hold off any other device's encode until this one is
-    // done, so the globals cannot change underneath it. See `ENCODE_BUSY`.
-    let _geometry = EncodeGeometryGuard::acquire(data);
+    let geom = data.geometry();
     // Gate video on the matching mode-set reaching the dock. Plane updates run before the CRTC
     // enable queues that mode-set, and the dock rejects video on an unconfigured stream. Deferring
     // does not advance the codec sequence; the next scanout pass retries the frame.
@@ -5722,13 +5619,12 @@ fn encode_and_send_wht(
     // The codec operates on complete 64x16 strips. Pad non-aligned modes to the next strip
     // boundary; the mode-set retains the visible dimensions and the sampler supplies black for
     // pixels outside them.
-    let w_pad = (w + super::video::wht::strip_w() - 1) & !(super::video::wht::strip_w() - 1);
-    let h_pad = (h + super::video::wht::strip_h() - 1) & !(super::video::wht::strip_h() - 1);
+    let w_pad = (w + geom.strip_w() - 1) & !(geom.strip_w() - 1);
+    let h_pad = (h + geom.strip_h() - 1) & !(geom.strip_h() - 1);
     let mut content_hashes: Option<KVVec<u64>> = None;
     let mut content_damage: KVec<DamageRect> = KVec::new();
     if identity {
-        let expected = (w_pad >> super::video::wht::strip_w_shift())
-            * (h_pad >> super::video::wht::strip_h_shift());
+        let expected = (w_pad >> geom.strip_w_shift()) * (h_pad >> geom.strip_h_shift());
         if src.hashes.len() != expected {
             return Err(EINVAL);
         }
@@ -5754,7 +5650,7 @@ fn encode_and_send_wht(
                     let debt = ttl[head_i].as_mut().ok_or(kernel::error::code::ENOMEM)?;
                     for i in 0..hashes.len() {
                         if state.hashes[i] != hashes[i] {
-                            debt[i] = damage_repeats();
+                            debt[i] = damage_repeats(geom);
                         }
                     }
                     // Reuse the hash differ: mark an owed strip by handing it a baseline value that
@@ -5764,7 +5660,7 @@ fn encode_and_send_wht(
                     for i in 0..hashes.len() {
                         baseline[i] = if debt[i] > 0 { !hashes[i] } else { hashes[i] };
                     }
-                    content_damage = changed_strip_rects(&baseline, &hashes, w_pad, h_pad)?;
+                    content_damage = changed_strip_rects(geom, &baseline, &hashes, w_pad, h_pad)?;
                 } else {
                     full = true;
                 }
@@ -5794,23 +5690,13 @@ fn encode_and_send_wht(
     // handed to the codec; kept for the post-send cache publish below.
     let mut encoded: Option<(KVec<(usize, usize)>, KVec<KVec<u8>>)> = None;
     let parallel = if !identity {
-        let coords = super::video::wht::all_strip_coords(w_pad, h_pad)?;
-        match parallel_strip_encode(src, &coords)? {
+        let coords = super::video::wht::all_strip_coords(geom, w_pad, h_pad)?;
+        match parallel_strip_encode(geom, src, &coords)? {
             Some(strips) => {
-                let records = if super::video::wht::head_sub_shift() != 0 {
-                    super::video::wht::frame_records_navarro_ordinary(
-                        &strips,
-                        head,
-                        band_parity_bit(),
-                        interlaced_bands(),
-                    )?
+                let records = if geom.head_sub_shift != 0 {
+                    super::video::wht::frame_records_navarro_ordinary(geom, &strips, head)?
                 } else {
-                    super::video::wht::frame_records(
-                        &strips,
-                        head,
-                        band_parity_bit(),
-                        interlaced_bands(),
-                    )?
+                    super::video::wht::frame_records(geom, &strips, head)?
                 };
                 Some((records, seq0.wrapping_add(1)))
             }
@@ -5818,13 +5704,13 @@ fn encode_and_send_wht(
         }
     } else {
         let coords = if full {
-            super::video::wht::all_strip_coords(w_pad, h_pad)?
+            super::video::wht::all_strip_coords(geom, w_pad, h_pad)?
         } else {
-            super::video::wht::damage_strip_coords(w_pad, h_pad, &content_damage)?
+            super::video::wht::damage_strip_coords(geom, w_pad, h_pad, &content_damage)?
         };
         // Reuse an encoded strip body when its pixels and gamma tag are unchanged. Encode only
         // misses, then restore the required x-order within each Y band.
-        let tiles_x = w_pad >> super::video::wht::strip_w_shift();
+        let tiles_x = w_pad >> geom.strip_w_shift();
         let mut reuse: KVec<Option<KVec<u8>>> = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
         let mut misses: KVec<(usize, usize)> = KVec::with_capacity(coords.len(), GFP_KERNEL)?;
         {
@@ -5833,9 +5719,7 @@ fn encode_and_send_wht(
                 .as_ref()
                 .filter(|c| c.w_pad == w_pad && c.h_pad == h_pad && c.tag == gamma_tag);
             for &(sx, sy) in coords.iter() {
-                let idx =
-                    (sy >> super::video::wht::strip_h_shift()) * tiles_x
-                    + (sx >> super::video::wht::strip_w_shift());
+                let idx = (sy >> geom.strip_h_shift()) * tiles_x + (sx >> geom.strip_w_shift());
                 let hit = usable.and_then(|c| {
                     // Same pixels as when this body was produced, and a body was kept.
                     let same = c.hashes.get(idx).zip(content_hashes.as_ref()?.get(idx));
@@ -5855,11 +5739,11 @@ fn encode_and_send_wht(
                 }
             }
         }
-        let fresh = match parallel_strip_encode(src, &misses)? {
+        let fresh = match parallel_strip_encode(geom, src, &misses)? {
             Some(s) => Some(s),
             // Too few misses to be worth splitting: encode them here rather than dropping to
             // the whole-frame serial path, which would re-encode the cache hits as well.
-            None if !misses.is_empty() => Some(encode_coords(src, &misses)?),
+            None if !misses.is_empty() => Some(encode_coords(geom, src, &misses)?),
             None => Some(KVec::new()),
         };
         match fresh {
@@ -5872,20 +5756,10 @@ fn encode_and_send_wht(
                         None => strips.push(next.next().ok_or(EINVAL)?, GFP_KERNEL)?,
                     }
                 }
-                let records = if full && super::video::wht::head_sub_shift() != 0 {
-                    super::video::wht::frame_records_navarro_ordinary(
-                        &strips,
-                        head,
-                        band_parity_bit(),
-                        interlaced_bands(),
-                    )?
+                let records = if full && geom.head_sub_shift != 0 {
+                    super::video::wht::frame_records_navarro_ordinary(geom, &strips, head)?
                 } else {
-                    super::video::wht::frame_records(
-                        &strips,
-                        head,
-                        band_parity_bit(),
-                        interlaced_bands(),
-                    )?
+                    super::video::wht::frame_records(geom, &strips, head)?
                 };
                 encoded = Some((coords, strips));
                 Some((records, seq0.wrapping_add(1)))
@@ -5895,34 +5769,21 @@ fn encode_and_send_wht(
     };
     let (frames, next_seq) = match parallel {
         Some(r) => r,
-        None if full && super::video::wht::head_sub_shift() != 0 => {
+        None if full && geom.head_sub_shift != 0 => {
             super::video::wht::colour_frame_ep08_navarro_ordinary(
-                w_pad,
-                h_pad,
-                seq0,
-                head,
-                band_parity_bit(),
-                interlaced_bands(),
-                px,
+                geom, w_pad, h_pad, seq0, head, px,
             )?
         }
-        None if full => super::video::wht::colour_frame_ep08(
-            w_pad,
-            h_pad,
-            seq0,
-            head,
-            band_parity_bit(),
-            interlaced_bands(),
-            px,
-        )?,
+        None if full => {
+            super::video::wht::colour_frame_ep08(geom, w_pad, h_pad, seq0, head, px)?
+        }
         None => super::video::wht::colour_frame_ep08_damage(
+            geom,
             w_pad,
             h_pad,
             seq0,
             head,
             &content_damage,
-            band_parity_bit(),
-            interlaced_bands(),
             px,
         )?,
     };
@@ -5994,15 +5855,15 @@ fn encode_and_send_wht(
     // vino sent none of until 2026-08-03. Working DLM and Windows both include it in frame zero and
     // put it after at least some image records; Windows' deterministic image-then-map ordering is
     // used below. Ridge has no equivalent record and gets an empty slice.
-    let params: KVec<u8> = if super::video::wht::head_sub_shift() == 0 {
+    let params: KVec<u8> = if geom.head_sub_shift == 0 {
         KVec::new()
     } else {
-        super::video::wht::navarro_strip_params(head, w_pad, h_pad, &frames)?
+        super::video::wht::navarro_strip_params(geom, head, w_pad, h_pad, &frames)?
     };
     vino_debug!(
         "vino: head={} shift={} params={} B ({}x{} pad)\n",
         head,
-        super::video::wht::head_sub_shift(),
+        geom.head_sub_shift,
         params.len(),
         w_pad,
         h_pad
@@ -6024,7 +5885,7 @@ fn encode_and_send_wht(
         // while later deltas repair only their selected regions -- and the ledger is cleared
         // outright below on the strength of this, so a keyframe that comes up short leaves stale
         // pixels nothing will ever repair.
-        u32::from(dock_buffers())
+        u32::from(geom.dock_buffers)
     } else {
         // Consecutive copies land in the same dock buffer. Spread delta retransmissions across
         // successive frames through `damage_repeats` and the debt repaint instead.
@@ -6325,10 +6186,10 @@ fn encode_and_send_wht(
             }
             if bodies.len() == hashes.len() {
                 if let Some((coords, strips)) = encoded {
-                    let tiles_x = w_pad >> super::video::wht::strip_w_shift();
+                    let tiles_x = w_pad >> geom.strip_w_shift();
                     for (&(sx, sy), body) in coords.iter().zip(strips) {
-                        let idx = (sy >> super::video::wht::strip_h_shift()) * tiles_x
-                            + (sx >> super::video::wht::strip_w_shift());
+                        let idx = (sy >> geom.strip_h_shift()) * tiles_x
+                            + (sx >> geom.strip_w_shift());
                         if let Some(slot) = bodies.get_mut(idx) {
                             *slot = body;
                         }
