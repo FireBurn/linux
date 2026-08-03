@@ -1240,12 +1240,24 @@ pub(crate) mod wht {
         let mut chunk: KVec<u8> = KVec::new();
         // Interlaced ordering sends even bands before odd bands while preserving x order.
         let mut order: KVec<usize> = KVec::with_capacity(strips.len(), GFP_KERNEL)?;
+        // ⚠ `strips.len() == 3600` is NOT sufficient to identify a DL7400 surface. The rows below
+        // are a producer permutation measured from a 2560x1440 Navarro frame, which is 20 strips
+        // across x 180 bands because Navarro strips are 128x8. **Ridge at the same resolution also
+        // has exactly 3600 strips** -- 40 across x 90 bands, its strips being 64x16 -- so the count
+        // alone selected this permutation for the wrong dock and reordered its frame against a
+        // grid half the real width. Measured: the D6000 accepted one 207,072-byte training frame,
+        // stopped draining EP08 and re-enumerated ~90 ms later. Both black carriers reach here on
+        // every dock (`black_frame_ep08` passes `Some(false)`, `black_frame_ep08_ordinary`
+        // `Some(true)`), so this is the guard that has to hold.
+        let navarro_layout =
+            geom.interlaced_bands && geom.strip_w() == STRIP_BLOCKS * DIM && strips.len() == 3600;
         let navarro_rows = match navarro_ordinary {
-            Some(false) if strips.len() == 3600 => Some(NAVARRO_PROLOGUE_ROWS),
-            Some(true) if strips.len() == 3600 => Some(NAVARRO_ORDINARY_ROWS),
+            Some(false) if navarro_layout => Some(NAVARRO_PROLOGUE_ROWS),
+            Some(true) if navarro_layout => Some(NAVARRO_ORDINARY_ROWS),
             _ => None,
         };
         if let Some(rows) = navarro_rows {
+            // 2560 px / 128 px per strip. Guaranteed by `navarro_layout` above.
             const STRIPS_ACROSS: usize = 20;
             let ordinary = navarro_ordinary == Some(true);
             for (run, &y) in rows.iter().enumerate() {
