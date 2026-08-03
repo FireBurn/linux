@@ -1586,7 +1586,17 @@ impl VinoDrmData {
                     // this on every video endpoint ahead of its first frame, and the DL7400 stalls
                     // the pipe on the opening image records without it. Clearing also resets the
                     // endpoint's sequence number, which is what the dock is really waiting for.
-                    let _ = dev.clear_video_halt(head_i);
+                    // ⚠ vino used to clear the halt here unconditionally, on the claim that "DLM
+                    // does this on every video endpoint ahead of its first frame". It does not:
+                    // the only CLEAR_FEATURE(ENDPOINT_HALT) in a same-day keyed capture is on
+                    // ep 0x81, the audio interrupt. `usb_clear_halt()` calls
+                    // `usb_reset_endpoint()`, which resets the *host's* sequence number while the
+                    // dock's is left alone -- and a SuperSpeed bulk endpoint whose sequence
+                    // numbers disagree accepts one burst and then NAKs forever, which is exactly
+                    // what this dock does at 65,536 bytes.
+                    if *crate::module_parameters::video_clear_halt.value() != 0 {
+                        let _ = dev.clear_video_halt(head_i);
+                    }
                     *queue_slot = Some(dev.video_queue(head_i, 8, xfer)?);
                     vino_debug!(
                         "vino: head={} endpoint={:#04x} persistent video queue opened by prompt training\n",
@@ -1641,7 +1651,9 @@ impl VinoDrmData {
                     // one *transfer*, not a byte count. Clearing the halt before each one tests
                     // whether the dock is halting the endpoint after every transfer.
                     if *crate::module_parameters::video_clear_each.value() != 0 {
-                        let _ = dev.clear_video_halt(head_i);
+                        if *crate::module_parameters::video_clear_halt.value() != 0 {
+                            let _ = dev.clear_video_halt(head_i);
+                        }
                     }
                     // DLM submits one transfer, waits for its completion, then submits the
                     // next -- never more than two outstanding. `video_sync` reproduces that
@@ -1652,7 +1664,9 @@ impl VinoDrmData {
                         queue.send(dev.io(), dst, super::timeout())
                     };
                     if let Err(e) = sent {
-                        let _ = dev.clear_video_halt(head_i);
+                        if *crate::module_parameters::video_clear_halt.value() != 0 {
+                            let _ = dev.clear_video_halt(head_i);
+                        }
                         return Err(e);
                     }
                     self.last_video_at.lock()[head_i] = Some(Instant::<Monotonic>::now());
@@ -2114,7 +2128,9 @@ impl VinoDrmData {
         let pipe_i = dev.video_pipe_index(head)?;
         let mut queue_slot = self.video_q[pipe_i].lock();
         if queue_slot.is_none() {
-            let _ = dev.clear_video_halt(head);
+            if *crate::module_parameters::video_clear_halt.value() != 0 {
+                let _ = dev.clear_video_halt(head);
+            }
             *queue_slot = Some(dev.video_queue(head, 8, VIDEO_XFER)?);
         }
         let queue = queue_slot
@@ -5369,7 +5385,9 @@ fn encode_and_send_wht(
             let submitted = {
                 let mut queue_slot = data.video_q[pipe_i].lock();
                 if queue_slot.is_none() {
-                    let _ = dev.clear_video_halt(head_i);
+                    if *crate::module_parameters::video_clear_halt.value() != 0 {
+                        let _ = dev.clear_video_halt(head_i);
+                    }
                     match dev.video_queue(head_i, 8, XFER) {
                         Ok(q) => {
                             *queue_slot = Some(q);
@@ -5435,7 +5453,9 @@ fn encode_and_send_wht(
                                 wire_off,
                                 wire_len
                             );
-                            let _ = dev.clear_video_halt(head_i);
+                            if *crate::module_parameters::video_clear_halt.value() != 0 {
+                                let _ = dev.clear_video_halt(head_i);
+                            }
                             return Err(e);
                         }
                         wire_off += data_len;

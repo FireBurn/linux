@@ -2783,6 +2783,10 @@ kernel::module_usb_driver! {
             default: 0,
             description: "Diagnostic: corrupt the sealed prologue's Dl3Cmac to test whether the dock authenticates it",
         },
+        video_clear_halt: u8 {
+            default: 0,
+            description: "Clear the video endpoint halt before streaming. DLM does NOT do this on the DL7400 -- it only clears ep 0x81 (audio) -- and usb_clear_halt() resets the host's sequence number while the dock's is untouched",
+        },
         video_clear_each: u8 {
             default: 0,
             description: "Diagnostic: clear the video endpoint halt before every transfer, to test whether the dock halts it after each one",
