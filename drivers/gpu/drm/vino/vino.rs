@@ -1706,7 +1706,16 @@ impl VinoDriver {
         frame: &[u8],
     ) -> Result {
         match out_q {
-            Some(queue) => queue.send(dev.io(), frame, timeout()),
+            // The queued path, which is the one both docks actually use. An error here is what
+            // surfaces as `control session failed after N attempts (ETIMEDOUT)`; the 40-retry NAK
+            // loop further down is the *unqueued* fallback and does not run, which is why
+            // instrumenting it said nothing.
+            Some(queue) => queue.send(dev.io(), frame, timeout()).inspect_err(|e| {
+                pr_info!(
+                    "vino: EP02 queued submit of {} B failed ({e:?})\n",
+                    frame.len()
+                );
+            }),
             None => dev.ctrl_send(frame, timeout(), GFP_KERNEL).map(|_| ()),
         }
     }
