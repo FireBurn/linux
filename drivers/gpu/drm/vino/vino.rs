@@ -29,6 +29,14 @@ fn debug_enabled() -> bool {
     *crate::module_parameters::debug.value() != 0
 }
 
+/// Whether this one module load may disclose its ephemeral session material for a wire capture.
+///
+/// This is deliberately separate from ordinary debug logging: the values make a usbmon trace
+/// decryptable and must never appear during a normal load.
+fn trace_crypto_enabled() -> bool {
+    *crate::module_parameters::trace_crypto.value() != 0
+}
+
 /// Emit a driver diagnostic only when the load-time `debug` parameter is nonzero.
 macro_rules! vino_debug {
     ($($arg:tt)*) => {
@@ -173,7 +181,10 @@ static PROFILE_DL7400: DockProfile = DockProfile {
     stream_id_mask: 0x07,
     strm2_marker: 0x0c,
     band_parity_bit: false,
-    aux_is_pad_count: false,
+    // The fixed-size black carriers happen to need no padding and therefore show zero here, but
+    // ordinary compressed image records carry the actual 0..15-byte pad count just like Ridge.
+    // This only became visible once a non-uniform live framebuffer was compared record-by-record.
+    aux_is_pad_count: true,
     strip_blocks_x: 16,
     interlaced_bands: true,
     presence_from_status: true,
@@ -280,11 +291,11 @@ impl<'a> UsbLink<'a> {
         usb::BulkOutQueue::new(self.window, &self.io, ep, depth, buf_len)
     }
 
-    /// Writes one video transfer synchronously, the way DLM paces its own.
+    /// Writes one video transfer synchronously for transport diagnostics.
     ///
-    /// DLM never has more than two URBs outstanding on a video endpoint and normally exactly one:
-    /// it submits 65536 bytes, waits for the completion, then submits the next. vino pipelines
-    /// four to eight through `video_queue`. This is the transport half of that difference.
+    /// This is deliberately not described as DLM's normal transport. The authenticated Navarro
+    /// capture reaches eight outstanding video URBs. Only its first prologue chunk is synchronous;
+    /// after that completion and a measured producer delay, DLM pipelines the remaining chunks.
     pub(crate) fn video_send(
         &self,
         head: usize,
@@ -314,6 +325,46 @@ impl<'a> UsbLink<'a> {
     /// Clears a stall on `head`'s video endpoint.
     pub(crate) fn clear_video_halt(&self, head: usize) -> Result {
         self.io.clear_halt(self.eps.video.get(head).ok_or(EINVAL)?)
+    }
+
+    /// Reads the standard two-byte status word for a video endpoint.
+    ///
+    /// Bit zero is `ENDPOINT_HALT`.  This is deliberately read-only: it distinguishes a dock
+    /// which has stalled the pipe from one which is merely returning NRDY without perturbing the
+    /// endpoint's host or device sequence state.
+    pub(crate) fn video_endpoint_status(&self, head: usize) -> Result<u16> {
+        let address = self.eps.video.get(head).ok_or(EINVAL)?.address();
+        let mut status = [0u8; 2];
+        self.control_recv(
+            0x00, // USB_REQ_GET_STATUS
+            0x82, // device-to-host, standard, endpoint
+            0,
+            u16::from(address),
+            &mut status,
+            timeout(),
+            GFP_KERNEL,
+        )?;
+        Ok(u16::from_le_bytes(status))
+    }
+
+    /// Sends the standard endpoint-halt clear without running Linux's host endpoint reset helper.
+    ///
+    /// Navarro uses this only during cold setup, before any video URB has touched the endpoint, so
+    /// the host sequence state is already its enumeration value. The working DLM wire transaction
+    /// is two raw `CLEAR_FEATURE(ENDPOINT_HALT)` requests 12.647 ms apart followed by its vendor
+    /// commit 143 us later. `usb_clear_halt()` adds an xHCI endpoint reset after the request; that
+    /// made each Vino operation return about 18 ms late and changed this transaction's ordering.
+    fn clear_video_halt_wire(&self, head: usize) -> Result {
+        let address = self.eps.video.get(head).ok_or(EINVAL)?.address();
+        self.control_send(
+            0x01, // USB_REQ_CLEAR_FEATURE
+            0x02, // host-to-device, standard, endpoint
+            0,    // USB_ENDPOINT_HALT
+            u16::from(address),
+            &[],
+            timeout(),
+            GFP_KERNEL,
+        )
     }
 
     /// Issues a control OUT transfer on EP0.
@@ -357,9 +408,12 @@ impl<'a> UsbLink<'a> {
 const EP84_BUF: usize = 4096;
 /// Depth of the persistent EP84 IN reader.
 ///
-/// The dock processes one reply at a time, but additional queue slots prevent gaps while a
-/// completed slot is reaped and reposted.
-const EP84_QUEUE_DEPTH: usize = 4;
+/// DLM keeps exactly one 4096-byte read outstanding. Vino previously posted four and consumed
+/// them through a fixed round-robin cursor; on Navarro an EDID reply then arrived 145 ms after its
+/// request instead of DLM's 45 ms, and EP02 NAKed every following message until that delayed slot
+/// was reaped. `BulkInQueue::recv()` re-submits the completed slot before returning, so depth one
+/// remains continuously posted without the cursor-induced reply skew.
+const EP84_QUEUE_DEPTH: usize = 1;
 
 /// USB transfer timeout used during session setup.
 fn timeout() -> Delta {
@@ -378,7 +432,10 @@ pub(crate) fn cp_reply_timeout() -> Delta {
 ///
 /// The dock acknowledges `AKE_No_Stored_km` before that calculation is complete, so an
 /// acknowledgment cannot be used as the readiness signal.
-const HDCP_HPRIME_WAIT_US: i64 = 165_000;
+// The DL7400's downstream receiver produces H' about 235--240 ms after AKE_No_Stored_km in the
+// working DLM transaction.  Wake just before that result instead of advancing after an arbitrary
+// shorter quiet window; `wait_perhead_push(0x07)` below remains the actual completion gate.
+const HDCP_HPRIME_WAIT_US: i64 = 220_000;
 
 /// Wait until `anchor` is at least `target_us` old.
 fn hold_until(anchor: Instant<Monotonic>, target_us: i64) {
@@ -432,6 +489,15 @@ struct Ep84Drain {
     display_cap_ctr: Option<u16>,
     /// Fresh per-head `rrx` used by downstream repeater authentication.
     perhead_rrx: Option<[u8; drm_hdcp::RRX_LEN]>,
+    /// Bit `msg_id` is set for every downstream-HDCP push observed in this sweep.
+    perhead_seen: u32,
+    perhead_repeater: Option<bool>,
+    perhead_hprime: Option<[u8; drm_hdcp::H_PRIME_LEN]>,
+    perhead_lprime: Option<[u8; drm_hdcp::L_PRIME_LEN]>,
+    /// Navarro's receiver-list payload is nine authenticated list-header bytes followed by V'.
+    perhead_v: Option<([u8; 9], [u8; drm_hdcp::V_PRIME_HALF_LEN])>,
+    perhead_auth_status: Option<u8>,
+    perhead_mprime: Option<[u8; drm_hdcp::H_PRIME_LEN]>,
 }
 
 impl Ep84Drain {
@@ -443,6 +509,63 @@ impl Ep84Drain {
         self.edid_ready |= o.edid_ready;
         self.display_cap_ctr = self.display_cap_ctr.or(o.display_cap_ctr);
         self.perhead_rrx = self.perhead_rrx.or(o.perhead_rrx);
+        self.perhead_seen |= o.perhead_seen;
+        self.perhead_repeater = self.perhead_repeater.or(o.perhead_repeater);
+        self.perhead_hprime = self.perhead_hprime.or(o.perhead_hprime);
+        self.perhead_lprime = self.perhead_lprime.or(o.perhead_lprime);
+        self.perhead_v = self.perhead_v.or(o.perhead_v);
+        self.perhead_auth_status = self.perhead_auth_status.or(o.perhead_auth_status);
+        self.perhead_mprime = self.perhead_mprime.or(o.perhead_mprime);
+    }
+
+    fn observe_perhead(&mut self, push: cp::PerheadHdcpPush) {
+        if push.msg_id < 32 {
+            self.perhead_seen |= 1u32 << push.msg_id;
+        }
+        match push.msg_id {
+            // AKE_Send_Cert: the first vendor payload byte is the repeater flag.
+            0x03 if push.payload_len >= 1 => {
+                self.perhead_repeater = Some(push.payload[0] != 0);
+            }
+            0x06 if push.payload_len >= drm_hdcp::RRX_LEN => {
+                let mut v = [0u8; drm_hdcp::RRX_LEN];
+                v.copy_from_slice(&push.payload[..drm_hdcp::RRX_LEN]);
+                self.perhead_rrx = Some(v);
+            }
+            0x07 if push.payload_len >= drm_hdcp::H_PRIME_LEN => {
+                let mut v = [0u8; drm_hdcp::H_PRIME_LEN];
+                v.copy_from_slice(&push.payload[..drm_hdcp::H_PRIME_LEN]);
+                self.perhead_hprime = Some(v);
+            }
+            0x0a if push.payload_len >= drm_hdcp::L_PRIME_LEN => {
+                let mut v = [0u8; drm_hdcp::L_PRIME_LEN];
+                v.copy_from_slice(&push.payload[..drm_hdcp::L_PRIME_LEN]);
+                self.perhead_lprime = Some(v);
+            }
+            // ReceiverID_List: RxInfo/seq/list header (9 bytes), V' (16 bytes), padding.
+            0x0c if push.payload_len >= 9 + drm_hdcp::V_PRIME_HALF_LEN => {
+                let mut list = [0u8; 9];
+                let mut vprime = [0u8; drm_hdcp::V_PRIME_HALF_LEN];
+                list.copy_from_slice(&push.payload[..9]);
+                vprime.copy_from_slice(&push.payload[9..9 + drm_hdcp::V_PRIME_HALF_LEN]);
+                self.perhead_v = Some((list, vprime));
+            }
+            // DisplayLink prefixes ReceiverAuthStatus with one vendor status byte. The HDCP
+            // value is payload[1] (`00 04` in all four working DLM per-head exchanges).
+            0x12 if push.payload_len >= 2 => {
+                self.perhead_auth_status = Some(push.payload[1]);
+            }
+            0x11 if push.payload_len >= drm_hdcp::H_PRIME_LEN => {
+                let mut v = [0u8; drm_hdcp::H_PRIME_LEN];
+                v.copy_from_slice(&push.payload[..drm_hdcp::H_PRIME_LEN]);
+                self.perhead_mprime = Some(v);
+            }
+            _ => {}
+        }
+    }
+
+    fn saw_perhead(&self, msg_id: u8) -> bool {
+        msg_id < 32 && self.perhead_seen & (1u32 << msg_id) != 0
     }
 }
 
@@ -584,7 +707,7 @@ impl WorkItem for BringUp {
                 return;
             }
             let result = (|| -> Result {
-                VinoDriver::bring_up(dev)?;
+                VinoDriver::bring_up(dev, profile)?;
                 vino_dev_debug!(cdev, "vino: plaintext session initialized\n");
                 let mut session = VinoDriver::run_ake(dev)?;
                 vino_dev_debug!(cdev, "vino: HDCP AKE + LC + SKE complete\n");
@@ -654,6 +777,41 @@ impl WorkItem for BringUp {
                         dev_info!(cdev, "vino: head {head} monitor connected\n");
                     }
                 }
+
+                // Navarro's compact discovery normally receives each EDID on the fetch drain,
+                // exactly as DLM does. After a dock re-enumeration one response can arrive late;
+                // publishing that partial topology lets userspace run a single-head mode set
+                // before the second head's runtime recovery, contaminating the shared cold-link
+                // state and leaving stale video URBs behind. Finish only those already-deferred,
+                // distinct physical streams before the one initial hotplug. A normal setup sends
+                // no additional control messages and remains byte-identical to the reference.
+                if profile.per_head_onehot {
+                    for head in 0..usize::from(profile.connectors) {
+                        if !discovery_deferred[head]
+                            || !data.runtime_connector(head)
+                            || data.head_present(head)
+                        {
+                            continue;
+                        }
+                        match data.reengage_head(dev, head as u8) {
+                            Ok(true) => {
+                                data.set_connected(head);
+                                dev_info!(
+                                    cdev,
+                                    "vino: head {head} monitor connected during initial recovery\n"
+                                );
+                            }
+                            Ok(false) => vino_dev_debug!(
+                                cdev,
+                                "vino: head {head} initial recovery found no monitor\n"
+                            ),
+                            Err(e) => dev_warn!(
+                                cdev,
+                                "vino: head {head} initial recovery failed ({e:?})\n"
+                            ),
+                        }
+                    }
+                }
                 Ok(())
             })();
 
@@ -681,9 +839,10 @@ impl WorkItem for BringUp {
         }
         {
             let drm_dev: &drm_sink::VinoDrmDevice = ddev;
-            // Give the downstream link its bounded training interval before userspace can submit a
-            // mode set. Status queries keep the control dialogue active during the interval.
-            if data.cp_engaged() {
+            // Ridge needs a bounded training interval before userspace can submit a mode set.
+            // Navarro's working transcript has already performed its fixed status sequence in
+            // `send_cp_setup`; another 1.3 seconds inserted ~84 messages before its first clear.
+            if data.cp_engaged() && !profile.per_head_onehot {
                 let data: &drm_sink::VinoDrmData = drm_dev;
                 let start = Instant::<Monotonic>::now();
                 let window = Delta::from_millis(1300);
@@ -694,6 +853,9 @@ impl WorkItem for BringUp {
                     fsleep(Delta::from_millis(15));
                 }
                 vino_dev_debug!(cdev, "vino: link ready after {polls} status polls\n");
+            }
+            if data.navarro_mode_words() {
+                data.hold_cp_for_initial_modeset();
             }
             drm_dev.hotplug_event();
             dev_info!(cdev, "vino: encrypted control session ready\n");
@@ -741,13 +903,57 @@ impl WorkItem for BringUp {
             // When the current run of silent probes started; only read while `head_silent > 0`.
             let mut head_silent_since = [Instant::<Monotonic>::now(); VinoDriver::CP_SETUP_HEADS];
             for h in 0..data.connector_count() {
+                if !data.runtime_connector(h) {
+                    continue;
+                }
                 head_known[h] = data.head_present(h);
             }
+            // A normal hotplug commit claims this hold almost immediately. Keep a bounded escape
+            // for a userspace session which elects not to light either connector at all.
+            const INITIAL_MODESET_QUIET_LIMIT: u32 = 5000;
+            let mut initial_quiet_ms = 0u32;
+            // The cold activation owns EP02 for several seconds. Deadlines which expire while it
+            // owns the link must be re-based when it releases it; otherwise the first post-close
+            // loop sends an overdue heartbeat and presence probes ahead of the status dialogue.
+            // DLM instead continues with status counters 184, 185, ... immediately after its
+            // closing markers.
+            let mut timeline_was_exclusive = false;
             while !data.is_shutting_down() {
+                if data.initial_modeset_quiet() {
+                    // Quiet means no unsolicited EP02 writes; DLM still has its one EP84 reader
+                    // continuously posted and reaped. Keep draining pushes while userspace is
+                    // preparing the first mode set so that transaction does not begin behind a
+                    // multi-second status backlog.
+                    data.drain_cp_pushes(dev, 8);
+                    if initial_quiet_ms >= INITIAL_MODESET_QUIET_LIMIT {
+                        data.release_initial_modeset_quiet();
+                        vino_dev_debug!(
+                            cdev,
+                            "vino: no initial mode set after {INITIAL_MODESET_QUIET_LIMIT} ms; \
+                             releasing control keepalive\n"
+                        );
+                    } else {
+                        initial_quiet_ms += 1;
+                        fsleep(Delta::from_millis(1));
+                        continue;
+                    }
+                }
                 // Mode-set markers and video activation form one exclusive transaction.
                 if data.cp_timeline_exclusive() {
+                    timeline_was_exclusive = true;
+                    // The KMS worker owns EP02, but it releases `cp_link` between scheduled
+                    // writes. Reap asynchronous EP84 traffic in those gaps just as DLM's reader
+                    // thread does; request replies remain protected because `send_cp_reply`
+                    // holds the mutex until it sees the matching counter.
+                    data.drain_cp_pushes(dev, 8);
                     fsleep(Delta::from_millis(1));
                     continue;
+                }
+                if timeline_was_exclusive {
+                    let resumed = Instant::<Monotonic>::now();
+                    next_heartbeat = resumed + HEARTBEAT_PERIOD;
+                    next_presence = resumed + PRESENCE_PERIOD;
+                    timeline_was_exclusive = false;
                 }
                 if data
                     .send_cp(dev, 0x14, 0, |ctr| cp::device_query_req(ctr, 0x000c))
@@ -773,6 +979,9 @@ impl WorkItem for BringUp {
                 {
                     let now_r = Instant::<Monotonic>::now();
                     for h in 0..data.connector_count() {
+                        if !data.runtime_connector(h) {
+                            continue;
+                        }
                         if head_known[h] || (now_r - next_reengage[h]).as_millis() < 0 {
                             continue;
                         }
@@ -826,6 +1035,9 @@ impl WorkItem for BringUp {
                 if (now_p - next_presence).as_millis() >= 0 {
                     next_presence = now_p + PRESENCE_PERIOD;
                     for h in 0..data.connector_count() {
+                        if !data.runtime_connector(h) {
+                            continue;
+                        }
                         let present = match data.probe_head_present(dev, h as u8) {
                             Some(p) => {
                                 head_silent[h] = 0;
@@ -944,7 +1156,7 @@ impl WorkItem for BringUp {
 
 impl VinoDriver {
     /// Initialize the plaintext control transport.
-    fn bring_up(dev: &UsbLink<'_>) -> Result {
+    fn bring_up(dev: &UsbLink<'_>, profile: &DockProfile) -> Result {
         // Control-request preamble: dock identity, interface selection, then the
         // vendor-OUT 0x24 / vendor-IN 0x22 pair that starts the HDCP path.
         const VENDOR_OUT: u8 = 0x40; // host->dev, vendor, device
@@ -985,7 +1197,21 @@ impl VinoDriver {
             Ok(()) => {}
             Err(e) => vino_debug!("vino: alternate setting unchanged ({e:?})\n"),
         }
-        match dev.control_send(0x24, VENDOR_OUT, 3, 0, &[], timeout(), GFP_KERNEL) {
+        // The first vendor transition is platform-specific even though both platforms use the
+        // same request number. Ridge uses wValue=3; both occurrences in the authenticated
+        // Navarro/DLM USB transcript use wValue=0. Sending Ridge's value here still permits AKE
+        // and an exact EP02 transcript, but leaves Navarro's video-side state machine different
+        // before its later value-0 commit.
+        let vendor_state = if profile.navarro_mode_words { 0 } else { 3 };
+        match dev.control_send(
+            0x24,
+            VENDOR_OUT,
+            vendor_state,
+            0,
+            &[],
+            timeout(),
+            GFP_KERNEL,
+        ) {
             Ok(()) => {}
             Err(e) => vino_debug!("vino: vendor preamble request stalled ({e:?})\n"),
         }
@@ -1433,6 +1659,13 @@ impl VinoDriver {
 
         // `hseq` points past the last capability/AKE frame; `send_cp_setup` continues the inner
         // counter from here for msg0.
+        if trace_crypto_enabled() {
+            pr_info!(
+                "vino-crypto: control key={:02x?} riv_out={riv:02x?} next_ctr={}\n",
+                &ks[..],
+                hseq
+            );
+        }
         Ok(Session {
             ks,
             riv,
@@ -1553,18 +1786,35 @@ impl VinoDriver {
             Some(q) => {
                 q.send(dev.io(), &frame, timeout())?;
                 q.flush(dev.io(), timeout())?;
-                for _ in 0..8 {
-                    let d = Self::drain_ep84(
+                if profile.navarro_mode_words {
+                    // DLM advances as soon as the dock authenticates msg0. The old eight-drain
+                    // loop waited for seven empty 10-ms windows after that reply and moved every
+                    // following setup transition roughly 90 ms later on the wire.
+                    let d = Self::lockstep_reply(
                         dev,
                         ep84_q.as_mut(),
                         &mut resp,
                         session,
+                        cp_ctr,
                         edid_out,
-                        Delta::from_millis(10),
                     );
                     drained += d.reads;
                     acks += d.acks;
                     rejects += d.rejects;
+                } else {
+                    for _ in 0..8 {
+                        let d = Self::drain_ep84(
+                            dev,
+                            ep84_q.as_mut(),
+                            &mut resp,
+                            session,
+                            edid_out,
+                            Delta::from_millis(10),
+                        );
+                        drained += d.reads;
+                        acks += d.acks;
+                        rejects += d.rejects;
+                    }
                 }
             }
             None => {
@@ -1605,35 +1855,81 @@ impl VinoDriver {
         cp_ctr += 1; // past msg0
         wseq += 2; // msg0 content is 32 B = 2 AES blocks
 
-        // Four initialization records follow msg0 and continue the same inner and block counters.
-        for (id, sub, fixed_prefix) in [
-            (0x0014u16, 0x0030u16, &[][..]),
-            (0x0015, 0x000b, &[0x01][..]),
-            (0x0016, 0x002a, &[0x00, 0x01][..]),
-            (0x0016, 0x002a, &[0x01, 0x01][..]),
-        ] {
-            let mut c = [0u8; 32];
-            c[0..2].copy_from_slice(&id.to_le_bytes());
-            c[2..4].copy_from_slice(&sub.to_le_bytes());
-            c[4..6].copy_from_slice(&cp_ctr.to_le_bytes());
-            rng::fill(&mut c[22..32]);
-            c[22..22 + fixed_prefix.len()].copy_from_slice(fixed_prefix);
-            let frame = cp::seal_interactive(&session.ks, &session.riv, id, wseq, &c)?;
-            Self::submit_cp_frame(dev, &mut out_q, &frame)?;
-            sent += 1;
-            let d = Self::drain_ep84(
-                dev,
-                ep84_q.as_mut(),
-                &mut resp,
-                session,
-                edid_out,
-                Delta::from_millis(10),
-            );
-            drained += d.reads;
-            acks += d.acks;
-            rejects += d.rejects;
-            cp_ctr += 1;
-            wseq += 2; // each burst message is 32 B = 2 AES blocks
+        // Initialization continues with two dock-wide records and one `0x16/0x2a` record for
+        // every physical connector. The authenticated Navarro transcript carries selectors
+        // 0,1,2,3 here; emitting Ridge's historical pair left all later counters four AES blocks
+        // behind DLM and never initialized Navarro's last two connector slots.
+        macro_rules! send_init {
+            ($id:expr, $sub:expr, $fixed_prefix:expr) => {{
+                let id: u16 = $id;
+                let sub: u16 = $sub;
+                let fixed_prefix: &[u8] = $fixed_prefix;
+                let mut c = [0u8; 32];
+                c[0..2].copy_from_slice(&id.to_le_bytes());
+                c[2..4].copy_from_slice(&sub.to_le_bytes());
+                c[4..6].copy_from_slice(&cp_ctr.to_le_bytes());
+                rng::fill(&mut c[22..32]);
+                c[22..22 + fixed_prefix.len()].copy_from_slice(fixed_prefix);
+                let frame = cp::seal_interactive(&session.ks, &session.riv, id, wseq, &c)?;
+                Self::submit_cp_frame(dev, &mut out_q, &frame)?;
+                sent += 1;
+                // Navarro's reference transaction is reply-lockstep: the next operation follows
+                // the matching authenticated counter immediately. A generic burst drain adds an
+                // empty 10-ms read after every acknowledgment and changes the EP0/EP02 ordering.
+                let d = if profile.navarro_mode_words {
+                    Self::lockstep_reply(
+                        dev,
+                        ep84_q.as_mut(),
+                        &mut resp,
+                        session,
+                        cp_ctr,
+                        edid_out,
+                    )
+                } else {
+                    Self::drain_ep84(
+                        dev,
+                        ep84_q.as_mut(),
+                        &mut resp,
+                        session,
+                        edid_out,
+                        Delta::from_millis(10),
+                    )
+                };
+                drained += d.reads;
+                acks += d.acks;
+                rejects += d.rejects;
+                cp_ctr += 1;
+                wseq += 2; // every initialization message is 32 B = 2 AES blocks
+            }};
+        }
+        send_init!(0x0014, 0x0030, &[]);
+        send_init!(0x0015, 0x000b, &[0x01]);
+
+        if profile.navarro_mode_words {
+            // The working DLM transaction places the video-engine transition at this exact
+            // authenticated boundary: after the reply to 0x15/0x0b (counter 11), before the four
+            // connector-selecting 0x16/0x2a records (counters 12..15). Measured submit times are
+            // EP08 clear, +12.647 ms EP0a clear, +143 us vendor commit, +2.941 ms first 0x16/0x2a.
+            // Performing the same requests after finalization moved them 53 messages later.
+            dev.clear_video_halt_wire(0)?;
+            fsleep(Delta::from_millis(13));
+            dev.clear_video_halt_wire(1)?;
+            dev.control_send(
+                0x24,
+                0x40, /* VENDOR_OUT */
+                0,
+                0,
+                &[],
+                timeout(),
+                GFP_KERNEL,
+            )?;
+            let mut state2 = [0u8; 28];
+            dev.control_recv(0x22, 0xc1, 1, 0, &mut state2, timeout(), GFP_KERNEL)?;
+            fsleep(Delta::from_millis(3));
+        }
+        for connector in 0..connector_count {
+            let prefix = [connector as u8, 0x01];
+            send_init!(0x0016, 0x002a, &prefix);
         }
 
         // Drain pending replies before starting the per-head authentication blocks. Each block
@@ -1683,9 +1979,11 @@ impl VinoDriver {
             let mut riv_h = [0u8; drm_hdcp::RIV_LEN];
             rng::fill(&mut riv_h);
             let ekpub_h = hdcp::oaep_encrypt_km(&mut session.rsa, &km_h)?;
+            let mut kd_h: Option<kernel::crypto::Secret<32>> = None;
             let mut edkey_h = None;
             let mut v_h = None;
             let mut fresh_rrx: Option<[u8; drm_hdcp::RRX_LEN]> = None;
+            let mut perhead_repeater: Option<bool> = None;
             let mut rrx_applied = false;
             // SKE_Send_Eks establishes this head's video key. Store the whitened key and the video
             // nonce derived from the delivered RIV for the scanout arm burst.
@@ -1704,7 +2002,8 @@ impl VinoDriver {
             video_keys[head][16..24].copy_from_slice(&vnonce);
             for (i, (id, sub, content_len)) in cp::CP_SETUP_PER_HEAD.iter().copied().enumerate() {
                 // The per-head `rrx` arrives with the response to AKE_No_Stored_km. It is mandatory
-                // for deriving this head's kd, Edkey and V before the consuming messages.
+                // for deriving this head's kd and Edkey before the consuming messages. V is not
+                // computed until the head's own ReceiverID_List/V' has been received and verified.
                 if i >= 3 && !rrx_applied {
                     let Some(rrx_h) = fresh_rrx else {
                         // No `rrx` means this head never began a downstream authentication, which
@@ -1721,12 +2020,18 @@ impl VinoDriver {
                         );
                         continue 'per_head;
                     };
-                    let kd_h = hdcp::derive_kd(&km_h, &rtx_h, &rrx_h)?;
+                    let kd = hdcp::derive_kd(&km_h, &rtx_h, &rrx_h)?;
                     edkey_h = Some(hdcp::compute_eks(&km_h, &rtx_h, &rrx_h, &rn_h, &ske_ks_h)?);
-                    let vf = hdcp::compute_v_full(&kd_h, &session.rxid_list);
-                    let mut v = [0u8; 16];
-                    v.copy_from_slice(&vf[16..]);
-                    v_h = Some(v);
+                    // Ridge retains the older reply-drain path and has only the dock-wide list
+                    // available here. Navarro replaces this after SKE with the verified list from
+                    // this exact head.
+                    if !profile.per_head_onehot {
+                        let vf = hdcp::compute_v_full(&kd, &session.rxid_list);
+                        let mut ack = [0u8; drm_hdcp::V_PRIME_HALF_LEN];
+                        ack.copy_from_slice(&vf[drm_hdcp::V_PRIME_HALF_LEN..]);
+                        v_h = Some(ack);
+                    }
+                    kd_h = Some(kd);
                     rrx_applied = true;
                 }
                 // id=0x26 (Stream_Manage restatement) is fully decoded -- deterministic content,
@@ -1742,18 +2047,35 @@ impl VinoDriver {
                         cp::seal_interactive(&session.ks, &session.riv, id, wseq, &content)?;
                     Self::submit_cp_frame(dev, &mut out_q, &frame)?;
                     sent += 1;
-                    let d = Self::drain_ep84(
-                        dev,
-                        ep84_q.as_mut(),
-                        &mut resp,
-                        session,
-                        edid_out,
-                        Delta::from_millis(10),
-                    );
+                    let d = if profile.per_head_onehot {
+                        Self::wait_perhead_push(
+                            dev,
+                            ep84_q.as_mut(),
+                            &mut resp,
+                            session,
+                            ake::id::REPEATERAUTH_STREAM_READY,
+                            Delta::from_millis(30),
+                        )
+                    } else {
+                        Self::drain_ep84(
+                            dev,
+                            ep84_q.as_mut(),
+                            &mut resp,
+                            session,
+                            edid_out,
+                            Delta::from_millis(10),
+                        )
+                    };
                     drained += d.reads;
                     acks += d.acks;
                     rejects += d.rejects;
                     fresh_rrx = fresh_rrx.or(d.perhead_rrx);
+                    if profile.per_head_onehot && d.perhead_mprime.is_none() {
+                        pr_err!(
+                            "vino: head {head} downstream HDCP never returned M'/Stream_Ready\n"
+                        );
+                        return Err(EPROTO);
+                    }
                     cp_ctr += 1;
                     wseq += ((content_len + 15) / 16) as u32;
                     continue;
@@ -1839,36 +2161,156 @@ impl VinoDriver {
                 let frame = cp::seal_interactive(&session.ks, &session.riv, id, wseq, &c)?;
                 Self::submit_cp_frame(dev, &mut out_q, &frame)?;
                 sent += 1;
-                let d = Self::drain_ep84(
-                    dev,
-                    ep84_q.as_mut(),
-                    &mut resp,
-                    session,
-                    edid_out,
-                    Delta::from_millis(10),
-                );
-                drained += d.reads;
-                acks += d.acks;
-                rejects += d.rejects;
-                fresh_rrx = fresh_rrx.or(d.perhead_rrx);
-                // AKE_No_Stored_km starts the receiver's H' calculation. LC_Init must not be sent
-                // until its minimum processing interval has elapsed.
-                if i == 2 {
-                    hold_until(send_at, HDCP_HPRIME_WAIT_US);
-                    // Drain the certificate, fresh RRX and H' response after the hold.
-                    let dh = Self::drain_ep84(
+                let mut d = if profile.per_head_onehot && i <= 5 {
+                    let want = match i {
+                        0 => ake::id::AKE_SEND_CERT,
+                        1 => 0x14, // DisplayLink AKE_Receiver_Info
+                        2 => ake::id::AKE_SEND_RRX,
+                        3 => ake::id::LC_SEND_L_PRIME,
+                        4 => ake::id::REPEATERAUTH_SEND_RECEIVERID_LIST,
+                        _ => ake::id::RECEIVER_AUTH_STATUS,
+                    };
+                    Self::wait_perhead_push(
+                        dev,
+                        ep84_q.as_mut(),
+                        &mut resp,
+                        session,
+                        want,
+                        Delta::from_millis(30),
+                    )
+                } else if profile.per_head_onehot {
+                    Self::lockstep_reply(
+                        dev,
+                        ep84_q.as_mut(),
+                        &mut resp,
+                        session,
+                        cp_ctr,
+                        edid_out,
+                    )
+                } else {
+                    Self::drain_ep84(
                         dev,
                         ep84_q.as_mut(),
                         &mut resp,
                         session,
                         edid_out,
                         Delta::from_millis(10),
+                    )
+                };
+                perhead_repeater = perhead_repeater.or(d.perhead_repeater);
+                fresh_rrx = fresh_rrx.or(d.perhead_rrx);
+
+                // AKE_No_Stored_km starts the receiver's H' calculation. Rrx is the immediate
+                // result; H' and pairing info are later, distinct milestones. DLM does not send
+                // LC_Init until both have crossed EP84.
+                if i == 2 && profile.per_head_onehot {
+                    let Some(rrx_h) = fresh_rrx else {
+                        cp_ctr += 1;
+                        wseq += ((content_len + 15) / 16) as u32;
+                        pr_info!(
+                            "vino: head {head} has no downstream sink (no AKE_Send_Rrx); skipping its authentication\n"
+                        );
+                        continue 'per_head;
+                    };
+                    hold_until(send_at, HDCP_HPRIME_WAIT_US);
+                    let dh = Self::wait_perhead_push(
+                        dev,
+                        ep84_q.as_mut(),
+                        &mut resp,
+                        session,
+                        ake::id::AKE_SEND_H_PRIME,
+                        Delta::from_millis(50),
                     );
-                    drained += dh.reads;
-                    acks += dh.acks;
-                    rejects += dh.rejects;
-                    fresh_rrx = fresh_rrx.or(dh.perhead_rrx);
+                    d.add(dh);
+                    let dp = Self::wait_perhead_push(
+                        dev,
+                        ep84_q.as_mut(),
+                        &mut resp,
+                        session,
+                        0x08, // AKE_Send_Pairing_Info
+                        Delta::from_millis(30),
+                    );
+                    d.add(dp);
+                    let Some(hprime) = d.perhead_hprime else {
+                        pr_err!("vino: head {head} downstream HDCP returned no H'\n");
+                        return Err(EPROTO);
+                    };
+                    let kd = hdcp::derive_kd(&km_h, &rtx_h, &rrx_h)?;
+                    let want_h = hdcp::compute_h(&kd, &rtx_h, perhead_repeater.unwrap_or(true));
+                    if want_h != hprime {
+                        pr_err!("vino: head {head} downstream H' mismatch\n");
+                        return Err(EPROTO);
+                    }
+                    edkey_h = Some(hdcp::compute_eks(
+                        &km_h,
+                        &rtx_h,
+                        &rrx_h,
+                        &rn_h,
+                        &ske_ks_h,
+                    )?);
+                    kd_h = Some(kd);
+                    rrx_applied = true;
+                    vino_debug!("vino: head {head} downstream H' verified\n");
                 }
+
+                if i == 3 && profile.per_head_onehot {
+                    let Some(lprime) = d.perhead_lprime else {
+                        pr_err!("vino: head {head} downstream HDCP returned no L'\n");
+                        return Err(EPROTO);
+                    };
+                    let (Some(kd), Some(rrx_h)) = (kd_h.as_ref(), fresh_rrx.as_ref()) else {
+                        return Err(EPROTO);
+                    };
+                    if hdcp::compute_l(kd, rrx_h, &rn_h) != lprime {
+                        pr_err!("vino: head {head} downstream L' mismatch\n");
+                        return Err(EPROTO);
+                    }
+                    vino_debug!("vino: head {head} downstream L' verified\n");
+                }
+
+                if i == 4 && profile.per_head_onehot {
+                    let Some((list_header, vprime)) = d.perhead_v else {
+                        pr_err!(
+                            "vino: head {head} downstream HDCP returned no ReceiverID_List/V'\n"
+                        );
+                        return Err(EPROTO);
+                    };
+                    let Some(kd) = kd_h.as_ref() else {
+                        return Err(EPROTO);
+                    };
+                    let vf = hdcp::compute_v_full(kd, &list_header);
+                    if vf[..drm_hdcp::V_PRIME_HALF_LEN] != vprime {
+                        pr_err!("vino: head {head} downstream V' mismatch\n");
+                        return Err(EPROTO);
+                    }
+                    let mut ack = [0u8; drm_hdcp::V_PRIME_HALF_LEN];
+                    ack.copy_from_slice(&vf[drm_hdcp::V_PRIME_HALF_LEN..]);
+                    v_h = Some(ack);
+                    if session.rxid_list.as_slice() != list_header {
+                        vino_debug!(
+                            "vino: head {head} ReceiverID list differs from dock-wide list\n"
+                        );
+                    }
+                    vino_debug!("vino: head {head} downstream V' verified\n");
+                }
+
+                if i == 5 && profile.per_head_onehot {
+                    let Some(status) = d.perhead_auth_status else {
+                        pr_err!(
+                            "vino: head {head} downstream HDCP returned no receiver-auth status\n"
+                        );
+                        return Err(EPROTO);
+                    };
+                    if status != 0x04 {
+                        pr_err!(
+                            "vino: head {head} downstream receiver-auth status {status:#x}, expected 0x04\n"
+                        );
+                        return Err(EPROTO);
+                    }
+                }
+                drained += d.reads;
+                acks += d.acks;
+                rejects += d.rejects;
                 // Attribute a display-capability reply by its echoed stream-open counter.
                 if let Some(c) = d.display_cap_ctr {
                     for h in 0..Self::CP_SETUP_HEADS {
@@ -1902,6 +2344,14 @@ impl VinoDriver {
                 }
             }
 
+            if trace_crypto_enabled() {
+                pr_info!(
+                    "vino-crypto: video head={head} raw_key={:02x?} delivered_riv={riv_h:02x?} key={:02x?} nonce={:02x?}\n",
+                    &ske_ks_h[..],
+                    &video_keys[head][..16],
+                    &video_keys[head][16..24]
+                );
+            }
             head_ok[head] = true;
             heads_authenticated += 1;
         }
@@ -1924,6 +2374,31 @@ impl VinoDriver {
             pr_info!(
                 "vino: platform has no per-head authentication; link AKE only, video keys from the link session\n"
             );
+        }
+
+        // Navarro performs one dock-wide state transition after the last per-connector AKE and
+        // before any connector finalizer. This message was absent from vino even though its
+        // authenticated DLM reply reports state 2. Keep it Navarro-only until a Ridge transcript
+        // establishes that platform's behavior.
+        if profile.per_head_onehot {
+            let state = cp::post_auth_state_req(cp_ctr)?;
+            let frame =
+                cp::seal_interactive(&session.ks, &session.riv, 0x15, wseq, &state)?;
+            Self::submit_cp_frame(dev, &mut out_q, &frame)?;
+            sent += 1;
+            let d = Self::drain_ep84(
+                dev,
+                ep84_q.as_mut(),
+                &mut resp,
+                session,
+                edid_out,
+                Delta::from_millis(10),
+            );
+            drained += d.reads;
+            acks += d.acks;
+            rejects += d.rejects;
+            cp_ctr += 1;
+            wseq += ((state.len() + 15) / 16) as u32;
         }
 
         // Finalize the streams of the heads that authenticated, before entering the steady-state
@@ -1976,19 +2451,22 @@ impl VinoDriver {
             queue.flush(dev.io(), timeout())?;
         }
 
-        // Commit the control setup after msg0.
-        dev.control_send(
-            0x24,
-            0x40, /* VENDOR_OUT */
-            0,
-            0,
-            &[],
-            timeout(),
-            GFP_KERNEL,
-        )?;
-        // Refresh the interface state after the render/commit request.
-        let mut state2 = [0u8; 28];
-        dev.control_recv(0x22, 0xc1, 1, 0, &mut state2, timeout(), GFP_KERNEL)?;
+        // Ridge commits after finalization. Navarro has already committed at its measured
+        // post-0x15/pre-0x16 boundary above.
+        if !profile.navarro_mode_words {
+            dev.control_send(
+                0x24,
+                0x40, /* VENDOR_OUT */
+                0,
+                0,
+                &[],
+                timeout(),
+                GFP_KERNEL,
+            )?;
+            // Refresh the interface state after the render/commit request.
+            let mut state2 = [0u8; 28];
+            dev.control_recv(0x22, 0xc1, 1, 0, &mut state2, timeout(), GFP_KERNEL)?;
+        }
 
         // Read the dock's reply: a VERIFIED `wsub=0x45` ack means the cipher engaged on our frame.
         let ls = Self::lockstep_reply(dev, ep84_q.as_mut(), &mut resp, session, 0x08, edid_out);
@@ -2022,7 +2500,98 @@ impl VinoDriver {
         }
 
         // Complete downstream discovery on the authenticated counter stream.
-        {
+        if profile.per_head_onehot {
+            // Navarro's authenticated DLM transcript is a compact, ordered transaction. Keep it
+            // separate from Ridge's older retry-heavy discovery below: hundreds of extra status
+            // polls delayed Navarro's first mode by ~23 seconds and changed every live counter.
+            macro_rules! navarro_send {
+                ($id:expr, $body:expr) => {{
+                    let id: u16 = $id;
+                    let body = $body;
+                    let e = Self::send_live_cp(
+                        dev,
+                        session,
+                        ep84_q.as_mut(),
+                        &mut resp,
+                        edid_out,
+                        id,
+                        wseq,
+                        &body,
+                    )?;
+                    drained += e.reads;
+                    acks += e.acks;
+                    rejects += e.rejects;
+                    sent += 1;
+                    wseq = wseq.wrapping_add(((body.len() + 15) / 16) as u32);
+                    cp_ctr += 1;
+                }};
+            }
+
+            // DLM first seeks every physical connector, including empty sockets.
+            for connector in 0..connector_count {
+                let probe = cp::get_edid_req_sub(cp_ctr, 0x20, connector as u8)?;
+                navarro_send!(0x15, probe);
+            }
+            let devq = cp::device_query_req(cp_ctr, 0x0000)?;
+            navarro_send!(0x14, devq);
+
+            let mut active = [false; Self::CP_SETUP_HEADS];
+            for head in 0..connector_count {
+                // Navarro exposes four connector numbers on two physical video pipes. The
+                // working two-panel DLM session discovers all four sockets but opens only the
+                // first connector on each distinct pipe (0/1, not their 2/3 aliases).
+                let endpoint = profile.video_eps[head];
+                if profile.video_eps[..head].contains(&endpoint) {
+                    continue;
+                }
+                active[head] = true;
+                *edid_out = None;
+                let hu8 = head as u8;
+                let kick = cp::edid_readiness_kick(cp_ctr, hu8)?;
+                navarro_send!(0x16, kick);
+                let probe = cp::get_edid_req_sub(cp_ctr, 0x20, hu8)?;
+                navarro_send!(0x15, probe);
+                let fetch = cp::get_edid_req(cp_ctr, hu8)?;
+                navarro_send!(0x15, fetch);
+                // The fetch drain carries the asynchronous EDID in the working DLM cadence.
+                edid_heads[head] = edid_out.take();
+                discovery_deferred[head] = edid_heads[head].is_none();
+            }
+            // DLM engages each active connector once, after all kick/probe/fetch triplets.
+            for head in 0..connector_count {
+                if active[head] {
+                    let engage = cp::edid_engage_req(cp_ctr, head as u8)?;
+                    navarro_send!(0x16, engage);
+                }
+            }
+
+            // Two status samples bracket the one-shot RTC synchronization, followed by thirteen
+            // more samples in the same-day working capture.
+            for _ in 0..2 {
+                let status = cp::device_query_req(cp_ctr, 0x000c)?;
+                navarro_send!(0x14, status);
+            }
+            // SAFETY: reading CLOCK_REALTIME seconds has no caller-side preconditions.
+            let now = unsafe { kernel::bindings::ktime_get_real_seconds() } as i64;
+            let rtc = cp::rtc_sync_req(
+                cp_ctr,
+                now,
+                *crate::module_parameters::rtc_utc_offset_minutes.value(),
+            )?;
+            navarro_send!(0x1e, rtc);
+            for _ in 0..13 {
+                let status = cp::device_query_req(cp_ctr, 0x000c)?;
+                navarro_send!(0x14, status);
+            }
+            // The last discovery records immediately preceding DLM's clear-mode pair re-seek
+            // each active connector once.
+            for head in 0..connector_count {
+                if active[head] {
+                    let probe = cp::get_edid_req_sub(cp_ctr, 0x20, head as u8)?;
+                    navarro_send!(0x15, probe);
+                }
+            }
+        } else {
             // Open discovery with a heartbeat and the one-shot device-capability query.
             let hb = cp::heartbeat(cp_ctr)?;
             let e = Self::send_live_cp(
@@ -2251,8 +2820,15 @@ impl VinoDriver {
 
     /// Seal and send one live interactive control message.
     ///
-    /// EP84 is drained between bounded NAK retries and once after a successful submission. The
-    /// returned tally distinguishes verified acknowledgments from rejected ciphertext.
+    /// The OUT is one long-lived URB, then EP84 is drained once after its completion. The returned
+    /// tally distinguishes verified acknowledgments from rejected ciphertext.
+    ///
+    /// Do not implement a short-timeout retry here. A USB bulk timeout does not prove that no
+    /// bytes reached the device: Navarro accepted several complete 64-byte frames just before
+    /// Vino cancelled their 5 ms URBs. Re-submitting the same sealed frame consequently put
+    /// duplicate inner counters on the wire (measured at counters 72, 75 and 95), while DLM sends
+    /// each transaction once. Leaving one URB outstanding lets xHCI retry NRDY packets without
+    /// replaying an already accepted application message.
     fn send_live_cp(
         dev: &UsbLink<'_>,
         session: &Session,
@@ -2265,34 +2841,8 @@ impl VinoDriver {
     ) -> Result<Ep84Drain> {
         let frame = cp::seal_interactive(&session.ks, &session.riv, id, wire_seq, content)?;
 
-        // Single-packet OUT: a NAK transfers nothing, so cancel+retry is safe. Between attempts
-        // drain EP84 so the dock can push/drain its IN queue (matches msg0's behaviour).
-        const TRIES: usize = 40;
-        let mut accepted = false;
-        let mut last_err = ETIMEDOUT;
         let mut tally = Ep84Drain::default();
-        for _ in 0..TRIES {
-            match dev.ctrl_send(&frame, Delta::from_millis(5), GFP_KERNEL) {
-                Ok(_) => {
-                    accepted = true;
-                    break;
-                }
-                Err(e) => {
-                    last_err = e;
-                    tally.add(Self::drain_ep84(
-                        dev,
-                        q.as_deref_mut(),
-                        resp,
-                        session,
-                        edid_out,
-                        Delta::from_millis(10),
-                    ));
-                }
-            }
-        }
-        if !accepted {
-            return Err(last_err);
-        }
+        dev.ctrl_send(&frame, timeout(), GFP_KERNEL)?;
         // Collect the dock's reply, including a possible get-EDID id=0x194 frame.
         tally.add(Self::drain_ep84(
             dev,
@@ -2395,10 +2945,13 @@ impl VinoDriver {
                 Ok(len) if len > 0 => {
                     out.reads += 1;
                     Self::log_ep84(session, &buf[..len]);
-                    // Capture the per-head Rrx from the `id=0x10 sub=0x84`
-                    // push for the downstream repeater AKE.
-                    if out.perhead_rrx.is_none() {
-                        out.perhead_rrx = cp::perhead_rrx(&session.ks, &session.riv, &buf[..len]);
+                    // Decode every downstream-HDCP milestone, not just Rrx.  A generic encrypted
+                    // envelope acknowledgment does not mean the downstream authentication has
+                    // advanced; L', V' and M' are the state-machine gates.
+                    if let Some(push) =
+                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len])
+                    {
+                        out.observe_perhead(push);
                     }
                     if len >= 10 && u16::from_le_bytes([buf[8], buf[9]]) == 0x45 {
                         // The 0x45 wire tag is shared by status traffic. Only a valid decrypted
@@ -2496,6 +3049,68 @@ impl VinoDriver {
         out
     }
 
+    /// Read through the downstream-HDCP reply stream until one specific protocol milestone.
+    ///
+    /// Navarro acknowledges every encrypted envelope before it emits the corresponding HDCP
+    /// result.  Advancing on the generic ACK alone allowed Vino to send SKE/V-ACK/Stream-Manage
+    /// without ever receiving L', V' or M'.  The dock accepted the envelopes but never enabled
+    /// the video consumer.  This routine makes the HDCP result, rather than the wrapper ACK, the
+    /// sequencing condition.
+    fn wait_perhead_push(
+        dev: &UsbLink<'_>,
+        mut q: Option<&mut usb::BulkInQueue>,
+        buf: &mut [u8],
+        session: &Session,
+        want_msg_id: u8,
+        wait: Delta,
+    ) -> Ep84Drain {
+        const MAX_READS: usize = 16;
+        let mut out = Ep84Drain::default();
+        for _ in 0..MAX_READS {
+            match Self::read_ep84(dev, q.as_deref_mut(), buf, wait) {
+                Ok(len) if len > 16 => {
+                    out.reads += 1;
+                    Self::log_ep84(session, &buf[..len]);
+                    if let Some(push) =
+                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len])
+                    {
+                        out.observe_perhead(push);
+                        if out.saw_perhead(want_msg_id) {
+                            return out;
+                        }
+                        continue;
+                    }
+                    if u16::from_le_bytes([buf[8], buf[9]]) != 0x45 {
+                        continue;
+                    }
+                    match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len]) {
+                        Some((id, sub, ctr)) => {
+                            out.acks += 1;
+                            vino_debug!(
+                                "vino: CP acknowledgment while waiting for HDCP {want_msg_id:#x}: id={id:#x} sub={sub:#x} ctr={ctr}\n"
+                            );
+                        }
+                        None if cp::decode_in_lenient(
+                            &session.ks,
+                            &session.riv,
+                            &buf[..len],
+                        )
+                        .is_some() => {
+                            out.acks += 1;
+                        }
+                        None => {
+                            out.rejects += 1;
+                            pr_warn!("vino: invalid encrypted CP reply\n");
+                        }
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
     /// Drain replies until a verified inner counter echoes the submitted request.
     ///
     /// Asynchronous pushes are processed while waiting, and the operation remains bounded.
@@ -2516,6 +3131,11 @@ impl VinoDriver {
                     Self::log_ep84(session, &buf[..len]);
                     if u16::from_le_bytes([buf[8], buf[9]]) != 0x45 {
                         continue;
+                    }
+                    if let Some(push) =
+                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len])
+                    {
+                        out.observe_perhead(push);
                     }
                     match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len]) {
                         Some((id, sub, ctr)) => {
@@ -2767,6 +3387,14 @@ kernel::module_usb_driver! {
             default: 0,
             description: "Enable verbose Vino protocol and scanout diagnostics",
         },
+        trace_crypto: u8 {
+            default: 0,
+            description: "Diagnostic: disclose ephemeral control/video keys and nonces for one decryptable usbmon capture",
+        },
+        rtc_utc_offset_minutes: i32 {
+            default: 0,
+            description: "Local UTC offset used by Navarro RTC synchronization (minutes east of UTC)",
+        },
         force_video: u8 {
             default: 0,
             description: "Drive video on docks whose profile disables it (experiment; may reset the dock)",
@@ -2785,7 +3413,7 @@ kernel::module_usb_driver! {
         },
         video_clear_halt: u8 {
             default: 0,
-            description: "Clear the video endpoint halt before streaming. DLM does NOT do this on the DL7400 -- it only clears ep 0x81 (audio) -- and usb_clear_halt() resets the host's sequence number while the dock's is untouched",
+            description: "Diagnostic: additionally clear a video endpoint when its queue opens (Navarro's required pre-commit EP08/EP0a clear is always sent at the captured point)",
         },
         video_clear_each: u8 {
             default: 0,
@@ -2797,7 +3425,7 @@ kernel::module_usb_driver! {
         },
         video_sync: u8 {
             default: 0,
-            description: "Pace video as DLM does: one synchronous transfer at a time, never pipelined",
+            description: "Diagnostic: send every video transfer synchronously instead of using DLM's mixed first-chunk/pipelined transport",
         },
         video_records: u32 {
             default: 0,
@@ -3124,18 +3752,21 @@ mod tests {
         hdr[12..16].copy_from_slice(&4u32.to_le_bytes()); // wire_seq = 4
         let frame = cp::seal_livemac(&ks, &riv, &hdr, &content)?;
         assert_eq!(frame.len(), 16 + 32 + 16);
+        let body = &frame[16..];
         let ct = &frame[16..16 + 32];
-        // `open_in` applies AES-CTR with the supplied nonce. Use the same RIV that sealed this
-        // host-to-dock fixture; the receive direction uses a distinct nonce and keystream.
-        assert_eq!(&cp::open_in(&ks, &riv, 4, ct)?[..], &content[..]);
+        // `open_in` verifies the appended Dl3Cmac, then applies AES-CTR with the supplied nonce.
+        assert_eq!(&cp::open_in(&ks, &riv, 4, body)?[..], &content[..]);
         // And pin that contract rather than leaving it implicit: the IN nonce really is different,
-        // so opening with it must NOT recover the plaintext.
+        // so both its MAC nonce and content keystream reject this fixture.
         assert_ne!(cp::in_riv(&riv), riv);
-        assert_ne!(
-            &cp::open_in(&ks, &cp::in_riv(&riv), 4, ct)?[..],
-            &content[..]
-        );
+        assert!(cp::open_in(&ks, &cp::in_riv(&riv), 4, body).is_err());
         assert_eq!(&frame[16 + 32..], &cp::dl3cmac_tag(&ks, &riv, 4, ct)?[..]);
+
+        let mut damaged = KVec::new();
+        damaged.extend_from_slice(body, GFP_KERNEL)?;
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        assert!(cp::open_in(&ks, &riv, 4, &damaged).is_err());
         Ok(())
     }
 
@@ -3165,6 +3796,19 @@ mod tests {
                 Some((0x14, 0x30, 9))
             );
         }
+
+        // Navarro's connector 2/3 HDCP pushes carry the upper half of their one-hot selector at
+        // inner offsets 6--7. They are authenticated messages, not malformed zero-pad headers.
+        let selector_push = [0x10, 0, 0x84, 0, 0, 0, 0, 0x80];
+        let frame = cp::seal_livemac(&ks, &in_head0, &header, &selector_push)?;
+        assert_eq!(
+            cp::decode_in_lenient(&ks, &out_head0, &frame),
+            Some((0x10, 0x84, 0))
+        );
+        assert_eq!(
+            &cp::inner_plaintext(&ks, &out_head0, &frame).unwrap()[..],
+            &selector_push
+        );
         Ok(())
     }
 

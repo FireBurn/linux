@@ -32,7 +32,7 @@ use kernel::{
         SpinLock, SpinLockIrq,
     },
     time::{
-        delay::fsleep,
+        delay::{fsleep, udelay},
         hrtimer::{
             ArcHrTimerHandle, HrTimer, HrTimerCallback, HrTimerCallbackContext, HrTimerPointer,
             HrTimerRestart, RelativeHardMode,
@@ -290,7 +290,27 @@ static COLD_NAVARRO: ColdTimeline = ColdTimeline {
     h1_mode: 10,
     // DLM polls continuously across this span; there is no silent window to preserve.
     quiet_end: 11,
-    video: &[(0, 122), (1, 272)],
+    // Video is not a pair of one-shot events. DLM keeps head 0's carrier alive throughout the
+    // still-open control bracket, then starts head 1 and continues both through the closing
+    // markers. Vino previously sent one frame at +122 ms, went silent for 182 ms, and only tried
+    // the second frame after closing the bracket; Navarro accepted that frame and NAKed the next
+    // forever. These are the measured starts of DLM's frames through the +304-ms close. The later
+    // frames contain desktop pixels; the activation path uses its pre-encoded carrier here and
+    // normal scanout replaces it as soon as activation returns.
+    video: &[
+        (0, 122),
+        (0, 124),
+        (0, 134),
+        (0, 171),
+        (0, 192),
+        (0, 199),
+        (0, 235),
+        (0, 252),
+        (1, 272),
+        (0, 277),
+        (1, 293),
+        (1, 303),
+    ],
     remode: &[],
     markers: &[
         (7, 0, 0x2f, 1),
@@ -310,10 +330,109 @@ static COLD_NAVARRO: ColdTimeline = ColdTimeline {
         (303, 1, 0x2f, 0),
         (304, 1, 0x2e, 0),
     ],
-    polls: &[17, 78, 120, 162, 179, 223, 267],
+    polls: &[17, 78, 120, 162, 179, 223, 267, 295, 297, 297],
     // Navarro reads every connector's EDID before the anchor, not inside the bracket.
     edid: &[],
 };
+
+/// Reservation-token slots for [`COLD_NAVARRO::markers`] and [`COLD_NAVARRO::polls`].
+///
+/// DLM assigns counters in its per-head workers before their EP02 writes interleave. Wire AES
+/// sequence remains monotonic, but the echoed inner counters consequently do not: for example the
+/// wire order begins `n, n+1, n+3, n+2, n+5, n+4`. Navarro starts NAKing at the first flattened
+/// counter, so retain that allocation order. These numbers index live reservation tokens; they
+/// are not protocol counters and are never added to a captured/base counter.
+static NAVARRO_MARKER_COUNTER_SLOTS: &[usize] =
+    &[1, 2, 4, 6, 8, 7, 10, 12, 11, 14, 16, 17, 20, 21, 26, 27];
+static NAVARRO_POLL_COUNTER_SLOTS: &[usize] = &[5, 9, 13, 15, 18, 19, 22, 23, 24, 25];
+const NAVARRO_COLD_COUNTERS: usize = 28;
+
+/// One operation in Navarro's cold sink-reset prelude. This is separate from [`ColdTimeline`]: it
+/// runs before the first real mode set and changes downstream EDID/sink state, whereas
+/// `ColdTimeline` brackets already-programmed streams.
+#[derive(Clone, Copy)]
+enum NavarroColdOp {
+    Poll,
+    EdidState(u8, u8),
+    Probe(u8),
+    Fetch(u8),
+    SinkState(u8, u8),
+    PostEdid(u8),
+    Clear(u8),
+}
+
+/// Authenticated DLM transaction between Navarro's first clear pair and its first real mode.
+///
+/// Offsets are milliseconds from the first head-0 clear in
+/// `navarro-dlm-today-124144/wire.pcapng`. Equal offsets deliberately retain wire order. Most
+/// importantly, DLM stops both EDID readers and sends sink state `0xff` immediately after the
+/// first clears, then re-reads and re-engages each sink before its second clear. Omitting this
+/// whole state transition left the video endpoints accepting one bulk transfer and NAKing every
+/// subsequent transfer.
+static NAVARRO_COLD_PRELUDE: &[(i64, NavarroColdOp)] = &[
+    (2, NavarroColdOp::EdidState(0, 0)),
+    (3, NavarroColdOp::Probe(0)),
+    (5, NavarroColdOp::EdidState(1, 0)),
+    (5, NavarroColdOp::Probe(1)),
+    (7, NavarroColdOp::SinkState(0, 0xff)),
+    (7, NavarroColdOp::SinkState(1, 0xff)),
+    (8, NavarroColdOp::Poll),
+    (30, NavarroColdOp::Poll),
+    (50, NavarroColdOp::Poll),
+    (69, NavarroColdOp::Poll),
+    (87, NavarroColdOp::Poll),
+    (105, NavarroColdOp::Poll),
+    (123, NavarroColdOp::Poll),
+    (143, NavarroColdOp::Poll),
+    (162, NavarroColdOp::Poll),
+    (181, NavarroColdOp::Poll),
+    (201, NavarroColdOp::Poll),
+    (219, NavarroColdOp::Poll),
+    (237, NavarroColdOp::Poll),
+    (255, NavarroColdOp::Poll),
+    (273, NavarroColdOp::Poll),
+    (293, NavarroColdOp::Poll),
+    (312, NavarroColdOp::Poll),
+    (328, NavarroColdOp::Poll),
+    (329, NavarroColdOp::Poll),
+    (329, NavarroColdOp::Poll),
+    (329, NavarroColdOp::Poll),
+    (330, NavarroColdOp::Poll),
+    (330, NavarroColdOp::Poll),
+    (1216, NavarroColdOp::Poll),
+    (1233, NavarroColdOp::Poll),
+    (1315, NavarroColdOp::Poll),
+    (1650, NavarroColdOp::Poll),
+    (1667, NavarroColdOp::Poll),
+    (1750, NavarroColdOp::Poll),
+    (1755, NavarroColdOp::Probe(0)),
+    (1757, NavarroColdOp::EdidState(0, 1)),
+    (1758, NavarroColdOp::Probe(0)),
+    (1805, NavarroColdOp::Fetch(0)),
+    (1810, NavarroColdOp::SinkState(0, 0)),
+    (1822, NavarroColdOp::Clear(0)),
+    (1827, NavarroColdOp::Poll),
+    (1850, NavarroColdOp::Probe(1)),
+    (1853, NavarroColdOp::EdidState(1, 1)),
+    (1856, NavarroColdOp::Probe(1)),
+    (1902, NavarroColdOp::PostEdid(0)),
+    (1903, NavarroColdOp::Fetch(1)),
+    (1907, NavarroColdOp::SinkState(1, 1)),
+    (1930, NavarroColdOp::Clear(1)),
+    (1934, NavarroColdOp::Poll),
+    (1956, NavarroColdOp::Poll),
+    (1975, NavarroColdOp::Poll),
+    (1994, NavarroColdOp::Poll),
+    (2003, NavarroColdOp::Poll),
+    (2005, NavarroColdOp::Poll),
+    (2007, NavarroColdOp::PostEdid(1)),
+    (2016, NavarroColdOp::Poll),
+];
+
+/// Navarro tears both pipe descriptors down first, then executes
+/// [`NAVARRO_COLD_PRELUDE`] before programming the first real mode.
+const NAVARRO_PRIME_CLEAR_H1_MS: i64 = 2;
+const NAVARRO_REAL_MODE_H0_MS: i64 = 2978;
 /// How long the KMS worker waits for the rest of a multi-head atomic commit's mode sets.
 ///
 /// Bounded so a genuine single-head commit costs at most this before proceeding.
@@ -792,6 +911,11 @@ pub(super) struct VinoDrmData {
     /// activation timeline. Without this, a keepalive poll can win `cp_link` between
     /// two explicitly paced markers and stretch/reorder the sequence.
     cp_timeline_exclusive: core::sync::atomic::AtomicBool,
+    /// Navarro's authenticated setup transcript continues directly into the first KMS
+    /// transaction: its first runtime message is a pipe clear, not a background status poll.
+    /// Hold the keepalive after publishing the session until that transaction has claimed the
+    /// control timeline.
+    initial_modeset_quiet: core::sync::atomic::AtomicBool,
     /// Mode generation successfully programmed on each dock head. Scanout must match it because
     /// atomic plane updates can precede the deferred mode-set transaction.
     modeset_active: [core::sync::atomic::AtomicU64; HEADS],
@@ -839,6 +963,8 @@ pub(super) struct VinoDrmData {
     last_timing: SpinLock<[Option<super::cp::Timing>; HEADS]>,
     /// Heads whose next video stream must be prefixed with the pipe-arm records.
     arm_prefix_pending: core::sync::atomic::AtomicU32,
+    /// Heads for which the read-only endpoint status at the first video stall was logged.
+    endpoint_status_logged: core::sync::atomic::AtomicU32,
     /// Connectors still owed the short sealed open that names a stream vino does not drive.
     ///
     /// Held apart from `arm_prefix_pending` because it is the complement of it: a connector vino
@@ -945,6 +1071,7 @@ impl VinoDrmData {
             dirty_ttl <- new_mutex!([const { None }; HEADS]),
             cp_engaged: core::sync::atomic::AtomicBool::new(false),
             cp_timeline_exclusive: core::sync::atomic::AtomicBool::new(false),
+            initial_modeset_quiet: core::sync::atomic::AtomicBool::new(false),
             modeset_active: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
             modeset_requested: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
             last_frame <- new_spinlock!([const { None }; HEADS]),
@@ -955,6 +1082,7 @@ impl VinoDrmData {
             video_staging <- new_mutex!([const { None }; HEADS]),
             last_timing <- new_spinlock!([None; HEADS]),
             arm_prefix_pending: core::sync::atomic::AtomicU32::new(0),
+            endpoint_status_logged: core::sync::atomic::AtomicU32::new(0),
             stream_open_pending: core::sync::atomic::AtomicU32::new(0),
             keyframe_pending: core::sync::atomic::AtomicU32::new(0),
             cursor_epoch: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
@@ -997,6 +1125,7 @@ impl VinoDrmData {
     pub(super) fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
         self.cp_timeline_exclusive.store(false, Ordering::Release);
+        self.initial_modeset_quiet.store(false, Ordering::Release);
     }
 
     /// Whether the parent interface is being removed.
@@ -1214,6 +1343,25 @@ impl VinoDrmData {
         usize::from(self.connectors.load(Ordering::Acquire)).min(HEADS)
     }
 
+    /// Whether `head` represents a distinct runtime stream on this dock.
+    ///
+    /// The DL7400 exposes four connector selectors but maps them in pairs onto two video bulk
+    /// endpoints. DLM discovers all four selectors during setup, then drives and polls only the
+    /// first selector for each distinct endpoint. Treating selectors 2/3 as independent heads
+    /// interleaves spurious re-engage traffic into the authenticated mode-set transcript.
+    pub(super) fn runtime_connector(&self, head: usize) -> bool {
+        if head >= self.connector_count() {
+            return false;
+        }
+        if !self.navarro_mode_words() {
+            return true;
+        }
+        let address = self.eps.video[head].address();
+        !self.eps.video[..head]
+            .iter()
+            .any(|endpoint| endpoint.address() == address)
+    }
+
     pub(super) fn set_cp_engaged(&self, engaged: bool) {
         self.cp_engaged
             .store(engaged, core::sync::atomic::Ordering::SeqCst);
@@ -1229,6 +1377,7 @@ impl VinoDrmData {
     /// any event relative to the mode-set itself.
     fn begin_cp_timeline(&self) {
         self.cp_timeline_exclusive.store(true, Ordering::Release);
+        self.initial_modeset_quiet.store(false, Ordering::Release);
         fsleep(Delta::from_millis(PROMPT_KEEPALIVE_QUIESCE_MS));
     }
 
@@ -1240,6 +1389,21 @@ impl VinoDrmData {
     /// worker checks it every millisecond while an activation sequence is in progress.
     pub(super) fn cp_timeline_exclusive(&self) -> bool {
         self.cp_timeline_exclusive.load(Ordering::Acquire)
+    }
+
+    /// Keep Navarro's setup-to-first-mode-set control stream free of background traffic.
+    pub(super) fn hold_cp_for_initial_modeset(&self) {
+        self.initial_modeset_quiet.store(true, Ordering::Release);
+    }
+
+    /// Whether the initial Navarro mode set still owns the next control message.
+    pub(super) fn initial_modeset_quiet(&self) -> bool {
+        self.initial_modeset_quiet.load(Ordering::Acquire)
+    }
+
+    /// Release the initial hold if userspace never submits a mode set.
+    pub(super) fn release_initial_modeset_quiet(&self) {
+        self.initial_modeset_quiet.store(false, Ordering::Release);
     }
 
     /// Publish the engaged CP session so the KMS callbacks can send runtime CP messages.
@@ -1312,6 +1476,31 @@ impl VinoDrmData {
         })
     }
 
+    /// Send one captured Navarro sink-reset operation.
+    fn navarro_cold_op(&self, dev: &BoundInterface<'_>, op: NavarroColdOp) -> Result {
+        match op {
+            NavarroColdOp::Poll => self.poll_status(dev),
+            NavarroColdOp::EdidState(head, state) => self.send_cp(dev, 0x16, 0, |ctr| {
+                super::cp::edid_readiness_state(ctr, head, state)
+            }),
+            NavarroColdOp::Probe(head) => self.send_cp(dev, 0x15, 0, |ctr| {
+                super::cp::get_edid_req_sub(ctr, 0x20, head)
+            }),
+            NavarroColdOp::Fetch(head) => {
+                self.send_cp(dev, 0x15, 0, |ctr| super::cp::get_edid_req(ctr, head))
+            }
+            NavarroColdOp::SinkState(head, state) => self.send_cp(dev, 0x16, 0, |ctr| {
+                super::cp::edid_sink_state(ctr, head, state)
+            }),
+            NavarroColdOp::PostEdid(head) => {
+                self.send_cp(dev, 0x15, 0, |ctr| super::cp::post_edid_query(ctr, head))
+            }
+            NavarroColdOp::Clear(head) => {
+                self.send_cp(dev, 0x48, 0, |ctr| super::cp::clear_mode(ctr, head))
+            }
+        }
+    }
+
     /// Drive `head` to black on the dock, then close its stream bracket.
     ///
     /// Runs on the command worker for [`KmsCmd::Blank`], i.e. after `atomic_disable` has already
@@ -1340,11 +1529,26 @@ impl VinoDrmData {
             band_parity_bit(),
             interlaced_bands(),
         )?;
+        let ordinary_frames = super::video::wht::black_frame_ep08_ordinary(
+            w_pad,
+            h_pad,
+            head,
+            band_parity_bit(),
+            interlaced_bands(),
+        )?;
         // Present for long enough to reach every dock buffer. The dock is multi-buffered and a
         // single presentation lands in one buffer only -- the same reason `DAMAGE_REPEATS` exists
         // -- so a one-shot blank leaves the other buffer holding the frozen desktop and the panel
         // alternates between black and stale content.
-        let sent = self.submit_prompt_training(dev, head, 0, &frames, BLANK_PRESENT_MS, false)?;
+        let sent = self.submit_prompt_training(
+            dev,
+            head,
+            0,
+            &frames,
+            &ordinary_frames,
+            BLANK_PRESENT_MS,
+            false,
+        )?;
         // Close the stream with the validated bracket. This stops the DisplayLink stream without
         // forcing the monitor into hard standby.
         self.stream_marker(dev, head, 0x2f, 0)?;
@@ -1397,6 +1601,26 @@ impl VinoDrmData {
         let elapsed_ms = (Instant::<Monotonic>::now() - anchor).as_millis();
         if elapsed_ms < target_ms {
             fsleep(Delta::from_millis(target_ms - elapsed_ms));
+        }
+    }
+
+    /// Sleep/spin until an exact microsecond offset in a short video-transport schedule.
+    ///
+    /// `fsleep` handles the bulk of the delay without burning a CPU; the small busy-wait tail
+    /// avoids scheduling a producer boundary hundreds of microseconds late. This is used only for
+    /// the four submissions of Navarro's one-shot prologue.
+    fn wait_video_offset(anchor: Instant<Monotonic>, target_us: i64) {
+        const SPIN_MARGIN_US: i64 = 80;
+        let elapsed = anchor.elapsed().as_micros_ceil();
+        if elapsed >= target_us {
+            return;
+        }
+        if target_us - elapsed > SPIN_MARGIN_US {
+            fsleep(Delta::from_micros(target_us - elapsed - SPIN_MARGIN_US));
+        }
+        let elapsed = anchor.elapsed().as_micros_ceil();
+        if elapsed < target_us {
+            udelay(Delta::from_micros(target_us - elapsed));
         }
     }
 
@@ -1462,6 +1686,7 @@ impl VinoDrmData {
         head: u8,
         want: u64,
         frames: &[KVec<u8>],
+        ordinary_frames: &[KVec<u8>],
         duration_ms: i64,
         with_arm: bool,
     ) -> Result<u32> {
@@ -1492,15 +1717,6 @@ impl VinoDrmData {
             0 => usize::MAX,
             n => (n as usize).saturating_mul(4048),
         };
-        let mut image_len: usize = 0;
-        let mut image_parts = 0usize;
-        for f in frames.iter() {
-            if image_len >= image_cap {
-                break;
-            }
-            image_len += f.len().min(image_cap - image_len);
-            image_parts += 1;
-        }
         // The DL7400's per-strip parameter map, ahead of the pixels it describes. This path --
         // the startup/prompt-training submit -- is the one the dock's first frames go out on, so
         // wiring the map only into the steady-state scanout left it absent from every frame that
@@ -1552,24 +1768,48 @@ impl VinoDrmData {
             } else {
                 &[]
             };
+            let opener = self.build_frame_opener(head, seq, !arm_slice.is_empty());
+            let opener_slice: &[u8] = opener.as_ref().map_or(&[], |o| &o[..]);
             // The dock is owed one sealed report on the stream sub for every frame on the frame
             // sub; without it the link is torn down a few seconds after the first frame.
             //
-            // ⚠ Except on the frame that carries the prologue. DLM's first frame goes straight
-            // from the decoder configuration to its image records: no stream report, and no
-            // parameter map until about forty-five image records in. vino put both immediately
-            // after the configuration, so its records 6 and 7 were two records DLM never sends
-            // there -- and the dock accepted exactly one transfer and then stopped draining.
+            // The prologue frame is the one exception for the report: DLM goes directly from its
+            // decoder configuration into image records. It is *not* an exception for the
+            // parameter map. The same-day DLM cold capture carries the map part-way through frame
+            // zero, and Windows carries it after the image records. Both put it before frame
+            // close. Omitting it made vino's first frame exactly 5,984 bytes short and left the
+            // dock briefly scanning a partially described framebuffer.
             let report = if arm_slice.is_empty() {
                 self.build_stream_report_buf(head_i)?
             } else {
                 None
             };
             let report_slice: &[u8] = report.as_ref().map_or(&[], |r| &r[..]);
-            // Same rule for the parameter map.
-            let params_slice: &[u8] = if arm_slice.is_empty() { &params[..] } else { &[] };
-            let wire_len =
-                arm_slice.len() + report_slice.len() + params_slice.len() + image_len + trailer.len();
+            let params_slice: &[u8] = &params[..];
+            // The prologue and ordinary DLM carriers contain identical strips but different
+            // producer record boundaries. Select by the presence of the one-shot arm rather than
+            // by this helper's local `repeat`: the cold timeline invokes the helper once per
+            // measured presentation, so every invocation starts with repeat zero.
+            let frame_parts = if arm_slice.is_empty() {
+                ordinary_frames
+            } else {
+                frames
+            };
+            let mut image_len: usize = 0;
+            let mut image_parts = 0usize;
+            for f in frame_parts.iter() {
+                if image_len >= image_cap {
+                    break;
+                }
+                image_len += f.len().min(image_cap - image_len);
+                image_parts += 1;
+            }
+            let wire_len = arm_slice.len()
+                + opener_slice.len()
+                + report_slice.len()
+                + params_slice.len()
+                + image_len
+                + trailer.len();
             {
                 let mut staging_slots = self.video_staging.lock();
                 let staging_slot = &mut staging_slots[head_i];
@@ -1582,18 +1822,10 @@ impl VinoDrmData {
 
                 let mut queue_slot = self.video_q[pipe_i].lock();
                 if queue_slot.is_none() {
-                    // Clear the endpoint's halt feature before the stream's first byte. DLM does
-                    // this on every video endpoint ahead of its first frame, and the DL7400 stalls
-                    // the pipe on the opening image records without it. Clearing also resets the
-                    // endpoint's sequence number, which is what the dock is really waiting for.
-                    // ⚠ vino used to clear the halt here unconditionally, on the claim that "DLM
-                    // does this on every video endpoint ahead of its first frame". It does not:
-                    // the only CLEAR_FEATURE(ENDPOINT_HALT) in a same-day keyed capture is on
-                    // ep 0x81, the audio interrupt. `usb_clear_halt()` calls
-                    // `usb_reset_endpoint()`, which resets the *host's* sequence number while the
-                    // dock's is left alone -- and a SuperSpeed bulk endpoint whose sequence
-                    // numbers disagree accepts one burst and then NAKs forever, which is exactly
-                    // what this dock does at 65,536 bytes.
+                    // Navarro's required EP08/EP0a clears are sent together at their captured
+                    // pre-commit point in `send_cp_setup`. Repeating a clear here, after stream
+                    // setup has begun, is intentionally diagnostic-only: it changes SuperSpeed
+                    // endpoint sequence state at a point DLM does not.
                     if *crate::module_parameters::video_clear_halt.value() != 0 {
                         let _ = dev.clear_video_halt(head_i);
                     }
@@ -1610,33 +1842,120 @@ impl VinoDrmData {
                     .as_mut()
                     .ok_or(kernel::error::code::ENODEV)?;
 
-                // Wire order per frame, as DLM sends it: this frame's opening records, then the
-                // sealed stream report, then the pixels, then the frame's closing records.
-                let arm_parts = usize::from(!arm_slice.is_empty());
-                let report_parts = usize::from(!report_slice.is_empty());
-                let param_parts = usize::from(!params_slice.is_empty());
-                let lead = arm_parts + report_parts + param_parts;
-                let part_count = lead + image_parts + 1;
+                // A carrier is one protocol frame split over several URBs. Never block after
+                // submitting only its prefix: DLM's video producer and control workers are
+                // independent, while this cold-timeline worker also owes the marker burst that
+                // surrounds the first video bytes. On a non-draining endpoint the old path filled
+                // the eight slots with two complete frames plus one URB of frame three, then
+                // waited a second for frame-three URB two. The due +14-ms marker consequently
+                // never reached EP02 even though the dock had authenticated the preceding marker.
+                // Defer the whole presentation when it cannot fit; the next scheduled carrier can
+                // retry after the control messages have advanced the dock state.
+                let frame_urbs = wire_len.div_ceil(xfer);
+                if !queue.can_send_n(dev.io(), frame_urbs)? {
+                    if self
+                        .endpoint_status_logged
+                        .fetch_or(head_bit, Ordering::AcqRel)
+                        & head_bit
+                        == 0
+                    {
+                        match dev.video_endpoint_status(head_i) {
+                            Ok(status) => pr_info!(
+                                "vino: head={} endpoint={:#04x} stopped accepting video: GET_STATUS={:#06x} halt={}\n",
+                                head,
+                                dev.eps.video[head_i].address(),
+                                status,
+                                status & 1
+                            ),
+                            Err(e) => pr_warn!(
+                                "vino: head={} endpoint={:#04x} stopped accepting video: GET_STATUS failed ({e:?})\n",
+                                head,
+                                dev.eps.video[head_i].address()
+                            ),
+                        }
+                    }
+                    if duration_ms <= 0 {
+                        return Ok(repeat);
+                    }
+                    if (Instant::<Monotonic>::now() - started).as_millis() >= duration_ms {
+                        break;
+                    }
+                    fsleep(Delta::from_millis(1));
+                    continue;
+                }
+
+                // Navarro's captured DLM stream flushes its two parameter records after exactly
+                // 115168 bytes of image records in both the prologue and ordinary carriers. The
+                // placement is load-bearing: putting the same valid records after all pixels lets
+                // two presentations complete, then leaves the first transfer of frame three
+                // permanently pending. Build a borrowed scatter list in the captured order. The
+                // insertion may fall inside one allocation chunk, but is always on a wire-record
+                // boundary.
+                const NAVARRO_PARAM_IMAGE_OFFSET: usize = 115168;
+                let mut wire_parts: KVec<&[u8]> = KVec::with_capacity(
+                    image_parts + 6,
+                    GFP_KERNEL,
+                )?;
+                if !arm_slice.is_empty() {
+                    wire_parts.push(arm_slice, GFP_KERNEL)?;
+                }
+                if !opener_slice.is_empty() {
+                    wire_parts.push(opener_slice, GFP_KERNEL)?;
+                }
+                if !report_slice.is_empty() {
+                    wire_parts.push(report_slice, GFP_KERNEL)?;
+                }
+                let param_at = NAVARRO_PARAM_IMAGE_OFFSET.min(image_len);
+                let mut image_off = 0usize;
+                let mut param_inserted = params_slice.is_empty();
+                for f in frame_parts.iter() {
+                    if image_off >= image_len {
+                        break;
+                    }
+                    let n = f.len().min(image_len - image_off);
+                    let split = param_at.saturating_sub(image_off).min(n);
+                    if !param_inserted && image_off + n >= param_at {
+                        if split != 0 {
+                            wire_parts.push(&f[..split], GFP_KERNEL)?;
+                        }
+                        wire_parts.push(params_slice, GFP_KERNEL)?;
+                        param_inserted = true;
+                        if split != n {
+                            wire_parts.push(&f[split..n], GFP_KERNEL)?;
+                        }
+                    } else if n != 0 {
+                        wire_parts.push(&f[..n], GFP_KERNEL)?;
+                    }
+                    image_off += n;
+                }
+                if !param_inserted {
+                    wire_parts.push(params_slice, GFP_KERNEL)?;
+                }
+                wire_parts.push(&trailer[..], GFP_KERNEL)?;
+
+                let part_count = wire_parts.len();
                 let mut part_i = 0usize;
                 let mut part_off = 0usize;
                 let mut wire_off = 0usize;
+                // DLM's authenticated first head-0 prologue does not put all four URBs on the
+                // xHCI ring at once. It submits at +0/+806/+851/+873 us and receives completion
+                // of the first at +104 us, so the dock gets a ~700-us ready interval before the
+                // second transfer and then a three-URB pipeline. Submitting chunk two immediately
+                // leaves Navarro NRDY forever after exactly one completed URB. Preserve this
+                // producer boundary only for the one-shot, full-size prologue; ordinary frames
+                // use the normal eight-deep queue, just as DLM does.
+                const NAVARRO_PROLOGUE_SUBMIT_US: [i64; 4] = [0, 806, 851, 873];
+                let pace_prologue = !arm_slice.is_empty()
+                    && xfer == VIDEO_XFER
+                    && super::video::wht::head_sub_shift() != 0
+                    && *crate::module_parameters::video_sync.value() == 0;
+                let mut prologue_anchor: Option<Instant<Monotonic>> = None;
                 while wire_off < wire_len {
                     let data_len = (wire_len - wire_off).min(xfer);
                     let dst = &mut staging[..data_len];
                     let mut dst_off = 0usize;
                     while dst_off < dst.len() && part_i < part_count {
-                        let part: &[u8] = if part_i < arm_parts {
-                            arm_slice
-                        } else if part_i < arm_parts + report_parts {
-                            report_slice
-                        } else if part_i < lead {
-                            params_slice
-                        } else if part_i < lead + image_parts {
-                            let f = &frames[part_i - lead][..];
-                            &f[..f.len().min(image_cap)]
-                        } else {
-                            &trailer[..]
-                        };
+                        let part = wire_parts[part_i];
                         let n = (part.len() - part_off).min(dst.len() - dst_off);
                         dst[dst_off..dst_off + n].copy_from_slice(&part[part_off..part_off + n]);
                         dst_off += n;
@@ -1655,9 +1974,17 @@ impl VinoDrmData {
                             let _ = dev.clear_video_halt(head_i);
                         }
                     }
-                    // DLM submits one transfer, waits for its completion, then submits the
-                    // next -- never more than two outstanding. `video_sync` reproduces that
-                    // exactly; the queue path pipelines eight.
+                    if pace_prologue {
+                        let chunk = wire_off / xfer;
+                        if let Some(anchor) = prologue_anchor {
+                            if let Some(&target_us) = NAVARRO_PROLOGUE_SUBMIT_US.get(chunk) {
+                                Self::wait_video_offset(anchor, target_us);
+                            }
+                        }
+                    }
+                    // `video_sync` is an all-synchronous diagnostic. The normal queue path uses
+                    // DLM's mixed transport: prologue chunk zero is reaped below, then the rest
+                    // and all ordinary frames are pipelined.
                     let sent = if *crate::module_parameters::video_sync.value() != 0 {
                         dev.video_send(head_i, dst, super::timeout(), GFP_KERNEL).map(|_| ())
                     } else {
@@ -1668,6 +1995,13 @@ impl VinoDrmData {
                             let _ = dev.clear_video_halt(head_i);
                         }
                         return Err(e);
+                    }
+                    if pace_prologue && wire_off == 0 {
+                        let anchor = Instant::<Monotonic>::now();
+                        prologue_anchor = Some(anchor);
+                        // Do not expose chunk two to xHCI before chunk zero completes. The capture
+                        // has the first completion at +104 us and the next submit at +806 us.
+                        queue.flush(dev.io(), super::timeout())?;
                     }
                     self.last_video_at.lock()[head_i] = Some(Instant::<Monotonic>::now());
                     wire_off += data_len;
@@ -1730,6 +2064,13 @@ impl VinoDrmData {
             band_parity_bit(),
             interlaced_bands(),
         )?;
+        let prompt_ordinary = super::video::wht::black_frame_ep08_ordinary(
+            w_pad,
+            h_pad,
+            head,
+            band_parity_bit(),
+            interlaced_bands(),
+        )?;
         let wake = self.modeset_active[head_i].load(Ordering::Acquire) == 0;
 
         self.begin_cp_timeline();
@@ -1766,6 +2107,7 @@ impl VinoDrmData {
                 head,
                 want,
                 &prompt,
+                &prompt_ordinary,
                 PROMPT_TRAINING_OPEN_MS,
                 true,
             );
@@ -1787,7 +2129,15 @@ impl VinoDrmData {
             return Ok(false);
         }
         if let Err(e) =
-            self.submit_prompt_training(dev, head, want, &prompt, PROMPT_TRAINING_TAIL_MS, false)
+            self.submit_prompt_training(
+                dev,
+                head,
+                want,
+                &prompt,
+                &prompt_ordinary,
+                PROMPT_TRAINING_TAIL_MS,
+                false,
+            )
         {
             self.modeset_active[head_i].store(0, Ordering::Release);
             return Err(e);
@@ -1811,6 +2161,8 @@ impl VinoDrmData {
         timings: [Option<super::cp::Timing>; HEADS],
     ) -> Result<bool> {
         let mut prompts: [Option<KVec<KVec<u8>>>; HEADS] = core::array::from_fn(|_| None);
+        let mut ordinary_prompts: [Option<KVec<KVec<u8>>>; HEADS] =
+            core::array::from_fn(|_| None);
         let mut keys = [0u64; HEADS];
         let mut valid = 0u32;
 
@@ -1844,6 +2196,13 @@ impl VinoDrmData {
                 band_parity_bit(),
                 interlaced_bands(),
             )?);
+            ordinary_prompts[head] = Some(super::video::wht::black_frame_ep08_ordinary(
+                w_pad,
+                h_pad,
+                head as u8,
+                band_parity_bit(),
+                interlaced_bands(),
+            )?);
             keys[head] = key;
             valid |= 1u32 << head;
         }
@@ -1851,13 +2210,44 @@ impl VinoDrmData {
             return Ok(false);
         }
 
-        // One clock anchors the whole transaction. A slow send therefore makes the next event
-        // catch up instead of shifting every subsequent protocol deadline.
+        // Keep the clear/settle phase and the real mode-set choreography in one exclusive control
+        // transaction. Their deadlines have separate anchors because the Navarro cold timeline was
+        // measured from the real head-0 mode set, 1,156 ms after its pipe clear.
         self.begin_cp_timeline();
-        let anchor = Instant::<Monotonic>::now();
+        let activation_started = Instant::<Monotonic>::now();
+        let mut anchor = activation_started;
         let mut sent = 0u32;
         let mut started = 0u32;
         let timeline = (|| -> Result<(u32, u32)> {
+            if self.navarro_mode_words() {
+                // DLM's first clear pair begins a dock-wide sink reset. The authenticated
+                // transcript then stops/restarts each EDID reader, disengages/re-engages the
+                // downstream sinks, and clears each pipe a second time before any real mode.
+                for head in 0..HEADS {
+                    if valid & (1u32 << head) == 0 {
+                        continue;
+                    }
+                    if head == 1 {
+                        Self::wait_mode_offset(activation_started, NAVARRO_PRIME_CLEAR_H1_MS);
+                    }
+                    self.send_cp(dev, 0x48, 0, |ctr| {
+                        super::cp::clear_mode(ctr, head as u8)
+                    })?;
+                }
+                for &(at, op) in NAVARRO_COLD_PRELUDE {
+                    Self::wait_mode_offset(activation_started, at);
+                    self.navarro_cold_op(dev, op)?;
+                }
+                Self::wait_mode_offset(activation_started, NAVARRO_REAL_MODE_H0_MS);
+                anchor = Instant::<Monotonic>::now();
+            }
+
+            let navarro_counters = if self.navarro_mode_words() {
+                Some(self.reserve_cp_counters::<NAVARRO_COLD_COUNTERS>()?)
+            } else {
+                None
+            };
+
             // Three cursors walk the sorted schedules; `cp_until` drains everything due at or
             // before a given offset, preserving the ordering between markers, polls, and EDID
             // reads.
@@ -1890,11 +2280,31 @@ impl VinoDrmData {
                         if nm == Some(off) {
                             let (_, head, sub, state) = timeline.markers[mi];
                             if sent & (1u32 << head) != 0 {
-                                self.stream_marker(dev, head, sub, state)?;
+                                if let Some(counters) = navarro_counters.as_ref() {
+                                    let slot = *NAVARRO_MARKER_COUNTER_SLOTS
+                                        .get(mi)
+                                        .ok_or(EINVAL)?;
+                                    let ctr = *counters.get(slot).ok_or(EINVAL)?;
+                                    self.send_cp_reserved(dev, 0x16, ctr, |ctr| {
+                                        super::cp::stream_marker(ctr, head, sub, state)
+                                    })?;
+                                } else {
+                                    self.stream_marker(dev, head, sub, state)?;
+                                }
                             }
                             mi += 1;
                         } else if np == Some(off) {
-                            self.poll_status(dev)?;
+                            if let Some(counters) = navarro_counters.as_ref() {
+                                let slot = *NAVARRO_POLL_COUNTER_SLOTS
+                                    .get(pi)
+                                    .ok_or(EINVAL)?;
+                                let ctr = *counters.get(slot).ok_or(EINVAL)?;
+                                self.send_cp_reserved(dev, 0x14, ctr, |ctr| {
+                                    super::cp::device_query_req(ctr, 0x000c)
+                                })?;
+                            } else {
+                                self.poll_status(dev)?;
+                            }
                             pi += 1;
                         } else {
                             let (_, head, fetch) = timeline.edid[ei];
@@ -1914,7 +2324,9 @@ impl VinoDrmData {
                 }};
             }
 
-            // Both mode-sets go out first, 29 ms apart, before any video.
+            // Both real mode sets go out before any video, spaced according to this dock's
+            // measured cold timeline. Navarro's pipe clears were sent during the settling phase
+            // above; do not collapse them back into this loop.
             for head in 0..HEADS {
                 let bit = 1u32 << head;
                 if valid & bit == 0 {
@@ -1927,15 +2339,17 @@ impl VinoDrmData {
                     cp_until!(timeline.h1_mode - 1);
                     Self::wait_mode_offset(anchor, timeline.h1_mode);
                 }
-                // Tear this connector's pipe down first; see `cp::clear_mode`.
-                if self.navarro_mode_words() {
+                if let Some(counters) = navarro_counters.as_ref() {
+                    let slot = if head == 0 { 0 } else { 3 };
+                    let ctr = *counters.get(slot).ok_or(EINVAL)?;
+                    self.send_cp_reserved(dev, 0x48, ctr, |ctr| {
+                        super::cp::set_mode(ctr, head as u8, &timing)
+                    })?;
+                } else {
                     self.send_cp(dev, 0x48, 0, |ctr| {
-                        super::cp::clear_mode(ctr, head as u8)
+                        super::cp::set_mode(ctr, head as u8, &timing)
                     })?;
                 }
-                self.send_cp(dev, 0x48, 0, |ctr| {
-                    super::cp::set_mode(ctr, head as u8, &timing)
-                })?;
                 if self.modeset_requested[head].load(Ordering::Acquire) != keys[head] {
                     continue;
                 }
@@ -2000,14 +2414,17 @@ impl VinoDrmData {
                 // Exactly one ARM+carrier presentation keeps the closing markers from being
                 // delayed behind a blocking multi-frame submission.
                 let frames = prompts[head].as_ref().ok_or(EINVAL)?;
+                let ordinary_frames = ordinary_prompts[head].as_ref().ok_or(EINVAL)?;
                 let t_sub = Instant::<Monotonic>::now();
+                let first_for_head = started & bit == 0;
                 self.submit_prompt_training(
                     dev,
                     head as u8,
                     keys[head],
                     frames,
+                    ordinary_frames,
                     PROMPT_TRAINING_OPEN_MS,
-                    true,
+                    first_for_head,
                 )?;
                 // The timeline collapses right after this call: head 1's video slipped from its
                 // scheduled +150 ms to +1321 ms, so the markers DLM sends inside the stream never
@@ -2060,11 +2477,13 @@ impl VinoDrmData {
                     continue;
                 }
                 let frames = prompts[head].as_ref().ok_or(EINVAL)?;
+                let ordinary_frames = ordinary_prompts[head].as_ref().ok_or(EINVAL)?;
                 if let Err(e) = self.submit_prompt_training(
                     dev,
                     head as u8,
                     keys[head],
                     frames,
+                    ordinary_frames,
                     PROMPT_TRAINING_OPEN_MS,
                     false,
                 ) {
@@ -2110,6 +2529,18 @@ impl VinoDrmData {
             super::video::wht::frame_trailer(head, seq0)
         } else {
             super::video::wht::navarro_frame_trailer(head, seq0)
+        }
+    }
+
+    /// Build the record that starts a non-prologue DL7400 frame.
+    ///
+    /// Ridge carries its slot transition in the three-record trailer. Navarro terminates the old
+    /// frame after its close record and starts the next USB transfer with this opener instead.
+    fn build_frame_opener(&self, head: u8, seq0: u32, prologue: bool) -> Option<[u8; 32]> {
+        if self.video_arm.load(Ordering::Acquire) || prologue {
+            None
+        } else {
+            Some(super::video::wht::navarro_frame_opener(head, seq0))
         }
     }
 
@@ -2315,7 +2746,7 @@ impl VinoDrmData {
         let descriptor = super::cp::navarro_pipe_descriptor(connector)?;
         let seal_seq = self.take_seal_seq(head, descriptor.len().div_ceil(16) as u32);
         let mut sealed =
-            super::cp::seal_video_arm(&vkey, &vnonce, stream, 0x000e, seal_seq, &descriptor)?;
+            super::cp::seal_video_arm(&vkey, &vnonce, stream, 0x0000, seal_seq, &descriptor)?;
         // Diagnostic: a dock that authenticates this record must behave differently when its tag
         // is wrong. Identical behaviour means the record is already being dropped.
         if *crate::module_parameters::break_mac.value() != 0 {
@@ -2442,6 +2873,7 @@ impl VinoDrmData {
         dev: &BoundInterface<'_>,
         id: u16,
         tag_reserved: usize,
+        reserved_counter: Option<u16>,
         build: impl FnOnce(u16) -> Result<KVec<u8>>,
         consume: impl FnOnce(&[u8; 16], &[u8; 8], &[u8]) -> Result<T>,
     ) -> Result<T> {
@@ -2449,39 +2881,73 @@ impl VinoDrmData {
         let Some(link) = (&mut *guard).as_mut() else {
             return Err(ENODEV);
         };
-        let msg = build(link.counter)?;
+        // DLM normally uses the next wire-order counter. Its cold Navarro mode transaction is the
+        // exception: per-head workers reserve counters before their writes interleave, so the
+        // inner counter order differs from the monotonically advancing AES block sequence.
+        let request_counter = reserved_counter.unwrap_or(link.counter);
+        let msg = build(request_counter)?;
         let content = &msg[..msg.len().saturating_sub(tag_reserved)];
         let frame = super::cp::seal_interactive(&link.ks, &link.riv, id, link.wire_seq, content)?;
         dev.ctrl_send(&frame, super::timeout(), GFP_KERNEL)?;
         link.wire_seq = link
             .wire_seq
             .wrapping_add(((content.len() + 15) / 16) as u32);
-        link.counter = link.counter.wrapping_add(1);
-        // Keep EP84 in lockstep with EP02 by reaping one reply after each control write. A missing
-        // reply is non-fatal because not every request produces one, but leaving replies queued
-        // eventually blocks the dock's control plane. Use the validated 4096-byte request size so
-        // larger logical replies can arrive as consecutive fragments.
+        // A normal message consumes the next counter now. A reserved message consumed its counter
+        // when its logical worker queued the transaction, before independently queued EP02 writes
+        // interleaved; consuming it twice here would skip a value after the cold transaction.
+        if reserved_counter.is_none() {
+            link.counter = link.counter.wrapping_add(1);
+        }
+        // DLM keeps reading EP84 until it sees the reply whose inner counter echoes this request.
+        // Navarro also emits unprompted `id=2/sub=0x86` status pushes on the same endpoint; treating
+        // the first such push as the paired reply advances EP02 before the dock has completed the
+        // transaction.  The dock then NAKs that write until the real reply is reaped, which is the
+        // exact 100-ms staircase visible in the failed captures.  Consume pushes here and stop only
+        // at the echoed counter (or a bounded timeout for request classes which do not reply).
+        //
+        // Use the validated 4096-byte request size so larger logical replies arrive intact.
         let mut reply = KVec::from_elem(0u8, 4096, GFP_KERNEL)?;
-        let got = if let Some(q) = link.ep84_q.as_mut() {
-            match q.recv(dev.io(), &mut reply, super::cp_reply_timeout()) {
-                Ok(Some(n)) => n,
-                _ => 0,
+        let deadline = Instant::<Monotonic>::now() + Delta::from_millis(64);
+        let mut matched = 0usize;
+        loop {
+            let got = if let Some(q) = link.ep84_q.as_mut() {
+                match q.recv(dev.io(), &mut reply, super::cp_reply_timeout()) {
+                    Ok(Some(n)) => n,
+                    Ok(None) => 0,
+                    Err(_) => break,
+                }
+            } else {
+                dev.ctrl_recv(&mut reply, super::cp_reply_timeout(), GFP_KERNEL)
+                    .unwrap_or(0)
+            };
+            if got > 16 {
+                // During re-engagement an EDID push can precede the paired acknowledgment. Keep
+                // it for the waiting head while continuing to wait for the echoed counter.
+                let target = self.edid_target.load(Ordering::Relaxed);
+                if target != NO_EDID_TARGET {
+                    if let Ok(Some(blob)) =
+                        super::cp::parse_edid_from_reply(&link.ks, &link.riv, &reply[..got])
+                    {
+                        *self.edid_caught.lock() = Some(blob);
+                    }
+                }
+                if let Some((reply_id, _, reply_counter)) =
+                    super::cp::decode_in_lenient(&link.ks, &link.riv, &reply[..got])
+                {
+                    if reply_counter == request_counter {
+                        matched = got;
+                        break;
+                    }
+                    if matches!(reply_id, 0x44 | 0x194) {
+                        self.downstream_event.store(true, Ordering::Release);
+                    }
+                }
             }
-        } else {
-            dev.ctrl_recv(&mut reply, super::cp_reply_timeout(), GFP_KERNEL)
-                .unwrap_or(0)
-        };
-        // During re-engagement the EDID push can be the reply consumed here. Preserve it for the
-        // waiting head rather than requiring it to arrive in the later unpaired drain.
-        let target = self.edid_target.load(Ordering::Relaxed);
-        if target != NO_EDID_TARGET && got > 16 {
-            if let Ok(Some(blob)) =
-                super::cp::parse_edid_from_reply(&link.ks, &link.riv, &reply[..got])
-            {
-                *self.edid_caught.lock() = Some(blob);
+            if (Instant::<Monotonic>::now() - deadline).as_millis() >= 0 {
+                break;
             }
         }
-        consume(&link.ks, &link.riv, &reply[..got])
+        consume(&link.ks, &link.riv, &reply[..matched])
     }
 
     /// Seal and send one interactive CP message on EP02, advancing the session keystream.
@@ -2492,7 +2958,41 @@ impl VinoDrmData {
         tag_reserved: usize,
         build: impl FnOnce(u16) -> Result<KVec<u8>>,
     ) -> Result {
-        self.send_cp_reply(dev, id, tag_reserved, build, |_, _, _| Ok(()))
+        self.send_cp_reply(dev, id, tag_reserved, None, build, |_, _, _| Ok(()))
+    }
+
+    /// Send one CP message using a counter token previously consumed from the live allocator.
+    fn send_cp_reserved(
+        &self,
+        dev: &BoundInterface<'_>,
+        id: u16,
+        inner_counter: u16,
+        build: impl FnOnce(u16) -> Result<KVec<u8>>,
+    ) -> Result {
+        self.send_cp_reply(
+            dev,
+            id,
+            0,
+            Some(inner_counter),
+            build,
+            |_, _, _| Ok(()),
+        )
+    }
+
+    /// Consume `N` consecutive counters from the live session and return them as reservation
+    /// tokens. This models DLM's independently queued per-head workers: allocation order remains
+    /// monotonic even when their actual EP02 writes interleave in a different order.
+    fn reserve_cp_counters<const N: usize>(&self) -> Result<[u16; N]> {
+        let mut guard = self.cp_link.lock();
+        let Some(link) = (&mut *guard).as_mut() else {
+            return Err(ENODEV);
+        };
+        let mut counters = [0u16; N];
+        for counter in &mut counters {
+            *counter = link.counter;
+            link.counter = link.counter.wrapping_add(1);
+        }
+        Ok(counters)
     }
 
     /// Consume the dock's *unprompted* EP84 pushes, i.e. reads that are not the reply to any of our
@@ -2512,12 +3012,13 @@ impl VinoDrmData {
         let mut n = 0;
         while n < max {
             let got = match link.ep84_q.as_mut() {
-                // Every queue slot is already posted. This is an opportunistic drain, so never
-                // spend the ordinary 8-ms paired-reply timeout waiting for a push which has not
-                // happened. A zero timeout still reaps and re-posts any completed slot.
-                Some(q) => q.recv(dev.io(), &mut reply, Delta::from_millis(0)),
+                // Every queue slot is already posted. One millisecond is enough to reap a
+                // completion without turning this best-effort reader into another control
+                // deadline. A zero-jiffy completion wait does not observe an already-signalled
+                // completion reliably, so it left pushes queued until the next EP02 write.
+                Some(q) => q.recv(dev.io(), &mut reply, Delta::from_millis(1)),
                 None => dev
-                    .ctrl_recv(&mut reply, Delta::from_millis(0), GFP_KERNEL)
+                    .ctrl_recv(&mut reply, Delta::from_millis(1), GFP_KERNEL)
                     .map(Some),
             };
             // `Ok(None)` is the queue's timeout: nothing pending, so the dock has nothing more to
@@ -5125,12 +5626,21 @@ fn encode_and_send_wht(
         let coords = super::video::wht::all_strip_coords(w_pad, h_pad)?;
         match parallel_strip_encode(src, &coords)? {
             Some(strips) => {
-                let records = super::video::wht::frame_records(
-                    &strips,
-                    head,
-                    band_parity_bit(),
-                    interlaced_bands(),
-                )?;
+                let records = if super::video::wht::head_sub_shift() != 0 {
+                    super::video::wht::frame_records_navarro_ordinary(
+                        &strips,
+                        head,
+                        band_parity_bit(),
+                        interlaced_bands(),
+                    )?
+                } else {
+                    super::video::wht::frame_records(
+                        &strips,
+                        head,
+                        band_parity_bit(),
+                        interlaced_bands(),
+                    )?
+                };
                 Some((records, seq0.wrapping_add(1)))
             }
             None => None,
@@ -5191,12 +5701,21 @@ fn encode_and_send_wht(
                         None => strips.push(next.next().ok_or(EINVAL)?, GFP_KERNEL)?,
                     }
                 }
-                let records = super::video::wht::frame_records(
-                    &strips,
-                    head,
-                    band_parity_bit(),
-                    interlaced_bands(),
-                )?;
+                let records = if full && super::video::wht::head_sub_shift() != 0 {
+                    super::video::wht::frame_records_navarro_ordinary(
+                        &strips,
+                        head,
+                        band_parity_bit(),
+                        interlaced_bands(),
+                    )?
+                } else {
+                    super::video::wht::frame_records(
+                        &strips,
+                        head,
+                        band_parity_bit(),
+                        interlaced_bands(),
+                    )?
+                };
                 encoded = Some((coords, strips));
                 Some((records, seq0.wrapping_add(1)))
             }
@@ -5205,6 +5724,17 @@ fn encode_and_send_wht(
     };
     let (frames, next_seq) = match parallel {
         Some(r) => r,
+        None if full && super::video::wht::head_sub_shift() != 0 => {
+            super::video::wht::colour_frame_ep08_navarro_ordinary(
+                w_pad,
+                h_pad,
+                seq0,
+                head,
+                band_parity_bit(),
+                interlaced_bands(),
+                px,
+            )?
+        }
         None if full => super::video::wht::colour_frame_ep08(
             w_pad,
             h_pad,
@@ -5290,8 +5820,9 @@ fn encode_and_send_wht(
     let frame_count = frames.len();
     let image_len: usize = frames.iter().take(frame_count).map(|f| f.len()).sum();
     // The DL7400's per-strip parameter map, which describes every strip in the frame and which
-    // vino sent none of until 2026-08-03. It goes ahead of the image records: it is what tells the
-    // dock how to read them. Ridge has no equivalent record and gets an empty slice.
+    // vino sent none of until 2026-08-03. Working DLM and Windows both include it in frame zero and
+    // put it after at least some image records; Windows' deterministic image-then-map ordering is
+    // used below. Ridge has no equivalent record and gets an empty slice.
     let params: KVec<u8> = if super::video::wht::head_sub_shift() == 0 {
         KVec::new()
     } else {
@@ -5326,8 +5857,26 @@ fn encode_and_send_wht(
         // successive frames through `DAMAGE_REPEATS` and the debt repaint instead.
         1
     };
-    let first_wire_len =
-        arm_len + params.len() + image_len + data.build_frame_trailer(head, seq0).len();
+    let first_opener_len = data
+        .build_frame_opener(head, seq0, startup)
+        .as_ref()
+        .map_or(0, |o| o.len());
+    // Every ordinary Navarro presentation pairs its frame-sub records with one authenticated
+    // report on the stream sub. Build presentation zero once here so the diagnostic length and
+    // the bytes submitted below refer to the same live counter reservation. The prologue itself
+    // has no report; presentation one will allocate its own inside the loop.
+    let mut first_report = if startup {
+        None
+    } else {
+        data.build_stream_report_buf(head_i)?
+    };
+    let first_report_len = first_report.as_ref().map_or(0, |r| r.len());
+    let first_wire_len = arm_len
+        + first_opener_len
+        + first_report_len
+        + params.len()
+        + image_len
+        + data.build_frame_trailer(head, seq0).len();
     vino_debug!(
         "vino: head={} chunks={} arm={} first={} presentations={}\n",
         head,
@@ -5368,7 +5917,24 @@ fn encode_and_send_wht(
         } else {
             &[]
         };
-        let wire_len = arm_slice.len() + params.len() + image_len + frame_trailer.len();
+        let frame_opener = data.build_frame_opener(head, repeat_seq, !arm_slice.is_empty());
+        let opener_slice: &[u8] = frame_opener.as_ref().map_or(&[], |o| &o[..]);
+        let report = if arm_slice.is_empty() {
+            if repeat == 0 {
+                first_report.take()
+            } else {
+                data.build_stream_report_buf(head_i)?
+            }
+        } else {
+            None
+        };
+        let report_slice: &[u8] = report.as_ref().map_or(&[], |r| &r[..]);
+        let wire_len = arm_slice.len()
+            + opener_slice.len()
+            + report_slice.len()
+            + params.len()
+            + image_len
+            + frame_trailer.len();
         last_wire_len = wire_len;
         {
             // Take this head's staging buffer while submitting, then restore it. The queue mutex
@@ -5412,13 +5978,19 @@ fn encode_and_send_wht(
                 let submit = |staging: &mut KVec<u8>, q: &mut super::usb::BulkOutQueue| -> Result {
                     let staging = &mut staging[..];
                     let q = &mut *q;
-                    // Scatter/gather cursor over [optional ARM][record chunks][trailer]. Join only one
+                    // Scatter/gather cursor over
+                    // [optional ARM][optional Navarro opener][authenticated stream report]
+                    // [record chunks][parameter map][trailer]. Join only one
                     // transfer at a time in the reusable bounded staging allocation, avoiding a
                     // contiguous allocation spanning the complete frame.
                     let arm_parts = usize::from(!arm_slice.is_empty());
+                    let opener_parts = usize::from(!opener_slice.is_empty());
+                    let report_parts = usize::from(!report_slice.is_empty());
                     let param_parts = usize::from(!params.is_empty());
                     let trailer_parts = 1usize;
-                    let part_count = arm_parts + param_parts + frame_count + trailer_parts;
+                    let opener_end = arm_parts + opener_parts;
+                    let lead = opener_end + report_parts;
+                    let part_count = lead + frame_count + param_parts + trailer_parts;
                     let mut part_i = 0usize;
                     let mut part_off = 0usize;
                     let mut wire_off = 0usize;
@@ -5429,10 +6001,14 @@ fn encode_and_send_wht(
                         while dst_off < dst.len() && part_i < part_count {
                             let part: &[u8] = if part_i < arm_parts {
                                 arm_slice
-                            } else if part_i < arm_parts + param_parts {
+                            } else if part_i < opener_end {
+                                opener_slice
+                            } else if part_i < lead {
+                                report_slice
+                            } else if part_i < lead + frame_count {
+                                &frames[part_i - lead][..]
+                            } else if part_i < lead + frame_count + param_parts {
                                 &params[..]
-                            } else if part_i < arm_parts + param_parts + frame_count {
-                                &frames[part_i - arm_parts - param_parts][..]
                             } else {
                                 &frame_trailer[..]
                             };

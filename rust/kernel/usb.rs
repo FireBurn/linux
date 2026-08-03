@@ -1414,6 +1414,7 @@ impl UrbSlot {
         matches!(self.urb, Some(QueueUrb::Active(_)))
     }
 
+    #[inline]
     fn wait(&self, timeout: Delta) -> bool {
         let millis = timeout.as_millis();
         let millis = if millis <= 0 {
@@ -1425,6 +1426,7 @@ impl UrbSlot {
             .wait_for_completion_timeout(crate::time::msecs_to_jiffies(millis))
     }
 
+    #[inline]
     fn finish(&mut self) -> Result<(i32, usize)> {
         let state = self.urb.take().ok_or(EIO)?;
         let active = match state {
@@ -1681,6 +1683,34 @@ impl BulkOutQueue {
             return Err(Error::from_errno(status));
         }
 
+        Ok(true)
+    }
+
+    /// Reports whether the next `count` queue slots can be submitted without waiting.
+    ///
+    /// Completed slots are reaped and any transfer error is returned. This is useful when a
+    /// higher-level protocol must not block halfway through a multi-URB record while waiting for
+    /// endpoint progress; callers can defer the whole record and service its control plane first.
+    #[inline]
+    pub fn can_send_n(&mut self, io: &Io<'_>, count: usize) -> Result<bool> {
+        self.inner.check(io)?;
+        if count > self.slots.len() {
+            return Ok(false);
+        }
+        for off in 0..count {
+            let i = (self.cursor + off) % self.slots.len();
+            if self.slots[i].is_active() {
+                if !self.slots[i].wait(Delta::ZERO) {
+                    return Ok(false);
+                }
+                // `wait_for_completion_timeout()` consumes the completion signal. Reap the URB
+                // now rather than leaving `send()` to wait for the signal a second time.
+                let (status, _) = self.slots[i].finish()?;
+                if status != 0 {
+                    return Err(Error::from_errno(status));
+                }
+            }
+        }
         Ok(true)
     }
 

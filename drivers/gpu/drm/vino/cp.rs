@@ -102,6 +102,70 @@ pub(super) fn stream_commit(counter: u16, head: u8) -> Result<KVec<u8>> {
 pub(super) fn device_query_req(counter: u16, sub: u16) -> Result<KVec<u8>> {
     random_tail_msg(0x14, sub, counter)
 }
+
+/// DL7400 post-authentication state query (`id=0x15 sub=0x78`).
+///
+/// The authenticated same-day DLM transcript sends this exactly once after all four per-connector
+/// authentication blocks and before the first `0x16/0x4c` finalizer. Its request has the ordinary
+/// 32-byte random-tail shape; the dock replies `0x14/0x78` with state `2` at offset 22. The
+/// handler's semantic name is not known, so keep the builder descriptive rather than assigning a
+/// guessed protocol meaning to that state.
+pub(super) fn post_auth_state_req(counter: u16) -> Result<KVec<u8>> {
+    random_tail_msg(0x15, 0x0078, counter)
+}
+/// DL7400 real-time-clock synchronization (`id=0x1e sub=0x94`).
+///
+/// The ten-byte payload at offset 22 is a compact broken-down local time:
+/// `[year LE16, month, day, hour, minute, second, weekday, yday LE16]`. The authenticated
+/// 2026-08-03 capture carried Monday as weekday 1 and 214 as the zero-based day of year, proving
+/// the last three bytes are calendar fields rather than an opaque random tail.
+pub(super) fn rtc_sync_req(
+    counter: u16,
+    unix_seconds: i64,
+    utc_offset_minutes: i32,
+) -> Result<KVec<u8>> {
+    let local = unix_seconds.saturating_add(i64::from(utc_offset_minutes) * 60);
+    let days = local.div_euclid(86_400);
+    let second_of_day = local.rem_euclid(86_400);
+
+    // Gregorian civil date from days since 1970-01-01 (Howard Hinnant's civil_from_days).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy_march = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy_march + 2) / 153;
+    let day = doy_march - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    if !(0..=u16::MAX as i64).contains(&year) {
+        return Err(EINVAL);
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_starts = [0u16, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let mut yday = month_starts[(month - 1) as usize] + day as u16 - 1;
+    if leap && month > 2 {
+        yday += 1;
+    }
+    let weekday = (days + 4).rem_euclid(7) as u8; // 1970-01-01 was Thursday (4).
+
+    let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
+    header(&mut b, 0x001e, 0x0094, counter)?;
+    pad_to(&mut b, 22)?;
+    b.extend_from_slice(&[0u8; 10], GFP_KERNEL)?;
+    b[22..24].copy_from_slice(&(year as u16).to_le_bytes());
+    b[24] = month as u8;
+    b[25] = day as u8;
+    b[26] = (second_of_day / 3_600) as u8;
+    b[27] = ((second_of_day % 3_600) / 60) as u8;
+    b[28] = (second_of_day % 60) as u8;
+    b[29] = weekday;
+    b[30..32].copy_from_slice(&yday.to_le_bytes());
+    Ok(b)
+}
 /// Shared builder for the many CP messages that share one wire shape: the standard 8-byte
 /// `[id][sub][counter][00 00]` header, 14 zero bytes, then a fresh 10-byte host-random tail the
 /// dock treats as an opaque token.
@@ -114,19 +178,23 @@ fn random_tail_msg(id: u16, sub: u16, counter: u16) -> Result<KVec<u8>> {
     b.extend_from_slice(&tail, GFP_KERNEL)?;
     Ok(b)
 }
-/// OUT `id=0x16 sub=0x0023` downstream-sink engage request. Offsets 22 and 23 both carry the head
-/// selector; the remaining bytes are an opaque token.
-pub(super) fn edid_engage_req(counter: u16, head: u8) -> Result<KVec<u8>> {
-    // Both selector bytes are required by the sink-engage handler.
+/// OUT `id=0x16 sub=0x0023` downstream-sink state request. Offset 22 selects the head and offset
+/// 23 carries the state. Navarro's cold transcript uses `0xff` to tear the sink down, then the
+/// head selector itself (`0` or `1`) to re-engage it.
+pub(super) fn edid_sink_state(counter: u16, head: u8, state: u8) -> Result<KVec<u8>> {
     let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
     header(&mut b, 0x16, 0x0023, counter)?;
     pad_to(&mut b, 22)?;
-    b.push(head, GFP_KERNEL)?;
-    b.push(head, GFP_KERNEL)?;
+    b.extend_from_slice(&[head, state], GFP_KERNEL)?;
     let mut tail = [0u8; 8];
     rng::fill(&mut tail);
     b.extend_from_slice(&tail, GFP_KERNEL)?;
     Ok(b)
+}
+
+/// Engage one downstream sink after its EDID exchange.
+pub(super) fn edid_engage_req(counter: u16, head: u8) -> Result<KVec<u8>> {
+    edid_sink_state(counter, head, head)
 }
 /// OUT `id=0x15 sub=0x0053` post-EDID capability query. Offset 22 carries a one-based head index.
 pub(super) fn post_edid_query(counter: u16, head: u8) -> Result<KVec<u8>> {
@@ -139,17 +207,22 @@ pub(super) fn post_edid_query(counter: u16, head: u8) -> Result<KVec<u8>> {
     b.extend_from_slice(&tail, GFP_KERNEL)?;
     Ok(b)
 }
-/// OUT `id=0x16 sub=0x004b` downstream EDID-read kick.
-pub(super) fn edid_readiness_kick(counter: u16, head: u8) -> Result<KVec<u8>> {
+/// OUT `id=0x16 sub=0x004b` downstream EDID-reader state request.
+pub(super) fn edid_readiness_state(counter: u16, head: u8, state: u8) -> Result<KVec<u8>> {
     let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
     header(&mut b, 0x16, 0x4b, counter)?;
     pad_to(&mut b, 22)?;
-    // Offset 22 selects the downstream head and offset 23 starts the read.
-    b.extend_from_slice(&[head, 0x01], GFP_KERNEL)?;
+    // Offset 22 selects the downstream head and offset 23 stops/starts the reader.
+    b.extend_from_slice(&[head, state], GFP_KERNEL)?;
     let mut tail = [0u8; 8];
     rng::fill(&mut tail);
     b.extend_from_slice(&tail, GFP_KERNEL)?;
     Ok(b)
+}
+
+/// Start one downstream EDID read.
+pub(super) fn edid_readiness_kick(counter: u16, head: u8) -> Result<KVec<u8>> {
+    edid_readiness_state(counter, head, 1)
 }
 /// OUT get-EDID request (`id=0x15 sub=0x21`). A `sub=0x20` probe must precede each fetch attempt.
 /// The dock may initially return an internal placeholder, so callers retry until a downstream EDID
@@ -503,7 +576,7 @@ pub(super) fn decode_any(
         return None;
     }
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
-    let head = &wire[16..wire.len().min(48)];
+    let body = &wire[16..];
     let rivs = inbound_reply_rivs(out_riv);
     let variants: [(&'static str, [u8; 8]); 4] = [
         ("out/h0", rivs[2]),
@@ -513,7 +586,7 @@ pub(super) fn decode_any(
     ];
     let mut best: Option<(i32, &'static str, u16, u16, u16, [u8; 24])> = None;
     for (tag, riv) in variants {
-        let Ok(pt) = open_in(ks, &riv, seq, head) else {
+        let Ok(pt) = open_in(ks, &riv, seq, body) else {
             continue;
         };
         if pt.len() < 8 {
@@ -559,9 +632,9 @@ pub(super) fn verify_in_ack(
         return None;
     }
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
-    let head = &wire[16..wire.len().min(32)];
+    let body = &wire[16..];
     for riv in inbound_reply_rivs(out_riv) {
-        let Ok(pt) = open_in(ks, &riv, seq, head) else {
+        let Ok(pt) = open_in(ks, &riv, seq, body) else {
             continue;
         };
         if pt.len() < 8 {
@@ -606,7 +679,10 @@ pub(super) fn inner_plaintext(
                 let Ok(pt) = open_in(ks, &riv, seq, &wire[16..]) else {
                     continue;
                 };
-                if pt.len() >= 8 && u16::from_le_bytes([pt[6], pt[7]]) == 0 {
+                // A verified Dl3Cmac, rather than an assumed zero word at inner offsets 6--7,
+                // identifies a genuine frame. Navarro stores connector selector bits in that
+                // word for the third and fourth per-connector HDCP bursts.
+                if pt.len() >= 8 {
                     return Some(pt);
                 }
             }
@@ -650,9 +726,9 @@ pub(super) fn decode_in_lenient(
         return None;
     }
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
-    let head = &wire[16..wire.len().min(32)];
+    let body = &wire[16..];
     for riv in inbound_reply_rivs(out_riv) {
-        let Ok(pt) = open_in(ks, &riv, seq, head) else {
+        let Ok(pt) = open_in(ks, &riv, seq, body) else {
             continue;
         };
         if pt.len() < 8 {
@@ -661,70 +737,84 @@ pub(super) fn decode_in_lenient(
         let id = u16::from_le_bytes([pt[0], pt[1]]);
         let sub = u16::from_le_bytes([pt[2], pt[3]]);
         let ctr = u16::from_le_bytes([pt[4], pt[5]]);
-        let pad = u16::from_le_bytes([pt[6], pt[7]]);
-        if id < 0x400 && pad == 0 {
-            return Some((id, sub, ctr));
-        }
+        // Navarro's device-log/status replies use session-varying IDs beyond the old catalogued
+        // range (the captured transaction boundary replies with id=0x0405/sub=0x000c). Its
+        // per-connector HDCP pushes also use bytes 4--7 as a one-hot 32-bit selector, so `ctr` is
+        // only an echo counter for actual request/reply classes and bytes 6--7 need not be zero.
+        // `open_in` has already authenticated the complete ciphertext with Dl3Cmac; no plaintext
+        // plausibility restriction is needed here.
+        return Some((id, sub, ctr));
     }
     None
 }
-/// Extract the fresh per-head `rrx` from an `AKE_Send_rrx` push.
+/// One decoded downstream-HDCP push carried inside the interactive control session.
 ///
-/// Each per-head repeater authentication supplies a distinct `rrx`. The derived `kd`, encryption
-/// key and `V` must use this value rather than the main-link `rrx`, otherwise repeater
-/// authentication and the downstream DDC path fail.
-pub(super) fn perhead_rrx(ks: &[u8; 16], out_riv: &[u8; 8], wire: &[u8]) -> Option<[u8; 8]> {
+/// The vendor wrapper pads all of the short HDCP messages to a fixed inner size, so callers must
+/// interpret the payload according to `msg_id`; `payload_len` is the available padded region, not
+/// a claim that every byte belongs to the HDCP message.  The largest value needed by the current
+/// authentication verifier is H'/L'/M' (32 bytes).
+#[derive(Clone, Copy)]
+pub(super) struct PerheadHdcpPush {
+    pub msg_id: u8,
+    pub payload: [u8; 38],
+    pub payload_len: usize,
+}
+
+/// Decode a per-head HDCP push from either of the two observed vendor framings.
+///
+/// Ridge can send the inner body directly in `wsub=0x25`; Navarro seals it as `wsub=0x45` with
+/// the live control key.  Keeping this as one parser matters: previously only Rrx was extracted,
+/// while L', ReceiverID/V', receiver-auth status and M' were silently treated as generic traffic.
+pub(super) fn perhead_hdcp_push(
+    ks: &[u8; 16],
+    out_riv: &[u8; 8],
+    wire: &[u8],
+) -> Option<PerheadHdcpPush> {
     if wire.len() <= 16 {
         return None;
     }
-    // The push arrives in one of two framings depending on the dock.
-    //
-    // Ridge seals it (`wsub=0x45`) and it has to be opened below. Navarro sends the whole per-head
-    // burst in the plaintext framing (`wsub=0x25`) instead, and the reply is readable as it
-    // stands: inner id/sub at offsets 16/18, HDCP msg-id at 25, `rrx` at 26. Rejecting anything
-    // that was not sealed dropped this silently, so no head on that platform ever obtained an
-    // `rrx`, its repeater authentication never completed, and the dock reset shortly after being
-    // told a monitor was connected.
     const SUB_HDCP_RESP: u16 = 0x25;
     const SUB_SEALED: u16 = 0x45;
     let wsub = u16::from_le_bytes([wire[8], wire[9]]);
-    if wsub == SUB_HDCP_RESP {
-        let inner = &wire[16..];
-        if inner.len() < 18 {
+
+    let copy_push = |inner: &[u8]| -> Option<PerheadHdcpPush> {
+        if inner.len() < 10 {
             return None;
         }
-        let id = u16::from_le_bytes([inner[0], inner[1]]);
         let sub = u16::from_le_bytes([inner[2], inner[3]]);
-        if id != 0x10 || sub != 0x84 || inner[9] != 0x06 {
+        if sub != 0x84 {
             return None;
         }
-        let mut rrx = [0u8; 8];
-        rrx.copy_from_slice(&inner[10..18]);
-        return Some(rrx);
+        let src = &inner[10..];
+        let n = src.len().min(38);
+        let mut payload = [0u8; 38];
+        payload[..n].copy_from_slice(&src[..n]);
+        Some(PerheadHdcpPush {
+            msg_id: inner[9],
+            payload,
+            payload_len: n,
+        })
+    };
+
+    if wsub == SUB_HDCP_RESP {
+        return copy_push(&wire[16..]);
     }
     if wsub != SUB_SEALED {
         return None;
     }
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
-    let head = &wire[16..wire.len().min(48)];
+    let body = &wire[16..];
     for riv in inbound_reply_rivs(out_riv) {
-        let Ok(pt) = open_in(ks, &riv, seq, head) else {
+        let Ok(inner) = open_in(ks, &riv, seq, body) else {
             continue;
         };
-        if pt.len() < 18 {
-            continue;
-        }
-        let id = u16::from_le_bytes([pt[0], pt[1]]);
-        let sub = u16::from_le_bytes([pt[2], pt[3]]);
-        // id=0x10 sub=0x84 push, inner HDCP msg-id (byte 9) == AKE_SEND_RRX (0x06).
-        if id == 0x10 && sub == 0x84 && pt[9] == 0x06 {
-            let mut rrx = [0u8; 8];
-            rrx.copy_from_slice(&pt[10..18]);
-            return Some(rrx);
+        if let Some(push) = copy_push(&inner) {
+            return Some(push);
         }
     }
     None
 }
+
 // All three cursor messages share one 32-byte inner layout:
 // off0..7 id/sub/counter header
 // off8..21 zero
@@ -909,6 +999,7 @@ pub(super) fn aux_for_id(id: u16, body_len: usize) -> u16 {
         0x1a => 0x04, // cursor move
         0x1b => 0x03, // cursor create
         0x1c => 0x02, // cursor image
+        0x1e => 0x00, // Navarro RTC synchronization
         0x1f => 0x0f,
         0x22 => 0x0c,
         0x26 => 0x08,
@@ -1226,10 +1317,36 @@ pub(super) fn in_riv(out_riv: &[u8; 8]) -> [u8; 8] {
     riv[7] ^= 0x01;
     riv
 }
-/// Decrypt a dock->host CP frame body (AES-CTR, the same keystream as [`seal`] but
-/// keyed with the IN `riv`). `ct` is the ciphertext (wire bytes after the 16-byte
-/// cleartext header); `seq` is the wire counter at wire offset 12.
-pub(super) fn open_in(ks: &[u8; 16], in_riv: &[u8; 8], seq: u32, ct: &[u8]) -> Result<KVec<u8>> {
+/// Authenticate and decrypt a dock->host CP frame body.
+///
+/// `body` is everything after the 16-byte clear wire header: AES-CTR ciphertext followed by the
+/// 16-byte clear Dl3Cmac. Inbound messages use the same encrypt-then-MAC construction as
+/// [`seal_livemac`]. Verifying the tag is important on Navarro because bytes 6--7 of the inner
+/// header are not invariably padding: per-connector HDCP pushes put the high half of their
+/// one-hot selector there (`00 80` / `80 00`). A zero-padding heuristic therefore rejects two
+/// connectors' authentic messages, while accepting arbitrary unauthenticated ciphertext with a
+/// chance plaintext prefix would be unsafe.
+pub(super) fn open_in(
+    ks: &[u8; 16],
+    in_riv: &[u8; 8],
+    seq: u32,
+    body: &[u8],
+) -> Result<KVec<u8>> {
+    if body.len() < 16 {
+        return Err(EINVAL);
+    }
+    let ct_len = body.len() - 16;
+    let (ct, wire_tag) = body.split_at(ct_len);
+    let expected = dl3cmac_tag(ks, in_riv, seq as u64, ct)?;
+    // Accumulate the difference so a tag mismatch does not reveal the first differing byte.
+    let mut different = 0u8;
+    for (&actual, &want) in wire_tag.iter().zip(expected.iter()) {
+        different |= actual ^ want;
+    }
+    if different != 0 {
+        return Err(EINVAL);
+    }
+
     let cipher = crypto::Aes128::new(ks)?;
     let mut pt = KVec::with_capacity(ct.len(), GFP_KERNEL)?;
     for (i, chunk) in ct.chunks(16).enumerate() {

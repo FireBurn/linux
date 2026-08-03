@@ -851,6 +851,52 @@ pub(crate) mod wht {
         interlaced: bool,
         mut px: impl FnMut(usize, usize) -> (u8, u8, u8),
     ) -> Result<(KVec<KVec<u8>>, u32)> {
+        colour_frame_ep08_variant(
+            width,
+            height,
+            seq0,
+            head,
+            band_parity,
+            interlaced,
+            None,
+            &mut px,
+        )
+    }
+
+    /// Encode a full live Navarro frame using the ordinary-frame producer permutation measured
+    /// from DLM. The first ordinary band is y=8, not y=0, and the captured worker boundaries are
+    /// part of the record grammar for a 2560x1440 surface.
+    pub(crate) fn colour_frame_ep08_navarro_ordinary(
+        width: usize,
+        height: usize,
+        seq0: u32,
+        head: u8,
+        band_parity: bool,
+        interlaced: bool,
+        mut px: impl FnMut(usize, usize) -> (u8, u8, u8),
+    ) -> Result<(KVec<KVec<u8>>, u32)> {
+        colour_frame_ep08_variant(
+            width,
+            height,
+            seq0,
+            head,
+            band_parity,
+            interlaced,
+            Some(true),
+            &mut px,
+        )
+    }
+
+    fn colour_frame_ep08_variant(
+        width: usize,
+        height: usize,
+        seq0: u32,
+        head: u8,
+        band_parity: bool,
+        interlaced: bool,
+        navarro_ordinary: Option<bool>,
+        px: &mut impl FnMut(usize, usize) -> (u8, u8, u8),
+    ) -> Result<(KVec<KVec<u8>>, u32)> {
         if width & (strip_w() - 1) != 0 || height & (strip_h() - 1) != 0 {
             return Err(kernel::error::code::EINVAL);
         }
@@ -860,14 +906,20 @@ pub(crate) mod wht {
         while sy < height {
             let mut sx = 0usize;
             while sx < width {
-                let blocks = colour_strip_blocks(sx, sy, &mut px)?;
+                let blocks = colour_strip_blocks(sx, sy, px)?;
                 strips.push(colour_strip(&blocks, sx as u16, sy as u16)?, GFP_KERNEL)?;
                 sx += strip_w();
             }
             sy += strip_h();
         }
         Ok((
-            frame_records(&strips, head, band_parity, interlaced)?,
+            frame_records_with_boundary(
+                &strips,
+                head,
+                band_parity,
+                interlaced,
+                navarro_ordinary.filter(|_| strips.len() == 3600),
+            )?,
             seq0.wrapping_add(1),
         ))
     }
@@ -883,6 +935,34 @@ pub(crate) mod wht {
         head: u8,
         band_parity: bool,
         interlaced: bool,
+    ) -> Result<KVec<KVec<u8>>> {
+        black_frame_ep08_variant(width, height, head, band_parity, interlaced, Some(false))
+    }
+
+    /// Build the ordinary Navarro black carrier which follows the prologue frame.
+    ///
+    /// DLM's ordinary 2560x1440 carriers contain the same 201600 bytes of strip payload as the
+    /// prologue, but split them across 53 image records rather than 52. Its additional boundary is
+    /// after strip 2804, making the complete frame 208624 bytes. Navarro accepts vino's 208608-byte
+    /// second frame and then NAKs the first transfer of frame three, so this distinction is part of
+    /// the producer grammar rather than harmless USB chunking.
+    pub(crate) fn black_frame_ep08_ordinary(
+        width: usize,
+        height: usize,
+        head: u8,
+        band_parity: bool,
+        interlaced: bool,
+    ) -> Result<KVec<KVec<u8>>> {
+        black_frame_ep08_variant(width, height, head, band_parity, interlaced, Some(true))
+    }
+
+    fn black_frame_ep08_variant(
+        width: usize,
+        height: usize,
+        head: u8,
+        band_parity: bool,
+        interlaced: bool,
+        navarro_ordinary: Option<bool>,
     ) -> Result<KVec<KVec<u8>>> {
         if width & (strip_w() - 1) != 0 || height & (strip_h() - 1) != 0 {
             return Err(kernel::error::code::EINVAL);
@@ -911,7 +991,13 @@ pub(crate) mod wht {
             }
             sy += strip_h();
         }
-        frame_records(&strips, head, band_parity, interlaced)
+        frame_records_with_boundary(
+            &strips,
+            head,
+            band_parity,
+            interlaced,
+            navarro_ordinary,
+        )
     }
 
     /// Encode ONE 64x16 strip whose top-left output pixel is `(sx, sy)`.
@@ -1045,6 +1131,65 @@ pub(crate) mod wht {
         band_parity_bit: bool,
         interlaced_bands: bool,
     ) -> Result<KVec<KVec<u8>>> {
+        frame_records_with_boundary(strips, head, band_parity_bit, interlaced_bands, None)
+    }
+
+    /// Frame a full live Navarro surface with the ordinary DLM producer order. Other modes and
+    /// damage subsets deliberately fall back to the generic interlaced order: the measured
+    /// permutation and its split-worker boundaries describe exactly 3600 128x8 strips.
+    pub(crate) fn frame_records_navarro_ordinary(
+        strips: &[KVec<u8>],
+        head: u8,
+        band_parity_bit: bool,
+        interlaced_bands: bool,
+    ) -> Result<KVec<KVec<u8>>> {
+        frame_records_with_boundary(
+            strips,
+            head,
+            band_parity_bit,
+            interlaced_bands,
+            (strips.len() == 3600).then_some(true),
+        )
+    }
+
+    // Exact producer completion order from DLM's authenticated 2560x1440 cold capture. Navarro
+    // stops draining immediately after vino's first ordering mismatch, at strip 300. Rows alone
+    // encode almost the whole permutation; the handful of split rows below are worker boundaries.
+    const NAVARRO_PROLOGUE_ROWS: &[u8] = &[
+        0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 29, 31, 33, 35, 37,
+        39, 41, 43, 45, 47, 49, 51, 53, 54, 57, 59, 60, 62, 64, 66, 68, 70, 72, 74,
+        76, 78, 80, 82, 84, 86, 88, 90, 92, 94, 96, 98, 100, 1, 3, 5, 7, 9, 11,
+        13, 15, 17, 19, 21, 23, 25, 27, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48,
+        50, 52, 55, 56, 58, 61, 63, 65, 67, 69, 71, 73, 75, 77, 79, 81, 83, 85,
+        87, 89, 91, 93, 95, 97, 99, 101, 102, 103, 110, 112, 114, 116, 118, 120,
+        122, 124, 126, 128, 130, 132, 134, 136, 138, 140, 142, 144, 146, 148, 150,
+        152, 154, 156, 158, 160, 162, 164, 166, 168, 170, 172, 174, 176, 178, 100,
+        104, 105, 106, 107, 108, 109, 111, 113, 115, 117, 119, 121, 123, 125, 127,
+        129, 131, 133, 135, 137, 139, 141, 143, 145, 147, 149, 151, 153, 155, 157,
+        159, 161, 163, 165, 167, 169, 171, 173, 175, 177, 179,
+    ];
+
+    const NAVARRO_ORDINARY_ROWS: &[u8] = &[
+        1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 29, 31, 33, 35, 37, 39,
+        41, 43, 45, 47, 49, 51, 53, 55, 57, 59, 61, 63, 64, 66, 68, 70, 72, 73, 75,
+        77, 79, 81, 83, 85, 87, 89, 91, 93, 95, 97, 99, 0, 3, 5, 7, 9, 11, 13,
+        15, 17, 19, 21, 23, 25, 27, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48,
+        50, 52, 54, 56, 58, 60, 62, 65, 67, 69, 71, 74, 76, 78, 80, 82, 84, 86,
+        88, 90, 92, 94, 96, 98, 100, 102, 99, 101, 102, 103, 105, 107, 109, 111,
+        113, 115, 117, 118, 120, 122, 125, 127, 129, 131, 133, 135, 137, 139, 141,
+        144, 146, 148, 150, 152, 154, 156, 158, 160, 162, 164, 166, 168, 170, 172,
+        174, 176, 178, 101, 104, 106, 108, 110, 112, 114, 116, 119, 121, 123, 124,
+        126, 128, 130, 132, 134, 136, 138, 140, 142, 143, 145, 147, 149, 151, 153,
+        155, 157, 159, 161, 163, 165, 167, 169, 171, 173, 175, 177, 179,
+    ];
+
+    fn frame_records_with_boundary(
+        strips: &[KVec<u8>],
+        head: u8,
+        band_parity_bit: bool,
+        interlaced_bands: bool,
+        navarro_ordinary: Option<bool>,
+    ) -> Result<KVec<KVec<u8>>> {
         let aux_is_pad_count = aux_is_pad_count();
         const PREFIX: usize = 8;
         const STRIDE_CAP: usize = 0x0ff0;
@@ -1054,7 +1199,37 @@ pub(crate) mod wht {
         let mut chunk: KVec<u8> = KVec::new();
         // Interlaced ordering sends even bands before odd bands while preserving x order.
         let mut order: KVec<usize> = KVec::with_capacity(strips.len(), GFP_KERNEL)?;
-        if interlaced_bands {
+        let navarro_rows = match navarro_ordinary {
+            Some(false) if strips.len() == 3600 => Some(NAVARRO_PROLOGUE_ROWS),
+            Some(true) if strips.len() == 3600 => Some(NAVARRO_ORDINARY_ROWS),
+            _ => None,
+        };
+        if let Some(rows) = navarro_rows {
+            const STRIPS_ACROSS: usize = 20;
+            let ordinary = navarro_ordinary == Some(true);
+            for (run, &y) in rows.iter().enumerate() {
+                let (x0, x1) = if ordinary {
+                    match run {
+                        50 => (0, 8),
+                        101 => (0, 8),
+                        102 => (8, 20),
+                        103 => (0, 4),
+                        104 => (8, 20),
+                        143 => (4, 20),
+                        _ => (0, 20),
+                    }
+                } else {
+                    match run {
+                        51 => (0, 4),
+                        139 => (4, 20),
+                        _ => (0, 20),
+                    }
+                };
+                for x in x0..x1 {
+                    order.push(y as usize * STRIPS_ACROSS + x, GFP_KERNEL)?;
+                }
+            }
+        } else if interlaced_bands {
             for pass in 0..2u16 {
                 for (n, s) in strips.iter().enumerate() {
                     if (strip_y(s) >> strip_h_shift()) & 1 == pass {
@@ -1085,6 +1260,19 @@ pub(crate) mod wht {
             while i < order.len()
                 && (!band_parity_bit || strip_y(&strips[order[i]]) == y0)
             {
+                // Preserve DLM's captured producer flushes exactly. They are not a uniform
+                // 1024-strip rule: applying that to the final 1552-strip segment added a record
+                // at 3072 and made the prologue 210064 bytes instead of 210048. The ordinary
+                // carrier also schedules the two 1024-strip producers differently, so it has its
+                // own three boundaries and one extra image record (208624 bytes total).
+                let producer_boundary = match navarro_ordinary {
+                    Some(false) => matches!(i, 1024 | 2048 | 2764),
+                    Some(true) => matches!(i, 2032 | 2048 | 2804),
+                    None => false,
+                };
+                if interlaced_bands && n > 0 && producer_boundary {
+                    break;
+                }
                 let s = &strips[order[i]];
                 let projected = record.len() + 2 + s.len();
                 let projected_aligned = (projected + 15) & !15;
@@ -1177,8 +1365,9 @@ pub(crate) mod wht {
 
     /// Whether an image record's `aux` carries its zero-padding count.
     ///
-    /// Ridge counts the 0..15 bytes each record is padded by. Navarro uses `aux` to name a record
-    /// type instead, and every one of its image records carries zero there.
+    /// Both Ridge and Navarro image records count their 0..15 padding bytes here. Navarro also
+    /// uses `aux` as a subtype on non-image records; its fixed black carriers masked the image
+    /// rule because their 4048-byte strides require no padding.
     ///
     /// `true` -- the Ridge encoding -- is the default, so a profile that says nothing is unchanged.
     pub(crate) static AUX_IS_PAD_COUNT: core::sync::atomic::AtomicBool =
@@ -1320,26 +1509,48 @@ pub(crate) mod wht {
         (phase, (phase + 2) % 6)
     }
 
-    /// Build the DL7400's two closing records: the ring slot this frame filled, and the slot the
-    /// next frame will fill. The dock is told each slot's id and its ring address, and the first
-    /// of the pair carries a wrapping one-based frame counter.
-    pub(crate) fn navarro_frame_trailer(connector: u8, seq0: u32) -> FrameTrailer {
-        let (phase, next_phase) = ring_phase(seq0);
+    /// Build the DL7400 record that opens a non-prologue frame.
+    ///
+    /// This used to be appended to the preceding frame's trailer. Both working transports put a
+    /// USB-transfer boundary between the `aux=0x0006` close and this `aux=0x0004` next-slot record:
+    /// DLM begins the next logical frame with it and Windows submits it on its own. Keeping the
+    /// opener with the frame it describes is therefore protocol framing, not cosmetic grouping.
+    pub(crate) fn navarro_frame_opener(connector: u8, seq0: u32) -> [u8; 32] {
+        let (phase, _) = ring_phase(seq0);
+        let prev_phase = (phase + 4) % 6;
         let slot = super::super::cp::navarro_pipe_slot(connector, u16::from(phase));
-        let next_slot = super::super::cp::navarro_pipe_slot(connector, u16::from(next_phase));
         let ring = super::super::cp::navarro_pipe_ring(connector, u16::from(phase)) as u16;
-        let next_ring =
-            super::super::cp::navarro_pipe_ring(connector, u16::from(next_phase)) as u16;
+        let prev_ring =
+            super::super::cp::navarro_pipe_ring(connector, u16::from(prev_phase)) as u16;
+        let sub = u16::from(head_sub(connector));
+
+        let mut out = [0u8; 32];
+        out[2] = 0x1c; // size=28 -> 32-byte record
+        out[4] = 0x04; // type=4
+        out[8..10].copy_from_slice(&sub.to_le_bytes());
+        out[10..12].copy_from_slice(&0x0004u16.to_le_bytes());
+        out[16..19].copy_from_slice(&[0x0a, 0x00, 0x04]);
+        out[19] = slot as u8;
+        out[22..24].copy_from_slice(&ring.to_le_bytes());
+        out[26..28].copy_from_slice(&prev_ring.to_le_bytes());
+        out
+    }
+
+    /// Build the DL7400's closing record for the ring slot this frame filled.
+    ///
+    /// The next slot is announced by [`navarro_frame_opener`] only after this frame's final USB
+    /// transfer has terminated.
+    pub(crate) fn navarro_frame_trailer(connector: u8, seq0: u32) -> FrameTrailer {
+        let (phase, _) = ring_phase(seq0);
+        let slot = super::super::cp::navarro_pipe_slot(connector, u16::from(phase));
+        let ring = super::super::cp::navarro_pipe_ring(connector, u16::from(phase)) as u16;
         let sub = u16::from(head_sub(connector));
 
         let mut out = [0u8; 96];
-        for (i, aux) in [0x0006u16, 0x0004].into_iter().enumerate() {
-            let o = i * 32;
-            out[o + 2] = 0x1c; // size=28 -> 32-byte record
-            out[o + 4] = 0x04; // type=4
-            out[o + 8..o + 10].copy_from_slice(&sub.to_le_bytes());
-            out[o + 10..o + 12].copy_from_slice(&aux.to_le_bytes());
-        }
+        out[2] = 0x1c; // size=28 -> 32-byte record
+        out[4] = 0x04; // type=4
+        out[8..10].copy_from_slice(&sub.to_le_bytes());
+        out[10..12].copy_from_slice(&0x0006u16.to_le_bytes());
 
         // Slot complete: its id, its ring address, and this frame's number.
         out[16..19].copy_from_slice(&[0x08, 0x00, 0x05]);
@@ -1347,13 +1558,7 @@ pub(crate) mod wht {
         out[22..24].copy_from_slice(&ring.to_le_bytes());
         out[25] = (seq0 as u8).wrapping_add(1);
 
-        // Next slot: its id and ring address, then the address just completed.
-        out[48..51].copy_from_slice(&[0x0a, 0x00, 0x04]);
-        out[51] = next_slot as u8;
-        out[54..56].copy_from_slice(&next_ring.to_le_bytes());
-        out[58..60].copy_from_slice(&ring.to_le_bytes());
-
-        FrameTrailer { bytes: out, len: 64 }
+        FrameTrailer { bytes: out, len: 32 }
     }
 
     /// They delimit every logical frame, including the ARM-prefixed first frame. The first record
