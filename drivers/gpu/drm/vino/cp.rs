@@ -117,8 +117,8 @@ pub(super) fn post_auth_state_req(counter: u16) -> Result<KVec<u8>> {
 ///
 /// The ten-byte payload at offset 22 is a compact broken-down local time:
 /// `[year LE16, month, day, hour, minute, second, weekday, yday LE16]`. The authenticated
-/// 2026-08-03 capture carried Monday as weekday 1 and 214 as the zero-based day of year, proving
-/// the last three bytes are calendar fields rather than an opaque random tail.
+/// A capture carrying Monday as weekday 1 and 214 as the zero-based day of year proves the last
+/// three bytes are calendar fields rather than an opaque random tail.
 pub(super) fn rtc_sync_req(
     counter: u16,
     unix_seconds: i64,
@@ -257,7 +257,7 @@ pub(super) struct Timing {
     pub refresh_hz: u16,
     /// Pixel clock in 10 kHz units, serialized as a `u32` at offsets 70 through 73.
     ///
-    /// It is a full 32-bit field, not the 16-bit one this was until 2026-08-03. No Ridge capture
+    /// It is a full 32-bit field. No Ridge capture
     /// could show that, because Ridge is never driven above 497.75 MHz and the high half is
     /// always zero there -- but the DL7400 sends `0x0001113d` (699.49 MHz) for 2560x1440p165,
     /// so the upper word is real. Truncating to `u16` made every mode past 655.35 MHz fail the
@@ -283,7 +283,7 @@ const RIDGE_OFF48: u16 = 0x6000;
 /// measured. Both words track resolution alone: all three decrypted 2560x1440 mode sets carry the
 /// same pair at 60, 120 and 165 Hz, and the one 640x480p60 mode set carries a different pair.
 ///
-/// ⚠ Two samples cannot separate a formula from a lookup. `0x0a80`/`0x0300` are both `hactive +
+/// Two samples cannot separate a formula from a lookup. `0x0a80`/`0x0300` are both `hactive +
 /// 128`, and `0x66db`/`0x6800` have no proposed derivation at all, so this deliberately refuses to
 /// extrapolate: an unmeasured resolution gets Ridge's words and a log line naming them, which is
 /// the same discipline [`mode_profile`] applies to offsets 42 and 66.
@@ -306,7 +306,7 @@ fn navarro_mode_words(hactive: u16, vactive: u16) -> Option<(u16, u16)> {
 /// The 1280x720p60 and 3840x2160p60 values predate the decrypted corpus but fall on the same
 /// ladder.
 ///
-/// ⚠ `vdisplay` tracks `hdisplay` in every sample, so nothing distinguishes a width ladder from
+/// `vdisplay` tracks `hdisplay` in every sample, so nothing distinguishes a width ladder from
 /// an area one; width is chosen because the steps land on standard widths.
 fn link_word_42(hdisplay: u16) -> u16 {
     match hdisplay {
@@ -327,7 +327,7 @@ fn link_word_42(hdisplay: u16) -> u16 {
 /// 2560x1440p60 (`0x0800`) -- same refresh, but the 1440p timing is CVT-RB and carries no VIC, so
 /// refresh alone does not select the base.
 ///
-/// ⚠ `0x2800` is observed in exactly one message and its meaning is undecoded, so treat any mode
+/// `0x2800` is observed in exactly one message and its meaning is undecoded, so treat any mode
 /// that lands on it without a measurement as suspect first if a panel stays dark.
 fn mode_word_66(mode: &kernel::drm::kms::modes::DisplayMode, refresh: u16) -> u16 {
     let vic = u16::from(mode.cea_vic()) & 0x00ff;
@@ -1259,10 +1259,9 @@ pub(super) fn navarro_stream_report_mode(mode_header: &[u8; 26]) -> [u8; 112] {
 /// `len + 2`. Each configuration names the connector's slot id and the three dock-side addresses
 /// that slot is given. 14 + 14 + 6 * 46 = 304 exactly, so there is no padding and no tail.
 ///
-/// ⚠ The marker count is **not** a settled constant. A capture from 2026-08-02 has it once,
-/// followed by the six records and then fourteen unexplained bytes; a same-day capture taken while
-/// DLM was demonstrably driving both panels on this dock has it twice and no trailing bytes at
-/// all. Both plaintexts are 304 bytes. This follows the capture that was working, and it is the
+/// The marker count is not a settled constant: one capture has it once followed by the six records
+/// and fourteen unexplained bytes, while a capture taken while DLM was driving both panels has it
+/// twice and no trailing bytes. Both plaintexts are 304 bytes. This follows the capture that was working, and it is the
 /// reason the fourteen bytes must not be dismissed as AES padding for *this* record: in the
 /// working capture they are consumed by a second marker at the front.
 ///

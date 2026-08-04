@@ -138,15 +138,9 @@ pub(crate) struct DockProfile {
     pub(crate) dock_buffers: u8,
     /// Outstanding EP84 reads to keep posted.
     ///
-    /// Navarro needs exactly one, which is what DLM keeps: with four posted through a round-robin
-    /// cursor an EDID reply arrived 145 ms after its request instead of DLM's 45 ms, and EP02
-    /// NAKed everything behind the un-reaped slot.
-    ///
-    /// ⚠ Ridge needs the deeper queue and regressed to `control session failed after 3 attempts
-    /// (ETIMEDOUT)` when Navarro's depth of one was applied to both. It drains replies through the
-    /// older retry-heavy discovery path, which interleaves far more unsolicited dock pushes with
-    /// the replies it is waiting for, so a single outstanding read loses the reply it needs. This
-    /// is per-profile for that reason and must not be collapsed back to one constant.
+    /// Navarro needs exactly one, as DLM keeps: a deeper queue delays an EDID reply behind an
+    /// un-reaped slot and the dock then NAKs EP02. Ridge interleaves many more unsolicited pushes
+    /// with the replies it waits for, and loses them at a depth of one.
     pub(crate) ep84_queue_depth: usize,
 }
 
@@ -720,13 +714,9 @@ impl WorkItem for BringUp {
         // Establish the transport, authenticate the link and configure the encrypted control
         // session before publishing the connectors. A transient failure must not leave an
         // otherwise bound device inert until it is physically replugged.
-        // ⚠ Not a formality. The D6000 intermittently refuses a session outright -- every control
-        // request is answered, `interface state` reads 28 zero bytes, and the very first EP02 bulk
-        // write (`init_0`) is NAKed until it times out. Three attempts over four seconds is not
-        // enough to distinguish "the dock needs a moment" from "the dock is wedged", and while it
-        // used to hard-reset itself every few seconds -- which cleared the state as a side effect
-        // -- that is fixed, so nothing else recovers it. Back off up to eight seconds and keep
-        // trying for about half a minute before giving the device up.
+        // A dock can refuse a session outright: it answers every control request while NAKing the
+        // first EP02 bulk write until it times out. Back off to about half a minute before giving
+        // the device up.
         const SESSION_ATTEMPTS: usize = 8;
         let mut established = false;
         for attempt in 1..=SESSION_ATTEMPTS {
@@ -793,22 +783,10 @@ impl WorkItem for BringUp {
                         data.set_edid(head, blob);
                         vino_dev_debug!(cdev, "vino: cached head {head} EDID ({n} bytes)\n");
                     }
-                    // **A recovered EDID is the presence signal**, on both platforms: without one
-                    // there is no monitor to drive, and publishing the connector anyway puts a
-                    // fallback mode into an empty socket and makes the dock lay out buffers for
-                    // outputs that do not exist.
-                    //
-                    // ⚠ Ridge used to publish any head the dock had reported present. That was
-                    // harmless only while an empty head failed its downstream authentication and
-                    // so was never reported; once that was fixed, head 1 of a D6000 with one
-                    // monitor came up as a second enabled output carrying the `1920x1440` fallback
-                    // list and no EDID -- a phantom screen userspace happily placed windows on.
-                    //
-                    // The one exception is Ridge's head 0, which cannot report presence before its
-                    // first probe. Assume it and let the watcher correct it, rather than making
-                    // every cold plug wait a re-engage cycle for its only monitor.
-                    let present = have_edid;
-                    if present {
+                    // A recovered EDID is the presence signal on both platforms. Publishing a
+                    // connector without one puts a fallback mode into an empty socket and makes
+                    // the dock lay out buffers for an output that does not exist.
+                    if have_edid {
                         data.set_connected(head);
                         dev_info!(cdev, "vino: head {head} monitor connected\n");
                     }
@@ -999,19 +977,10 @@ impl WorkItem for BringUp {
                 // Consume asynchronous pushes instead of leaving them for the next paired read.
                 const MAX_UNPAIRED_DRAIN: usize = 4;
                 data.drain_cp_pushes(dev, MAX_UNPAIRED_DRAIN);
-                // Keep trying to bring an absent head's sink back. See `REENGAGE_RETRY`.
-                //
-                // This exists for a head whose *setup-time* discovery was deferred or timed out --
-                // it is a recovery, not a poll. Once the presence probe has actually answered for
-                // a connector, that answer is authoritative and this must stand down: an empty
-                // socket is not a head waiting to be recovered.
-                //
-                // ⚠ Without that, every empty connector was re-engaged forever. Each attempt is
-                // seven CP messages, several of which an empty socket never answers -- `id=0x15
-                // sub=0x21`, the EDID fetch, went unanswered every two seconds indefinitely, each
-                // one holding `cp_link` for its full deadline. On a DL7400 with one monitor that is
-                // three sockets doing it continuously, competing with video on the same control
-                // plane and with the other dock on the same bus.
+                // Recover a head whose setup-time discovery was deferred or timed out. This is a
+                // recovery, not a poll: once the presence probe has answered for a connector that
+                // answer is authoritative and this stands down, or an empty socket costs seven
+                // unanswered CP messages every `REENGAGE_RETRY` for the life of the session.
                 {
                     let now_r = Instant::<Monotonic>::now();
                     for h in 0..data.connector_count() {
@@ -1935,11 +1904,8 @@ impl VinoDriver {
                 wseq += 2; // every initialization message is 32 B = 2 AES blocks
             }};
         }
-        // ⚠ Navarro-only. This whole initialisation sequence was introduced with the DL7400 and
-        // did not exist before it: the parent of 498a10040294 sends none of `0x14/0x30`,
-        // `0x15/0x0b` or `0x16/0x2a`. Ridge inherited three messages it had never sent, and a
-        // user bisect landed the D6000's "no pixels at all" regression exactly on that commit.
-        // Ridge's own sequence is the historical one below.
+        // Navarro-only. Ridge's sequence begins below; sending these three messages there shifts
+        // every later inner counter and AES block.
         if profile.navarro_mode_words {
             send_init!(0x0014, 0x0030, &[]);
             send_init!(0x0015, 0x000b, &[0x01]);
@@ -2243,17 +2209,9 @@ impl VinoDriver {
                 fresh_rrx = fresh_rrx.or(d.perhead_rrx);
 
                 // AKE_No_Stored_km starts the receiver's H' calculation. Rrx is the immediate
-                // result; H' and pairing info are later, distinct milestones. DLM does not send
-                // LC_Init until both have crossed EP84.
-                // ⚠ Ridge needs the H'-computation hold too, and lost it when this block was
-                // gated to Navarro in 498a10040294. `AKE_No_Stored_km` starts the receiver's H'
-                // calculation, and the parent held `HDCP_HPRIME_WAIT_US` here and then drained,
-                // for *every* dock, before letting `LC_Init` (i == 3) go out. Without it Ridge
-                // sends LC_Init while the receiver is still computing, and picks up `fresh_rrx`
-                // only if it happens to land in an unrelated drain -- so its downstream
-                // authentication completes on incomplete material and the dock never authorises
-                // the stream. Measured at HEAD: the control session, EDID and connector are all
-                // fine and the dock then accepts ZERO bytes on EP08.
+                // result; H' and pairing info are later milestones, and DLM sends no LC_Init
+                // (i == 3) until both have crossed EP84. Both platforms need the wait and the
+                // drain, or the head authenticates on material that never arrived.
                 if i == 2 && !profile.per_head_onehot {
                     hold_until(send_at, HDCP_HPRIME_WAIT_US);
                     let dh = Self::drain_ep84(
@@ -2513,20 +2471,9 @@ impl VinoDriver {
             wseq += 2; // 32 B content = 2 AES blocks
         }
         if let Some(queue) = out_q.as_mut() {
-            // Instrumented: `send_cp_setup` returns ETIMEDOUT for Ridge without ever logging
-            // "encrypted control setup complete", while every individual submit and reply match
-            // succeeds. A queue flush waits for outstanding URBs and is the remaining way this
-            // function can time out with nothing else complaining.
-            // A flush timeout is NOT fatal to the session. `reap()` leaves a slow slot posted so
-            // a later call keeps waiting on it, and the session is otherwise complete: the dock
-            // has acknowledged every message, per-head authentication has run, and EDID discovery
-            // has finished.
-            //
-            // The D6000 reaches here with one connector empty, and an outstanding EP02 write for
-            // that connector is never drained -- so `flush` returns ETIMEDOUT after `timeout()`
-            // (1000 ms, exactly the measured gap) and failed the whole control session. Every
-            // other USB primitive in this path was instrumented and succeeds; this was the only
-            // one that did not.
+            // A flush timeout is not fatal: `reap()` leaves a slow slot posted for a later call,
+            // and the session is otherwise complete. A dock with an empty connector never drains
+            // that connector's last EP02 write, which would otherwise fail the whole setup.
             if let Err(e) = queue.flush(dev.io(), timeout()) {
                 pr_info!(
                     "vino: EP02 queue flush timed out ({e:?}); session already acknowledged,                      continuing\n"

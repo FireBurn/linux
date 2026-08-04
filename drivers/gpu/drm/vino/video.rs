@@ -466,16 +466,8 @@ pub(crate) mod wht {
 
     /// Everything about a dock's video encoding that differs between platforms.
     ///
-    /// ⚠ This used to be eight module-global statics written once per probe. With a Ridge dock
-    /// and a DL7400 bound at the same time, whichever probed last won and the other encoded with
-    /// the wrong layout: the D6000 was fed Navarro-shaped records, answered `head=0
-    /// endpoint=0x08 stopped accepting video` after exactly 65,536 bytes and **hard-reset
-    /// itself**, looping its whole bring-up every ~8 s. Carrying the geometry as a value makes
-    /// that unrepresentable, where mirroring it per device and restoring it under a lock only
-    /// made the two docks take turns.
-    ///
-    /// It is [`Copy`] and eight bytes wide, so passing it costs a register and no encoder needs
-    /// to reach for shared state on its hot path.
+    /// Passed by value rather than held in shared state: two docks of different generations may
+    /// encode concurrently, and each frame must carry its own dock's layout.
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) struct Geometry {
         /// `log2` of the strip width in pixels. A strip is always [`STRIP_BLOCKS`] blocks of
@@ -1240,15 +1232,10 @@ pub(crate) mod wht {
         let mut chunk: KVec<u8> = KVec::new();
         // Interlaced ordering sends even bands before odd bands while preserving x order.
         let mut order: KVec<usize> = KVec::with_capacity(strips.len(), GFP_KERNEL)?;
-        // ⚠ `strips.len() == 3600` is NOT sufficient to identify a DL7400 surface. The rows below
-        // are a producer permutation measured from a 2560x1440 Navarro frame, which is 20 strips
-        // across x 180 bands because Navarro strips are 128x8. **Ridge at the same resolution also
-        // has exactly 3600 strips** -- 40 across x 90 bands, its strips being 64x16 -- so the count
-        // alone selected this permutation for the wrong dock and reordered its frame against a
-        // grid half the real width. Measured: the D6000 accepted one 207,072-byte training frame,
-        // stopped draining EP08 and re-enumerated ~90 ms later. Both black carriers reach here on
-        // every dock (`black_frame_ep08` passes `Some(false)`, `black_frame_ep08_ordinary`
-        // `Some(true)`), so this is the guard that has to hold.
+        // The rows below are a producer permutation of a 2560x1440 Navarro surface: 20 strips
+        // across x 180 bands, its strips being 128x8. A strip count alone cannot select it --
+        // Ridge at the same resolution is also exactly 3600 strips, 40 across x 90 bands -- and
+        // both black carriers reach here on every dock, so match the layout itself.
         let navarro_layout =
             geom.interlaced_bands && geom.strip_w() == STRIP_BLOCKS * DIM && strips.len() == 3600;
         let navarro_rows = match navarro_ordinary {
@@ -1370,7 +1357,7 @@ pub(crate) mod wht {
     /// fixed 32 bytes regardless of how many strips actually occupy it -- at 2560 wide only the
     /// first 20 are ever non-zero and bytes 20..32 are zero in all 5760 bytes of every map.
     ///
-    /// ⚠ 32 covers any width up to 4096 px, but nothing wider has been captured, so a mode past
+    /// 32 covers any width up to 4096 px, but nothing wider has been captured, so a mode past
     /// that must not assume the stride still holds.
     const PARAM_BANDS_PER_TLV: usize = 8;
     const PARAM_BAND_STRIDE: usize = 32;
@@ -1390,11 +1377,8 @@ pub(crate) mod wht {
     /// falls on a multiple of 512.
     #[inline]
     fn strip_size_class(len: usize) -> u8 {
-        // ⛔ The field does NOT saturate. Every map in the decrypted DLM corpus uses only classes
-        // 0..3 with a longest strip of 1670 B, while vino's live desktop reaches 2598 B -- classes
-        // 4 and 5, which no capture covers. Clamping to 3 was A/B'd on hardware and made the
-        // DL7400's artifact **worse**, so the class is a real magnitude and the corpus simply
-        // never held a strip that long.
+        // The field does not saturate: the corpus only reaches class 3 because its longest strip
+        // is 1670 B, and clamping a live desktop's larger strips to 3 corrupts them.
         (len >> 9) as u8
     }
 
@@ -1407,19 +1391,11 @@ pub(crate) mod wht {
     /// padding is reached, since `aux` is a producer lane on this dock and not a pad count.
     fn framed_strip_extents(frames: &[KVec<u8>]) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
         frames.iter().flat_map(|chunk| {
-            // ⚠ Each element of `frames` is an ALLOCATION chunk, not one record: the loop above
-            // packs complete records into `CHUNK`-sized buffers. Skipping a single 16-byte header
-            // and walking strips to the end therefore stopped at the first *inner* record
-            // boundary, because the next record's zero `pad` word reads as a strip length of 0.
-            // Only the strips of each chunk's first record were measured, and every other position
-            // stayed size class 0 -- "under 512 bytes" -- which is exactly the artifact this map
-            // exists to prevent: busy strips decode to coloured noise while flat fills stay exact.
-            // At 2560x1440 a chunk holds about four of the 4080-byte records, so roughly three
-            // quarters of the frame was mis-declared.
-            //
-            // Walk records by their own stride instead. A record is `[u16 pad][u16 size][12 B
-            // header][ (u16 len ++ strip)* ][ 0..15 pad ]` and the next one begins `size + 4`
-            // bytes on.
+            // Each element of `frames` is an allocation chunk holding several complete records,
+            // not one record, so walk records by their own stride: a record is `[u16 pad][u16
+            // size][12 B header][ (u16 len ++ strip)* ][ 0..15 pad ]` and the next begins
+            // `size + 4` bytes on. Walking strips to the end of a chunk instead stops at the first
+            // inner record boundary, because the next record's zero `pad` reads as a zero length.
             let mut next_record = 0usize;
             let mut p = 0usize;
             let mut record_end = 0usize;
@@ -1466,13 +1442,9 @@ pub(crate) mod wht {
     /// Values come from [`strip_size_class`] applied to the strips in `frames`. A position this
     /// frame does not carry stays zero, which is what DLM sends for it.
     ///
-    /// ⚠ Sending the all-zero map -- what vino did until this was measured -- is not a harmless
-    /// approximation. It announces every strip as "under 512 bytes", so the dock mis-parses
-    /// exactly the detailed strips and renders them as coloured noise while flat fills stay
-    /// perfect. That was the on-panel artifact.
-    ///
-    /// vino sent no map at all until 2026-08-03: it is the only record kind in DLM's video stream
-    /// that vino never emitted.
+    /// An all-zero map is not a harmless approximation: it announces every strip as "under 512
+    /// bytes", so the dock mis-parses exactly the detailed strips and renders them as coloured
+    /// noise while flat fills stay perfect.
     pub(crate) fn navarro_strip_params(
         geom: Geometry,
         connector: u8,
@@ -1488,16 +1460,11 @@ pub(crate) mod wht {
 
         // One byte per map slot, laid out exactly as the sub-records carry it.
         //
-        // ⚠ The map covers the WHOLE surface, but a delta frame carries only the strips its damage
-        // set selected. Rebuilding from zero each time therefore re-declares every *untouched*
-        // position as class 0 -- "under 512 bytes" -- which is the same mis-declaration that made
-        // busy strips decode to noise before the map existed at all, reintroduced for exactly the
-        // parts of the screen that are holding still. Carry the previous frame's classes forward
-        // and overwrite only what this frame actually sends.
-        //
-        // `remembered` is the caller's per-connector buffer; a mode change resizes it, and the
-        // resize zeroes it, which is correct because the dock's framebuffer is undefined until the
-        // keyframe that follows.
+        // The map covers the whole surface while a delta frame carries only its damaged strips,
+        // so carry the previous frame's classes forward and overwrite only what this frame sends;
+        // rebuilding from zero would re-declare every untouched strip as class 0. `remembered` is
+        // the caller's per-connector buffer, zeroed by the resize a mode change triggers, which is
+        // correct because the dock's framebuffer is undefined until the keyframe that follows.
         if remembered.len() != bands * PARAM_BAND_STRIDE {
             remembered.clear();
             remembered.resize(bands * PARAM_BAND_STRIDE, 0, GFP_KERNEL)?;
@@ -1521,11 +1488,9 @@ pub(crate) mod wht {
             longest = longest.max(len);
             described += 1;
         }
-        // How many of the frame's strips the map accounts for, and how they are distributed. A
-        // position the walk misses is announced as size class 0, so `described` must equal the
-        // strip count of the records handed in -- it read one record per allocation chunk until
-        // 2026-08-04. The histogram is the second half of the check: a map that covers every strip
-        // but calls them all class 0 is the same failure with a healthier-looking count.
+        // A position the walk misses is announced as class 0, so `described` must equal the strip
+        // count of the records handed in, and the histogram distinguishes a map that covers every
+        // strip from one that calls them all class 0.
         vino_debug!(
             "vino: connector={connector} strip map {described} strip(s) over {} chunk(s), classes {:?}, longest {longest} B\n",
             frames.len(),
@@ -1603,10 +1568,9 @@ pub(crate) mod wht {
 
     /// Build the DL7400 record that opens a non-prologue frame.
     ///
-    /// This used to be appended to the preceding frame's trailer. Both working transports put a
-    /// USB-transfer boundary between the `aux=0x0006` close and this `aux=0x0004` next-slot record:
-    /// DLM begins the next logical frame with it and Windows submits it on its own. Keeping the
-    /// opener with the frame it describes is therefore protocol framing, not cosmetic grouping.
+    /// Both working transports put a USB-transfer boundary between the `aux=0x0006` close and this
+    /// `aux=0x0004` next-slot record, so the opener belongs to the frame it describes rather than
+    /// to the preceding trailer. This is protocol framing, not cosmetic grouping.
     pub(crate) fn navarro_frame_opener(geom: Geometry, connector: u8, seq0: u32) -> [u8; 32] {
         let (phase, _) = ring_phase(seq0);
         let prev_phase = (phase + 4) % 6;

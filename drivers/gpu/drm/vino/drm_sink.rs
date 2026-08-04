@@ -128,14 +128,10 @@ const FRAME_PERIOD_US: i64 = FRAME_PERIOD_MS * 1000;
 /// How many consecutive frames must carry a strip after its content changes, so that every one of
 /// the dock's buffers receives it.
 ///
-/// The ring depth (`Geometry::dock_buffers`: Ridge 2, DL7400 3) is the theoretical minimum; a
-/// window drag still left an occasional stale frame at exactly the minimum, so this carries one
-/// frame of margin for a presentation the dock drops or applies to the buffer it just used.
-///
-/// ⚠ This was a hardcoded 2 until 2026-08-03, which silently left one of the DL7400's three slots
-/// holding stale pixels on every keyframe. Because the dock scans the slots in turn, a strip
-/// present in two of three ghosts -- the panel alternates between new and old content -- which is
-/// invisible to any analysis that decodes the wire, since the *bytes* are correct.
+/// The ring depth (`Geometry::dock_buffers`) is the theoretical minimum, plus one frame of margin
+/// for a presentation the dock drops or applies to the buffer it just used. Coming up short leaves
+/// a slot holding stale pixels, which the panel shows as ghosting and no wire analysis can see --
+/// the bytes are correct.
 #[inline]
 fn damage_repeats(geom: super::video::wht::Geometry) -> u8 {
     geom.dock_buffers.saturating_add(1)
@@ -244,29 +240,16 @@ static COLD_RIDGE: ColdTimeline = ColdTimeline {
     edid: cold::EDID,
 };
 
-/// Navarro's timeline, extracted from `captures/navarro-dlm-modeset-20260802-005453` and anchored
-/// on head 0's mode set exactly as Ridge's is.
+/// Navarro's timeline, measured from a DLM cold bring-up and anchored on connector 0's real
+/// (`off23 = 2`) mode set, exactly as Ridge's is.
 static COLD_NAVARRO: ColdTimeline = ColdTimeline {
-    // Measured from `captures/navarro-dlm-today-124144` -- a cold bring-up recorded while DLM was
-    // demonstrably driving both panels on this dock -- and anchored on connector 0's *real*
-    // (`off23 = 2`) mode set.
-    //
-    // ⚠ This replaces a timeline taken from `navarro-dlm-modeset-20260802-005453`, which differed
-    // in every dimension: it had head 1 streaming first at +1116 ms and head 0 at +1245 ms, the
-    // second mode set at +757 ms, and a repeat mode set at +1129 ms. That capture was a mode
-    // *change* on an already-running link, not a cold bring-up, so vino was replaying a recovery
-    // sequence as if it were an activation -- nine times slower than the real thing and with the
-    // heads in the opposite order.
     h1_mode: 10,
     // DLM polls continuously across this span; there is no silent window to preserve.
     quiet_end: 11,
-    // Video is not a pair of one-shot events. DLM keeps head 0's carrier alive throughout the
-    // still-open control bracket, then starts head 1 and continues both through the closing
-    // markers. Vino previously sent one frame at +122 ms, went silent for 182 ms, and only tried
-    // the second frame after closing the bracket; Navarro accepted that frame and NAKed the next
-    // forever. These are the measured starts of DLM's frames through the +304-ms close. The later
-    // frames contain desktop pixels; the activation path uses its pre-encoded carrier here and
-    // normal scanout replaces it as soon as activation returns.
+    // Video is not a pair of one-shot events: DLM keeps head 0's carrier alive throughout the
+    // still-open control bracket, starts head 1, and continues both through the closing markers.
+    // A gap here makes the dock accept one frame and NAK the next forever. The activation path
+    // uses its pre-encoded carrier; normal scanout replaces it as soon as activation returns.
     video: &[
         (0, 122),
         (0, 124),
@@ -876,13 +859,6 @@ pub(super) struct VinoDrmData {
     video_supported: core::sync::atomic::AtomicBool,
     /// This device's codec geometry, packed; see [`VinoDrmData::geometry`] and
     /// [`super::video::wht::Geometry`].
-    ///
-    /// ⚠ This used to be *module-global* state the codec read directly. With a Ridge dock and a
-    /// DL7400 bound at the same time, whichever probed last won and the other encoded with the
-    /// wrong geometry: Ridge lays 16 blocks 8 across x 2 down over 64x16 px, Navarro 16 across x
-    /// 1 down over 128x8. Measured consequence -- the D6000 was fed Navarro-shaped records,
-    /// answered `head=0 endpoint=0x08 stopped accepting video`, and **reset itself**, looping its
-    /// whole bring-up every ~8 s.
     codec_geometry: core::sync::atomic::AtomicU32,
     /// Whether to prefix the cold ARM burst to the first frame; see `DockProfile::video_arm`.
     video_arm: core::sync::atomic::AtomicBool,
@@ -1311,12 +1287,8 @@ impl VinoDrmData {
 
     /// This device's codec geometry, to be passed into every codec call made on its behalf.
     ///
-    /// Stored packed rather than as the struct itself because the DRM device allocation is
-    /// pin-initialised before `probe` knows which dock it matched; unpacking is a handful of
-    /// shifts and every encoder wants the value once, at the top.
-    ///
-    /// A device that never had a profile applied reads the Ridge layout, which is what every
-    /// geometry-free code path assumed before this was a parameter at all.
+    /// Stored packed because the DRM device allocation is pin-initialised before `probe` knows
+    /// which dock it matched. A device with no profile applied reads the Ridge layout.
     pub(super) fn geometry(&self) -> super::video::wht::Geometry {
         let p = self.codec_geometry.load(core::sync::atomic::Ordering::Acquire);
         if p & 0x8000 == 0 {
@@ -2637,7 +2609,7 @@ impl VinoDrmData {
     /// first and only record on its own stream, sealed with that connector's own key at block 0.
     /// A driven connector's sealed chain instead opens with the pipe descriptor at block 0.
     ///
-    /// vino used to send it on `stream_id | 0x10`, which for head 0 is connector 2's stream id,
+    /// It must not go out on `stream_id | 0x10`, which for head 0 is connector 2's stream id,
     /// sealed with head 0's key. That both signed another connector's stream with the wrong key
     /// and, because the prologue then also started at block 0, used the head's first keystream
     /// block twice.
@@ -3249,19 +3221,11 @@ impl VinoDrmData {
         dev.ctrl_send(&frame, super::timeout(), GFP_KERNEL).ok()?;
         link.wire_seq = link.wire_seq.wrapping_add(((msg.len() + 15) / 16) as u32);
         link.counter = link.counter.wrapping_add(1);
-        // ⭐ Take the reply that answers THIS probe, not simply the next frame on EP84.
-        //
-        // This used to reap exactly one read and decode it as the answer. The connectors are
-        // probed back to back, so a reply that arrived a moment late -- or any unprompted push --
-        // was consumed by the *next* connector's probe and its status word attributed to the wrong
-        // head. Measured on the DL7400 with a monitor on socket 1 only: head 0 and head 1 traded
-        // `present` between them every few minutes, `head 0 monitor disconnected` dropped the live
-        // output, and a sink re-engagement five seconds later brought it back. The dock never
-        // changed its mind; vino misread which question it was answering.
-        //
-        // The inner counter echoes the request, so use it. A round that never sees its own echo
-        // returns `None`, which the caller already treats as "this poll learned nothing" rather
-        // than as an unplug.
+        // Take the reply that answers this probe, not simply the next frame on EP84: the
+        // connectors are probed back to back, so a late reply or an unprompted push would
+        // otherwise be attributed to the wrong head. The inner counter echoes the request. A round
+        // that never sees its own echo returns `None`, which the caller treats as "this poll
+        // learned nothing" rather than as an unplug.
         let mut reply = KVec::from_elem(0u8, 4096, GFP_KERNEL).ok()?;
         let deadline = Instant::<Monotonic>::now() + Delta::from_millis(64);
         let got = loop {
@@ -5003,30 +4967,6 @@ fn read_cursor_bgra(
     Ok(out)
 }
 
-/// Replace the cursor bitmap with a diagnostic pattern. **Temporary, 2026-07-29.**
-///
-/// The pointer is uniformly translucent on both heads, which is a pixel-format question, and the
-/// DLM capture never caught a `sub=0x41` bitmap upload to compare against. This substitutes four
-/// horizontal bands whose intended appearance is unambiguous, so what actually shows on the panel
-/// identifies the format directly instead of by guesswork:
-///
-/// **Stage 2 -- locate the alpha byte.** Stage 1 (opaque red / green / blue / 50% grey, in
-/// DRM_FORMAT_ARGB8888 little-endian order `B G R A`) came back with only the green and grey bands
-/// visible: an "equals sign". Zero-for-red-and-blue, `ff`-for-green holds at exactly one byte
-/// index, **byte 1** -- so the dock is not reading alpha from byte 3, and vino's opaque cursors
-/// have been shipping their green channel as alpha.
-///
-/// **Stage 3 -- silhouette test, to tell a format difference from a byte offset.**
-///
-/// Stage 2 (band `k` sets only byte `k`, drawn as `k + 1` dashes) returned **two dashes**, so the
-/// dock takes alpha from **byte 1**. Two causes fit that equally well, because every pixel within a
-/// band is identical and a shift is therefore invisible:
-///
-/// * **(A)** the dock's pixel format really does carry alpha at index 1;
-/// * **(B)** the format is ordinary (alpha at index 3) but the bitmap sits **±2 bytes** from where
-///   the dock expects it -- [`super::cp::cursor_image`] pads to `off32` and appends there.
-///
-
 /// Source (framebuffer) dimensions for an output of `ow`x`oh` pixels under plane `rotation`.
 /// The 90/270 rotations swap width and height between the framebuffer and the displayed output;
 /// the others preserve them.
@@ -5878,10 +5818,9 @@ fn encode_and_send_wht(
     // whole-frame coalescing allocation.
     let frame_count = frames.len();
     let image_len: usize = frames.iter().take(frame_count).map(|f| f.len()).sum();
-    // The DL7400's per-strip parameter map, which describes every strip in the frame and which
-    // vino sent none of until 2026-08-03. Working DLM and Windows both include it in frame zero and
-    // put it after at least some image records; Windows' deterministic image-then-map ordering is
-    // used below. Ridge has no equivalent record and gets an empty slice.
+    // The DL7400's per-strip parameter map. DLM and Windows both include it in frame zero after
+    // at least some image records; the deterministic image-then-map ordering is used below. Ridge
+    // has no equivalent record and gets an empty slice.
     let params: KVec<u8> = if geom.head_sub_shift == 0 {
         KVec::new()
     } else {
