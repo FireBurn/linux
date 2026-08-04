@@ -745,9 +745,13 @@ pub(crate) mod wht {
         cb: &[i32; PIXELS],
         y: &[i32; PIXELS],
     ) -> ColourBlock {
-        let tcr = transform(cr);
-        let tcb = transform(cb);
-        let ty = transform(y);
+        #[cfg(target_arch = "x86_64")]
+        let (tcr, tcb, ty) = match crate::simd::colour_block_transforms(cr, cb, y) {
+            Some(t) => t,
+            None => (transform(cr), transform(cb), transform(y)),
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let (tcr, tcb, ty) = (transform(cr), transform(cb), transform(y));
         // Quantise all three planes and find each one's last significant coefficient in a single
         // pass. These were separate steps, so every block ran three further 63-element reverse
         // scans ([`chroma_last`]) across arrays it had only just written. Folding the search into

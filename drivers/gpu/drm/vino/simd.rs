@@ -56,6 +56,44 @@ pub(crate) fn has_avx2() -> bool {
     cpu_has(bindings::X86_FEATURE_AVX2)
 }
 
+/// Whether the encoder should use the vectorised transform, resolved once.
+///
+/// Both halves are checked here so the hot path is one relaxed load: the CPU must have AVX2 and
+/// the operator must have asked for it.
+static USE_SIMD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Latch whether the encoder takes the vectorised path. Called once, from probe.
+pub(crate) fn set_encoder_simd(on: bool) {
+    let v = u8::from(on && has_avx2());
+    USE_SIMD.store(v, core::sync::atomic::Ordering::Relaxed);
+    let name = if v != 0 { "avx2" } else { "scalar" };
+    pr_info!("vino-simd: encoder transform = {}\n", name);
+}
+
+/// Transform three planes of one block, vectorised if this build and CPU allow it.
+///
+/// One FPU section covers all three: it is short, straight-line and allocation-free, which is what
+/// [`FpuGuard`] requires. Returns `None` when the scalar path should run instead.
+#[inline]
+pub(crate) fn colour_block_transforms(
+    cr: &[i32; PIXELS],
+    cb: &[i32; PIXELS],
+    y: &[i32; PIXELS],
+) -> Option<([i32; COEFFS], [i32; COEFFS], [i32; COEFFS])> {
+    if USE_SIMD.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let _fpu = FpuGuard::new(0);
+    // SAFETY: the guard is live and `USE_SIMD` is only set when `has_avx2()` held.
+    Some(unsafe {
+        (
+            transform_inblock_avx2(cr),
+            transform_inblock_avx2(cb),
+            transform_inblock_avx2(y),
+        )
+    })
+}
+
 /// Whether this CPU can run the AVX-512 path.
 pub(crate) fn has_avx512() -> bool {
     cpu_has(bindings::X86_FEATURE_AVX512F)
@@ -248,6 +286,95 @@ simd_transform!(
     _mm512_srai_epi32
 );
 
+/// Level-1 Haar of one 8x8 block, vectorised **within** the block.
+///
+/// The across-blocks form above has to gather every block into lane-major order first, and that
+/// transpose costs about what the vector arithmetic saves. Here a row of eight `i32` is exactly one
+/// `__m256i`, so the column pass is whole-vector add/sub with no shuffle and only the row pass
+/// needs one permute. Nothing is transposed, and because it transforms a single block it has no
+/// lane-utilisation penalty: the encoder's batch of three costs three calls, not eight idle lanes.
+///
+/// Levels 2 and 3 stay scalar. They are 20 of the 84 butterflies and operate on 4x4 and 2x2 data,
+/// which is narrower than a vector.
+///
+/// # Safety
+///
+/// The caller must hold a live [`FpuGuard`] and must have checked `has_avx2()`.
+#[target_feature(enable = "avx2")]
+unsafe fn transform_inblock_avx2(block: &[i32; PIXELS]) -> [i32; COEFFS] {
+    // SAFETY: as the caller.
+    unsafe {
+        // Deinterleave a row into [evens | odds] with one permute.
+        let idx = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+        let mut l = [_mm_setzero_si128(); 8];
+        let mut h = [_mm_setzero_si128(); 8];
+        for r in 0..8 {
+            let row = _mm256_loadu_si256(block.as_ptr().add(r * 8) as *const __m256i);
+            let p = _mm256_permutevar8x32_epi32(row, idx);
+            let e = _mm256_castsi256_si128(p);
+            let o = _mm256_extracti128_si256(p, 1);
+            l[r] = _mm_add_epi32(e, o);
+            h[r] = _mm_sub_epi32(e, o);
+        }
+
+        // Column pass: pair rows. Whole-vector, no shuffle.
+        let (mut ll1, mut hl1, mut lh1, mut hh1) = ([0i32; 16], [0i32; 16], [0i32; 16], [0i32; 16]);
+        for i in 0..4 {
+            let (la, lb) = (l[2 * i], l[2 * i + 1]);
+            let (ha, hb) = (h[2 * i], h[2 * i + 1]);
+            _mm_storeu_si128(ll1.as_mut_ptr().add(i * 4) as *mut __m128i, _mm_add_epi32(la, lb));
+            _mm_storeu_si128(lh1.as_mut_ptr().add(i * 4) as *mut __m128i, _mm_sub_epi32(la, lb));
+            _mm_storeu_si128(hl1.as_mut_ptr().add(i * 4) as *mut __m128i, _mm_add_epi32(ha, hb));
+            _mm_storeu_si128(hh1.as_mut_ptr().add(i * 4) as *mut __m128i, _mm_sub_epi32(ha, hb));
+        }
+
+        // Levels 2 and 3, scalar and identical to `video::wht`.
+        let sh = |x: i32| x >> 6;
+        let (mut ll2, mut hl2, mut lh2, mut hh2) = ([0i32; 4], [0i32; 4], [0i32; 4], [0i32; 4]);
+        {
+            let (mut tl, mut th) = ([0i32; 8], [0i32; 8]);
+            for r in 0..4 {
+                for i in 0..2 {
+                    let (a, b) = (ll1[r * 4 + 2 * i], ll1[r * 4 + 2 * i + 1]);
+                    tl[r * 2 + i] = a + b;
+                    th[r * 2 + i] = a - b;
+                }
+            }
+            for c in 0..2 {
+                for i in 0..2 {
+                    let (a, b) = (tl[2 * i * 2 + c], tl[(2 * i + 1) * 2 + c]);
+                    ll2[i * 2 + c] = a + b;
+                    lh2[i * 2 + c] = a - b;
+                    let (a2, b2) = (th[2 * i * 2 + c], th[(2 * i + 1) * 2 + c]);
+                    hl2[i * 2 + c] = a2 + b2;
+                    hh2[i * 2 + c] = a2 - b2;
+                }
+            }
+        }
+        let (l0, h0) = (ll2[0] + ll2[1], ll2[0] - ll2[1]);
+        let (l1, h1) = (ll2[2] + ll2[3], ll2[2] - ll2[3]);
+        let (ll3, hl3, lh3, hh3) = (l0 + l1, h0 + h1, l0 - l1, h0 - h1);
+
+        let mut out = [0i32; COEFFS];
+        out[0] = sh(ll3);
+        out[1] = sh(hl3);
+        out[2] = sh(lh3);
+        out[3] = sh(hh3);
+        for i in 0..4 {
+            out[4 + i] = sh(hl2[i]);
+            out[8 + i] = sh(lh2[i]);
+            out[12 + i] = sh(hh2[i]);
+        }
+        for i in 0..16 {
+            let m = SCAN4_MORTON[i];
+            out[16 + i] = sh(hl1[m]);
+            out[32 + i] = sh(lh1[m]);
+            out[48 + i] = sh(hh1[m]);
+        }
+        out
+    }
+}
+
 // ------------------------------------------------------------------------------- the experiment
 
 /// Deterministic pseudo-random blocks spanning the 8-bit range the codec sees.
@@ -312,6 +439,55 @@ pub(crate) fn bench() -> Result {
     let fpu = Instant::<Monotonic>::now() - t;
     let fpu_ns = ns_per(fpu, REPS * BLOCKS);
     pr_info!("vino-simd: kernel_fpu_begin/end {fpu_ns} ns per section (empty)\n");
+
+    // The within-block form: one block per call, so the encoder's batch of three costs three
+    // calls rather than eight idle lanes.
+    if has_avx2() {
+        let mut bad = 0usize;
+        for b in blocks.iter() {
+            let _fpu = FpuGuard::new(0);
+            // SAFETY: guard live, feature checked.
+            if unsafe { transform_inblock_avx2(b) } != transform(b) {
+                bad += 1;
+            }
+        }
+        if bad != 0 {
+            pr_err!("vino-simd: avx2-inblock MISMATCH on {} blocks -- not reporting a speedup\n", bad);
+            return Err(EINVAL);
+        }
+        let t = Instant::<Monotonic>::now();
+        for _ in 0..REPS {
+            for b in blocks.iter() {
+                let _fpu = FpuGuard::new(0);
+                // SAFETY: as above.
+                sink = sink.wrapping_add(unsafe { transform_inblock_avx2(b) }[0] as i64);
+            }
+        }
+        let ib = ns_per(Instant::<Monotonic>::now() - t, REPS * BLOCKS);
+
+        // The same, with one FPU section around a whole strip's worth of blocks, which is how a
+        // real encoder would open it.
+        let t = Instant::<Monotonic>::now();
+        for _ in 0..REPS {
+            for chunk in blocks.chunks(48) {
+                let _fpu = FpuGuard::new(0);
+                for b in chunk {
+                    // SAFETY: as above.
+                    sink = sink.wrapping_add(unsafe { transform_inblock_avx2(b) }[0] as i64);
+                }
+            }
+        }
+        let ib_strip = ns_per(Instant::<Monotonic>::now() - t, REPS * BLOCKS);
+        pr_info!(
+            "vino-simd: avx2-inblock identical to scalar | {} ns/block (fpu per block), {} ns/block (fpu per strip) -- no lane waste at any batch size\n",
+            ib, ib_strip
+        );
+        pr_info!(
+            "vino-simd: avx2-inblock vs scalar -- {}% per block, {}% per strip\n",
+            if ib > 0 { scalar_ns * 100 / ib } else { 0 },
+            if ib_strip > 0 { scalar_ns * 100 / ib_strip } else { 0 },
+        );
+    }
 
     macro_rules! run {
         ($label:literal, $supported:expr, $f:ident, $vec:ty, $lanes:literal, $zero:expr) => {

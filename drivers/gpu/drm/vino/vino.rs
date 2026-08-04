@@ -3277,6 +3277,14 @@ impl usb::Driver for VinoDriver {
         // The SIMD experiment needs no hardware, but this is the driver's only entry point after
         // the module parameters are readable. Once per load, not once per interface.
         #[cfg(target_arch = "x86_64")]
+        {
+            static LATCHED: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !LATCHED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                simd::set_encoder_simd(*crate::module_parameters::simd_transform.value() != 0);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
         if *crate::module_parameters::simd_bench.value() != 0 {
             static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
             if !RAN.swap(true, core::sync::atomic::Ordering::Relaxed) {
@@ -3470,6 +3478,10 @@ kernel::module_usb_driver! {
         debug: u8 {
             default: 0,
             description: "Enable verbose Vino protocol and scanout diagnostics",
+        },
+        simd_transform: u8 {
+            default: 0,
+            description: "Experiment: use the AVX2 within-block Haar transform in the encoder instead of the scalar one. Byte-exact; the scalar path remains the fallback and the oracle",
         },
         simd_bench: u8 {
             default: 0,
