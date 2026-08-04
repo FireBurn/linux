@@ -2347,6 +2347,29 @@ impl VinoDriver {
                 // AKE_No_Stored_km starts the receiver's H' calculation. Rrx is the immediate
                 // result; H' and pairing info are later, distinct milestones. DLM does not send
                 // LC_Init until both have crossed EP84.
+                // ⚠ Ridge needs the H'-computation hold too, and lost it when this block was
+                // gated to Navarro in 498a10040294. `AKE_No_Stored_km` starts the receiver's H'
+                // calculation, and the parent held `HDCP_HPRIME_WAIT_US` here and then drained,
+                // for *every* dock, before letting `LC_Init` (i == 3) go out. Without it Ridge
+                // sends LC_Init while the receiver is still computing, and picks up `fresh_rrx`
+                // only if it happens to land in an unrelated drain -- so its downstream
+                // authentication completes on incomplete material and the dock never authorises
+                // the stream. Measured at HEAD: the control session, EDID and connector are all
+                // fine and the dock then accepts ZERO bytes on EP08.
+                if i == 2 && !profile.per_head_onehot {
+                    hold_until(send_at, HDCP_HPRIME_WAIT_US);
+                    let dh = Self::drain_ep84(
+                        dev,
+                        ep84_q.as_mut(),
+                        &mut resp,
+                        session,
+                        edid_out,
+                        Delta::from_millis(10),
+                    );
+                    fresh_rrx = fresh_rrx.or(dh.perhead_rrx);
+                    perhead_repeater = perhead_repeater.or(dh.perhead_repeater);
+                    d.add(dh);
+                }
                 if i == 2 && profile.per_head_onehot {
                     let Some(rrx_h) = fresh_rrx else {
                         cp_ctr += 1;
