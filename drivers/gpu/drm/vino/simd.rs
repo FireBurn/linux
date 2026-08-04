@@ -22,7 +22,10 @@ use kernel::fpu::FpuGuard;
 use kernel::prelude::*;
 use kernel::time::{Delta, Instant, Monotonic};
 
-use super::video::wht::{colour_strip_at, transform, Geometry, COEFFS, PIXELS, RIDGE_GEOMETRY};
+use super::video::wht::{
+    colour, colour_block, colour_strip, colour_strip_at, quantize, transform, ColourBlock,
+    Geometry, COEFFS, PIXELS, RIDGE_GEOMETRY,
+};
 
 /// Blocks `colour_block` transforms together: the `cr`, `cb` and `y` planes of one 8x8 block.
 ///
@@ -428,6 +431,71 @@ pub(crate) fn bench() -> Result {
         if strip_ns > 0 { in_transform * 100 / strip_ns } else { 0 },
     );
     pr_info!("vino-simd: a perfect transform could save at most that share of encode CPU\n");
+
+    // Where the other ~90% goes. The transform is one of four elementwise stages a strip runs, and
+    // the three around it have no shuffle and no transpose, so they vectorise where it does not.
+    let mut planes = ([0i32; PIXELS], [0i32; PIXELS], [0i32; PIXELS]);
+    for i in 0..PIXELS {
+        let (y, cb, cr) = colour((i * 7) as u8, (i * 13) as u8, (i * 29) as u8);
+        planes.0[i] = cr;
+        planes.1[i] = cb;
+        planes.2[i] = y;
+    }
+    const N: usize = 16 * 512;
+
+    let t = Instant::<Monotonic>::now();
+    for i in 0..N {
+        let v = core::hint::black_box(i as u8);
+        core::hint::black_box(colour(v, v.wrapping_add(29), v.wrapping_add(83)));
+    }
+    let px_ns = ns_per(Instant::<Monotonic>::now() - t, N);
+
+    let t = Instant::<Monotonic>::now();
+    for i in 0..N {
+        core::hint::black_box(quantize(core::hint::black_box(i as i32 * 37), i % COEFFS));
+    }
+    let q_ns = ns_per(Instant::<Monotonic>::now() - t, N);
+
+    let t = Instant::<Monotonic>::now();
+    for _ in 0..N / 16 {
+        core::hint::black_box(colour_block(&planes.0, &planes.1, &planes.2));
+    }
+    let block_ns = ns_per(Instant::<Monotonic>::now() - t, N / 16);
+
+    // Per strip: 16 blocks x 64 px of colour conversion, and 16 `colour_block` calls of which the
+    // transform is 3 x `scalar_ns`.
+    let colour_per_strip = px_ns * 16 * PIXELS as i64;
+    let block_per_strip = block_ns * 16;
+    pr_info!(
+        "vino-simd: per strip -- colour() {} ns ({}%), colour_block {} ns ({}%), of which transform {} ns ({}%)\n",
+        colour_per_strip,
+        if strip_ns > 0 { colour_per_strip * 100 / strip_ns } else { 0 },
+        block_per_strip,
+        if strip_ns > 0 { block_per_strip * 100 / strip_ns } else { 0 },
+        in_transform,
+        if strip_ns > 0 { in_transform * 100 / strip_ns } else { 0 },
+    );
+    pr_info!(
+        "vino-simd: elementwise unit costs -- colour() {} ns/px, quantize() {} ns/coeff\n",
+        px_ns, q_ns
+    );
+
+    // The entropy coder, timed directly rather than by subtraction. It is bit-serial and
+    // data-dependent, so it is the part of the codec SIMD cannot touch.
+    let mut blocks: KVec<ColourBlock> = KVec::with_capacity(16, GFP_KERNEL)?;
+    for _ in 0..16 {
+        blocks.push(colour_block(&planes.0, &planes.1, &planes.2), GFP_KERNEL)?;
+    }
+    let t = Instant::<Monotonic>::now();
+    for i in 0..512 {
+        core::hint::black_box(colour_strip(&blocks, 0, (i % 64) as u16 * 16)?.len());
+    }
+    let entropy_ns = ns_per(Instant::<Monotonic>::now() - t, 512);
+    pr_info!(
+        "vino-simd: entropy coder {} ns/strip ({}% of the strip encode) -- bit-serial, no SIMD applies\n",
+        entropy_ns,
+        if strip_ns > 0 { entropy_ns * 100 / strip_ns } else { 0 },
+    );
     pr_info!("vino-simd: 100% means parity with scalar; over 100% is faster\n");
     core::hint::black_box(sink);
     Ok(())
