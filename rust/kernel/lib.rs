@@ -75,6 +75,8 @@ pub mod faux;
 #[cfg(CONFIG_RUST_FW_LOADER_ABSTRACTIONS)]
 pub mod firmware;
 pub mod fmt;
+#[cfg(target_arch = "x86_64")]
+pub mod fpu;
 pub mod fs;
 #[cfg(CONFIG_GPU_BUDDY = "y")]
 pub mod gpu;
