@@ -225,7 +225,6 @@ impl EvdiDrmData {
     /// Store the dock bandwidth limits the client supplied via CONNECT, for
     /// [`EvdiConnector`]'s `mode_valid` to enforce. Must be called before the EDID is
     /// published (`set_edid`'s hotplug re-probes the mode list against these limits).
-    ///
     pub(crate) fn set_mode_limits(&self, pixel_area: u32, pixels_per_second: u32) {
         self.pixel_area_limit.store(pixel_area, Ordering::Relaxed);
         self.pixel_per_second_limit
@@ -507,10 +506,9 @@ impl crtc::DriverCrtc for EvdiCrtc {
         let data: &EvdiDrmData = dev;
         let new = commit.take_new_state();
         let mode = new.mode();
-        crate::painter::notify_dpms(data, dev, crate::painter::DPMS_ON);
+        crate::painter::notify_dpms(data, crate::painter::DPMS_ON);
         crate::painter::notify_mode_changed(
             data,
-            dev,
             mode.hdisplay() as i32,
             mode.vdisplay() as i32,
             mode.vrefresh(),
@@ -528,7 +526,7 @@ impl crtc::DriverCrtc for EvdiCrtc {
         let data: &EvdiDrmData = dev;
         let _ = data.set_scanout(None);
         *data.color.lock() = None;
-        crate::painter::notify_dpms(data, dev, crate::painter::DPMS_OFF);
+        crate::painter::notify_dpms(data, crate::painter::DPMS_OFF);
     }
 
     /// Arm the page-flip completion event to be sent by the next vblank tick, so userspace is paced
@@ -541,10 +539,7 @@ impl crtc::DriverCrtc for EvdiCrtc {
         {
             let data: &EvdiDrmData = crtc.drm_dev();
             let built = crate::color::ColorPipeline::build(new.gamma_lut(), new.ctm());
-            let mut slot = data.color.lock();
-            if *slot != built {
-                *slot = built;
-            }
+            *data.color.lock() = built;
         }
         if let Some(pending) = new.get_pending_vblank_event() {
             match crtc.vblank_get() {
@@ -665,7 +660,7 @@ impl plane::DriverPlane for EvdiPlane {
                 new.for_each_damage_clip(old, |r| p.damage.push((r.x1, r.y1, r.x2, r.y2)));
                 p.frame_dirty = true;
             }
-            crate::painter::notify_update_ready(data, dev);
+            crate::painter::notify_update_ready(data);
         }
     }
 }
@@ -711,7 +706,7 @@ impl connector::DriverConnector for EvdiConnector {
     /// the connector stays usable before CONNECT.
     fn get_modes<'a>(
         connector: ConnectorGuard<'a, Self>,
-        guard: &ModeConfigGuard<'a, Self::Driver>,
+        _guard: &ModeConfigGuard<'a, Self::Driver>,
     ) -> i32 {
         let data: &EvdiDrmData = connector.drm_dev();
         if let Some(blob) = data.cached_edid.lock().as_ref() {
@@ -720,7 +715,6 @@ impl connector::DriverConnector for EvdiConnector {
                 _ => {}
             }
         }
-        let _ = guard;
         let n = connector.add_modes_noedid((FALLBACK_W, FALLBACK_H));
         connector.set_preferred_mode((FALLBACK_W, FALLBACK_H));
         n
@@ -813,7 +807,7 @@ fn update_cursor(
     }
     let (old, new) = commit.take_old_new_state();
     let Some(fb) = new.framebuffer::<EvdiDrmDriver>() else {
-        crate::painter::notify_cursor_disabled(data, dev);
+        crate::painter::notify_cursor_disabled(data);
         return;
     };
 
@@ -849,6 +843,6 @@ fn update_cursor(
     {
         let x = destination.x1 - source.x1;
         let y = destination.y1 - source.y1;
-        crate::painter::notify_cursor_move(data, dev, x, y);
+        crate::painter::notify_cursor_move(data, x, y);
     }
 }
