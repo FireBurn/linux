@@ -505,6 +505,8 @@ mod crypto;
 mod hdcp;
 mod proto;
 mod rng;
+#[cfg(target_arch = "x86_64")]
+mod simd;
 mod video;
 mod video_arm;
 
@@ -3272,6 +3274,17 @@ impl usb::Driver for VinoDriver {
         io: Arc<usb::IoWindow>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let cdev: &device::Device<Core<'_>> = intf.as_ref();
+        // The SIMD experiment needs no hardware, but this is the driver's only entry point after
+        // the module parameters are readable. Once per load, not once per interface.
+        #[cfg(target_arch = "x86_64")]
+        if *crate::module_parameters::simd_bench.value() != 0 {
+            static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+            if !RAN.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                if let Err(e) = simd::bench() {
+                    pr_warn!("vino-simd: benchmark failed ({e:?})\n");
+                }
+            }
+        }
         // The D6000 exposes several interfaces (0/1/5/6 match us; 2-4 are audio).
         // The control endpoints (0x02/0x84) and the whole HDCP session live on
         // interface 0 -- drive bring-up only there so we don't run the preamble and
@@ -3457,6 +3470,10 @@ kernel::module_usb_driver! {
         debug: u8 {
             default: 0,
             description: "Enable verbose Vino protocol and scanout diagnostics",
+        },
+        simd_bench: u8 {
+            default: 0,
+            description: "Experiment: at load, time the scalar Haar transform against the optional AVX2/AVX-512 ones and report the kernel_fpu_begin/end cost they have to earn back",
         },
         trace_crypto: u8 {
             default: 0,
