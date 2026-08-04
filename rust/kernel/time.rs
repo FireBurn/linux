@@ -129,6 +129,20 @@ unsafe impl ClockSource for RealTime {
     }
 }
 
+/// Returns the coarse wall-clock time in whole seconds since the Unix epoch.
+///
+/// This is the cheap counterpart to reading an [`Instant<RealTime>`]: it reads the seconds field
+/// the timekeeping core maintains, with no 64-bit division, and is what a caller that only needs a
+/// calendar time should use.
+///
+/// The value follows CLOCK_REALTIME, so it is not monotonic: settimeofday(2), NTP steps and leap
+/// second handling can move it in either direction.
+pub fn ktime_get_real_seconds() -> i64 {
+    // SAFETY: reading the timekeeping core's seconds field has no preconditions and is safe from
+    // any context.
+    unsafe { bindings::ktime_get_real_seconds() }
+}
+
 /// A monotonic that ticks while system is suspended.
 ///
 /// A nonsettable system-wide clock that is identical to CLOCK_MONOTONIC,
