@@ -2914,6 +2914,11 @@ impl VinoDrmData {
         // inner counter order differs from the monotonically advancing AES block sequence.
         let request_counter = reserved_counter.unwrap_or(link.counter);
         let msg = build(request_counter)?;
+        let inner_sub = if msg.len() >= 4 {
+            u16::from_le_bytes([msg[2], msg[3]])
+        } else {
+            0
+        };
         let content = &msg[..msg.len().saturating_sub(tag_reserved)];
         let frame = super::cp::seal_interactive(&link.ks, &link.riv, id, link.wire_seq, content)?;
         dev.ctrl_send(&frame, super::timeout(), GFP_KERNEL)?;
@@ -3005,8 +3010,11 @@ impl VinoDrmData {
         // not decode it" -- and on the D6000 the wire shows 50 sealed replies arriving during an
         // attempt that ends in ETIMEDOUT.
         if matched == 0 {
+            // Name the *inner* sub as well as the wire id. "id=0x16 went unanswered" covers the
+            // EDID engage, the readiness kick and both stream/display markers, and which one the
+            // dock ignored is the whole diagnosis.
             pr_info!(
-                "vino: unanswered id={id:#06x} ctr={request_counter}:                  reaped {reaped} reply/replies, {undecodable} undecodable,                  last decoded id={seen_id:#06x} sub={seen_sub:#06x} ctr={seen_counter}\n"
+                "vino: unanswered id={id:#06x} sub={inner_sub:#06x} ctr={request_counter}: reaped {reaped} reply/replies, {undecodable} undecodable, last decoded id={seen_id:#06x} sub={seen_sub:#06x} ctr={seen_counter}\n"
             );
         }
         consume(&link.ks, &link.riv, &reply[..matched])
@@ -3276,22 +3284,54 @@ impl VinoDrmData {
     fn probe_connector_present(&self, dev: &BoundInterface<'_>, sel: u8, head: u8) -> Option<bool> {
         let mut guard = self.cp_link.lock();
         let link = (&mut *guard).as_mut()?;
-        let msg = super::cp::get_edid_req_sub(link.counter, 0x0020, sel).ok()?;
+        let request_counter = link.counter;
+        let msg = super::cp::get_edid_req_sub(request_counter, 0x0020, sel).ok()?;
         let frame =
             super::cp::seal_interactive(&link.ks, &link.riv, 0x15, link.wire_seq, &msg).ok()?;
         dev.ctrl_send(&frame, super::timeout(), GFP_KERNEL).ok()?;
         link.wire_seq = link.wire_seq.wrapping_add(((msg.len() + 15) / 16) as u32);
         link.counter = link.counter.wrapping_add(1);
+        // ⭐ Take the reply that answers THIS probe, not simply the next frame on EP84.
+        //
+        // This used to reap exactly one read and decode it as the answer. The connectors are
+        // probed back to back, so a reply that arrived a moment late -- or any unprompted push --
+        // was consumed by the *next* connector's probe and its status word attributed to the wrong
+        // head. Measured on the DL7400 with a monitor on socket 1 only: head 0 and head 1 traded
+        // `present` between them every few minutes, `head 0 monitor disconnected` dropped the live
+        // output, and a sink re-engagement five seconds later brought it back. The dock never
+        // changed its mind; vino misread which question it was answering.
+        //
+        // The inner counter echoes the request, so use it. A round that never sees its own echo
+        // returns `None`, which the caller already treats as "this poll learned nothing" rather
+        // than as an unplug.
         let mut reply = KVec::from_elem(0u8, 4096, GFP_KERNEL).ok()?;
-        let got = match link.ep84_q.as_mut() {
-            Some(q) => match q.recv(dev.io(), &mut reply, super::cp_reply_timeout()) {
-                Ok(Some(n)) if n > 16 => n,
-                _ => return None,
-            },
-            None => match dev.ctrl_recv(&mut reply, super::cp_reply_timeout(), GFP_KERNEL) {
-                Ok(n) if n > 16 => n,
-                _ => return None,
-            },
+        let deadline = Instant::<Monotonic>::now() + Delta::from_millis(64);
+        let got = loop {
+            let n = match link.ep84_q.as_mut() {
+                Some(q) => match q.recv(dev.io(), &mut reply, super::cp_reply_timeout()) {
+                    Ok(Some(n)) => n,
+                    Ok(None) => 0,
+                    Err(_) => return None,
+                },
+                None => dev
+                    .ctrl_recv(&mut reply, super::cp_reply_timeout(), GFP_KERNEL)
+                    .unwrap_or(0),
+            };
+            if n > 16 {
+                match super::cp::decode_in_lenient(
+                    &link.ks,
+                    &link.riv,
+                    &reply[..n],
+                    link.authenticated_in,
+                ) {
+                    Some((_, _, echoed)) if echoed == request_counter => break n,
+                    // Undecodable frames are the dock's asynchronous pushes; keep draining.
+                    _ => {}
+                }
+            }
+            if (Instant::<Monotonic>::now() - deadline).as_millis() >= 0 {
+                return None;
+            }
         };
         // Decode the downstream status at inner bytes 22..26 as well as the handler ID.
         let (id, status, _) = super::cp::probe_reply_status(&link.ks, &link.riv, &reply[..got], link.authenticated_in)?;

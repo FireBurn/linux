@@ -218,7 +218,7 @@ static PROFILE_D6000: DockProfile = DockProfile {
     connectors: 2,
     dock_buffers: 2,
     cp_authenticated_in: false,
-    cp_reply_counter_match: false,
+    cp_reply_counter_match: true,
     ep84_queue_depth: 4,
 };
 
