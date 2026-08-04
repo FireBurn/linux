@@ -136,21 +136,25 @@ pub(crate) struct DockProfile {
     /// keyframe presentation count and the per-strip retransmit debt, so getting it wrong leaves
     /// one slot holding stale pixels and the panel ghosts on anything detailed.
     pub(crate) dock_buffers: u8,
-    /// Highest refresh rate this dock is known to drive.
+    /// Highest refresh rate this dock is known to drive, or `u32::MAX` for a dock that has no
+    /// refresh limit beyond its link rate.
     ///
-    /// DLM clamps Ridge to 120 Hz -- asked for 2560x1440@180 it puts 119.998 Hz on the wire -- but
-    /// drives the DL7400 at 2560x1440@164.96 on both heads with no clamp at all, and a decrypted
-    /// DLM mode set exists for that timing. 180 Hz is deliberately not offered on either: it is
-    /// accepted and then not delivered, collapsing the frame rate and destabilising the dock.
+    /// This is a *rate* limit, not a bandwidth one -- `max_head_clock_khz` and `pixel_budget` carry
+    /// bandwidth. DLM clamps Ridge here regardless of resolution: asked for 2560x1440@180 it puts
+    /// 119.998 Hz on the wire, and asked for @85 it programs the 59.95 Hz CVT-RB timing. It applies
+    /// no such clamp to the DL7400, which it drives at 2560x1440@164.96 on both heads, so nothing
+    /// justifies capping that dock by refresh alone.
     pub(crate) max_refresh_hz: u32,
-    /// Highest per-mode pixel clock in kHz this dock is known to accept.
+    /// Highest per-mode pixel clock in kHz this dock is known to carry.
+    ///
+    /// This is the constraint that actually bounds a mode: the DL7400 accepts 2560x1440@180 and
+    /// then fails to deliver it, and what separates that mode from the 165 Hz one it does drive is
+    /// 714.81 MHz against 699.50 MHz of link rate, not 180 against 165 of refresh.
     ///
     /// The set-mode message carries the clock at offsets 70..73 as a `u32` in 10 kHz units. Ridge
-    /// is never driven above 497.75 MHz, so its captures only ever fill the low half. DLM drives
-    /// the DL7400's 2560x1440p165 mode, whose EDID clock is 699.50 MHz, and rounds it to
-    /// `0x0001113d` on the wire; the ceiling is the mode's clock, not DLM's rounded copy of it.
-    /// The next mode up, 2560x1440p180 at 714.81 MHz, is one the dock accepts and then fails to
-    /// deliver.
+    /// is never driven above 497.75 MHz, so its captures only ever fill the low half. Take the
+    /// ceiling from the mode's own clock rather than from DLM's copy of it, which is rounded to
+    /// the wire's 10 kHz unit (`0x0001113d`, 699.49 MHz, for a 699.50 MHz mode).
     pub(crate) max_head_clock_khz: u32,
     /// Dock-wide pixel-rate budget in pixels per second, shared across all heads.
     ///
@@ -233,7 +237,7 @@ static PROFILE_DL7400: DockProfile = DockProfile {
     navarro_mode_words: true,
     connectors: 4,
     dock_buffers: 3,
-    max_refresh_hz: 165,
+    max_refresh_hz: u32::MAX,
     max_head_clock_khz: 699_500,
     pixel_budget: 1_216_512_000,
     ep84_queue_depth: 1,
@@ -4211,29 +4215,35 @@ mod tests {
         Ok(())
     }
 
-    /// Each dock's refresh ceiling keeps its highest validated rate and prunes 180 Hz.
+    /// A mode is bounded by link rate, not by refresh, except where the dock itself clamps.
     ///
-    /// The boundary cases matter most: both must pass by **equality**. A `<` would prune each
-    /// dock's working configuration and dark its panels.
+    /// The boundary cases matter most: each must pass by **equality**. A `<` would prune a dock's
+    /// working configuration and dark its panels.
     #[test]
-    fn refresh_ceiling_is_per_dock_and_stops_below_180() {
-        // Ridge: DLM clamps it here, putting 119.998 Hz on the wire for a 180 Hz request.
-        assert_eq!(PROFILE_D6000.max_refresh_hz, 120);
-        // Navarro: DLM drives it at 2560x1440@164.96 on both heads with no clamp.
-        assert_eq!(PROFILE_DL7400.max_refresh_hz, 165);
+    fn mode_ceilings_bound_bandwidth_not_refresh() {
+        let refresh_ok =
+            |p: &DockProfile, hz: i32| hz <= 0 || (hz as u32) <= p.max_refresh_hz;
+        let clock_ok = |p: &DockProfile, khz: u32| khz <= p.max_head_clock_khz;
 
-        let ok = |profile: &DockProfile, hz: i32| {
-            hz <= 0 || (hz as u32) <= profile.max_refresh_hz
-        };
-        // 164.96 Hz and 119.998 Hz both arrive already rounded by `drm_mode_vrefresh`.
-        assert!(ok(&PROFILE_D6000, 120) && ok(&PROFILE_D6000, 60));
-        assert!(!ok(&PROFILE_D6000, 165));
-        assert!(ok(&PROFILE_DL7400, 165) && ok(&PROFILE_DL7400, 120));
-        // 180 Hz is accepted by the dock and then not delivered, on either platform.
-        assert!(!ok(&PROFILE_D6000, 180) && !ok(&PROFILE_DL7400, 180));
+        // Ridge is clamped by refresh regardless of resolution: DLM puts 119.998 Hz on the wire
+        // for a 180 Hz request and the 59.95 Hz CVT-RB timing for an 85 Hz one.
+        assert_eq!(PROFILE_D6000.max_refresh_hz, 120);
+        assert!(refresh_ok(&PROFILE_D6000, 120) && !refresh_ok(&PROFILE_D6000, 165));
+
+        // The DL7400 has no such clamp -- DLM drives it at 2560x1440@164.96 -- so its modes are
+        // bounded by link rate alone.
+        assert!(refresh_ok(&PROFILE_DL7400, 180) && refresh_ok(&PROFILE_DL7400, 240));
+
+        // 2560x1440: p165 is 699.50 MHz and carried; p180 is 714.81 MHz and is the mode the dock
+        // accepts and then fails to deliver.
+        assert!(clock_ok(&PROFILE_DL7400, 699_500));
+        assert!(!clock_ok(&PROFILE_DL7400, 714_810));
+        // Ridge cannot express the high half of the offset-70 u32 in any capture taken.
+        assert!(clock_ok(&PROFILE_D6000, 655_350) && !clock_ok(&PROFILE_D6000, 699_500));
+
         // A degenerate mode reports 0 Hz and carries no rate information; a signed refresh must
         // never be read as a huge unsigned one.
-        assert!(ok(&PROFILE_DL7400, 0) && ok(&PROFILE_DL7400, -1));
+        assert!(refresh_ok(&PROFILE_DL7400, 0) && refresh_ok(&PROFILE_DL7400, -1));
 
         // Each budget admits its own dual-head configuration and nothing beyond it.
         let rate = drm_sink::active_pixel_rate;
@@ -4333,10 +4343,7 @@ mod tests {
         })?;
         assert!(cp::mode_supported(&mode));
         // Still out of the dock's envelope, so userspace never sees it.
-        assert!(
-            mode.clock() > 655_350
-                || (mode.vrefresh() as u32) > PROFILE_DL7400.max_refresh_hz
-        );
+        assert!(mode.clock() as u32 > PROFILE_DL7400.max_head_clock_khz);
         // The clock field itself carries it fine: offsets 70..73 are a u32, as the DL7400's
         // 2560x1440p165 mode set proves (0x0001113d = 699.49 MHz). Admission is the refresh
         // limit's job, not a silent conversion failure.
