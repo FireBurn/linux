@@ -886,9 +886,6 @@ pub(super) struct VinoDrmData {
     codec_geometry: core::sync::atomic::AtomicU32,
     /// Whether to prefix the cold ARM burst to the first frame; see `DockProfile::video_arm`.
     video_arm: core::sync::atomic::AtomicBool,
-    /// Whether presence comes from the probe reply's status word rather than from which handler
-    /// answered; see `DockProfile::presence_from_status`.
-    presence_from_status: core::sync::atomic::AtomicBool,
     /// Whether the mode set carries the DL7400's offset-46/48 words; see `DockProfile`.
     navarro_mode_words: core::sync::atomic::AtomicBool,
     /// How many downstream connectors this dock answers a presence probe for; see
@@ -1091,7 +1088,6 @@ impl VinoDrmData {
             self_blanked: core::sync::atomic::AtomicU32::new(0),
             video_supported: core::sync::atomic::AtomicBool::new(true),
             codec_geometry: core::sync::atomic::AtomicU32::new(0),
-            presence_from_status: core::sync::atomic::AtomicBool::new(false),
             navarro_mode_words: core::sync::atomic::AtomicBool::new(false),
             connectors: core::sync::atomic::AtomicU8::new(HEADS as u8),
             video_arm: core::sync::atomic::AtomicBool::new(true),
@@ -1335,20 +1331,6 @@ impl VinoDrmData {
             ((p >> 20) & 0xff) as u8,
             ((p >> 28) & 0xf) as u8,
         )
-    }
-
-    /// Record how this dock reports monitor presence; see [`DockProfile::presence_from_status`].
-    pub(super) fn set_presence_from_status(&self, on: bool) {
-        self.presence_from_status.store(on, Ordering::Release);
-    }
-
-    /// Whether a decodable status word is required to determine connector presence.
-    ///
-    /// Navarro answers the same handler for both occupied and empty sockets.  Unlike Ridge, a
-    /// missing reply therefore cannot be inferred to mean that a monitor was removed: it merely
-    /// means that this polling round did not recover the status word.
-    pub(super) fn presence_from_status(&self) -> bool {
-        self.presence_from_status.load(Ordering::Acquire)
     }
 
     /// Record whether mode sets carry the DL7400's offset-46/48 words.
@@ -3310,20 +3292,10 @@ impl VinoDrmData {
         };
         // Decode the downstream status at inner bytes 22..26 as well as the handler ID.
         let (id, status, _) = super::cp::probe_reply_status(&link.ks, &link.riv, &reply[..got])?;
-        // On Ridge a head with no monitor cannot be routed to an EDID handler, so the dock answers
-        // the generic `id=0x14` rather than the rich `id=0x44` -- the same substitution it makes
-        // for a wrong head selector, which is how the EDID head-selector bug was found. That is
-        // the primary discriminator there, refined by the status word.
-        //
-        // Navarro answers `id=0x44` for every one of its four connectors whether or not a monitor
-        // is attached, so the same test is unconditionally true and no unplug is ever seen. There
-        // presence is bit `0x10` of inner byte 23 -- `05 11 27 00` occupied, `05 01 <20|21|60|61>
-        // 00` empty -- which lands in bits 8..15 of the status word.
-        let present = if self.presence_from_status.load(Ordering::Acquire) {
-            status & 0x0000_1000 != 0
-        } else {
-            matches!(id, 0x44 | 0x194 | 0x78)
-        };
+        // Presence is bit 0x10 of inner byte 23, which lands in bits 8..15 of the status word:
+        // `05 11 27 00` for an occupied connector, `05 01 <20|21|60|61> 00` for an empty one.
+        // Which handler answered says nothing about it -- both docks reply `id=0x44` either way.
+        let present = status & 0x0000_1000 != 0;
         // One line per *changed* answer per head, so a steady link is silent and an unplug is
         // unmissable. Both fields are packed into the same cell: the id alone cannot distinguish a
         // dock that keeps saying `0x44` from one whose downstream state has moved underneath it.

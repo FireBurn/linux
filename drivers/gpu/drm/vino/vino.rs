@@ -116,19 +116,6 @@ pub(crate) struct DockProfile {
     pub(crate) strip_blocks_x: usize,
     /// Whether image records interlace y bands; see [`video::wht::Geometry::interlaced_bands`].
     pub(crate) interlaced_bands: bool,
-    /// Whether monitor presence must be read from the probe reply's status word rather than from
-    /// which handler answered.
-    ///
-    /// Ridge routes the `id=0x15 sub=0x20` probe to its EDID/display-capability handler only when
-    /// a sink is actually attached, so "the rich `id=0x44` answered rather than the generic
-    /// `id=0x14`" *is* the presence signal there.
-    ///
-    /// Navarro answers `id=0x44` for **all four** of its connectors whether or not a monitor is
-    /// attached -- measured across a session in which two cables were walked between sockets -- so
-    /// that discriminator is unconditionally true there and an unplug can never be observed.
-    /// Presence is instead bit `0x10` of inner byte 23, i.e. `status & 0x1000`: an occupied
-    /// connector answers `05 11 27 00`, an empty one `05 01 <20|21|60|61> 00`.
-    pub(crate) presence_from_status: bool,
     /// Whether the mode set carries the DL7400's offset-46/48 words rather than Ridge's.
     ///
     /// Both words are platform- and resolution-specific, and vino sent Ridge's `0x4000`/`0x6000`
@@ -196,7 +183,6 @@ static PROFILE_D6000: DockProfile = DockProfile {
     aux_is_pad_count: true,
     strip_blocks_x: 8,
     interlaced_bands: false,
-    presence_from_status: false,
     navarro_mode_words: false,
     connectors: 2,
     dock_buffers: 2,
@@ -226,7 +212,6 @@ static PROFILE_DL7400: DockProfile = DockProfile {
     aux_is_pad_count: true,
     strip_blocks_x: 16,
     interlaced_bands: true,
-    presence_from_status: true,
     navarro_mode_words: true,
     connectors: 4,
     dock_buffers: 3,
@@ -822,7 +807,7 @@ impl WorkItem for BringUp {
                     // The one exception is Ridge's head 0, which cannot report presence before its
                     // first probe. Assume it and let the watcher correct it, rather than making
                     // every cold plug wait a re-engage cycle for its only monitor.
-                    let present = have_edid || (head == 0 && !data.presence_from_status());
+                    let present = have_edid;
                     if present {
                         data.set_connected(head);
                         dev_info!(cdev, "vino: head {head} monitor connected\n");
@@ -923,37 +908,24 @@ impl WorkItem for BringUp {
             const PRESENCE_PERIOD: Delta = Delta::from_millis(1000);
             let mut next_presence = Instant::<Monotonic>::now() + PRESENCE_PERIOD;
             let mut head_known = [false; VinoDriver::CP_SETUP_HEADS];
+            // The presence probe's last verdict per connector, or `None` until it has answered
+            // once. Distinguishes "no monitor here" from "not asked yet", which the blind
+            // re-engage retry below needs and `head_known` cannot express.
+            let mut head_probed: [Option<bool>; VinoDriver::CP_SETUP_HEADS] =
+                [None; VinoDriver::CP_SETUP_HEADS];
             let mut head_debounce = [0u8; VinoDriver::CP_SETUP_HEADS];
-            /// Consecutive silent probes required before treating a head as disconnected.
-            const PRESENCE_SILENT_LIMIT: u8 = 3;
-            /// How long a head must stay silent before that silence counts as a removal.
-            ///
-            /// A downstream event pulls the next probe forward, so consecutive silent probes are
-            /// not `PRESENCE_PERIOD` apart -- they can be one control round trip apart. The dock
-            /// moves a head's status word whenever downstream state shifts, which is exactly what
-            /// a mode set does, so a Ridge mode set produced a burst of forced probes; three
-            /// silent ones then landed inside 30 ms and a live monitor was declared REMOVED,
-            /// failing dual-head activation with `ENODEV`. Removal needs both enough probes to
-            /// rule out one dropped reply and enough elapsed time to rule out a busy link.
-            const PRESENCE_SILENT_MIN: Delta = Delta::from_millis(3000);
-            /// Floor on the gap between presence probes, including event-forced ones.
-            ///
-            /// A downstream event should bring the probe forward, not remove its cadence
-            /// altogether: without a floor the probe runs once per loop iteration for as long as
-            /// the dock keeps talking.
+            // Floor on the gap between presence probes. A downstream event brings the probe
+            // forward; without a floor it would run once per loop iteration for as long as the
+            // dock keeps talking.
             const PRESENCE_MIN_GAP: Delta = Delta::from_millis(50);
-            /// How often to retry the sink re-engage on a head believed to have no monitor.
-            ///
-            /// A recovered sink may not emit a uniquely identifiable event, so absent heads are
-            /// retried at a bounded cadence.
+            // A recovered sink need not emit a uniquely identifiable event, so a head whose
+            // discovery was deferred is retried at a bounded cadence until the probe answers.
             const REENGAGE_RETRY: Delta = Delta::from_millis(4000);
             let mut next_reengage = [Instant::<Monotonic>::now(); VinoDriver::CP_SETUP_HEADS];
             /// Settling period after re-engagement during which a negative probe is ignored.
             const PRESENCE_GRACE: Delta = Delta::from_millis(10_000);
             let mut presence_grace = [Instant::<Monotonic>::now(); VinoDriver::CP_SETUP_HEADS];
-            let mut head_silent = [0u8; VinoDriver::CP_SETUP_HEADS];
             // When the current run of silent probes started; only read while `head_silent > 0`.
-            let mut head_silent_since = [Instant::<Monotonic>::now(); VinoDriver::CP_SETUP_HEADS];
             for h in 0..data.connector_count() {
                 if !data.runtime_connector(h) {
                     continue;
@@ -1028,10 +1000,25 @@ impl WorkItem for BringUp {
                 const MAX_UNPAIRED_DRAIN: usize = 4;
                 data.drain_cp_pushes(dev, MAX_UNPAIRED_DRAIN);
                 // Keep trying to bring an absent head's sink back. See `REENGAGE_RETRY`.
+                //
+                // This exists for a head whose *setup-time* discovery was deferred or timed out --
+                // it is a recovery, not a poll. Once the presence probe has actually answered for
+                // a connector, that answer is authoritative and this must stand down: an empty
+                // socket is not a head waiting to be recovered.
+                //
+                // ⚠ Without that, every empty connector was re-engaged forever. Each attempt is
+                // seven CP messages, several of which an empty socket never answers -- `id=0x15
+                // sub=0x21`, the EDID fetch, went unanswered every two seconds indefinitely, each
+                // one holding `cp_link` for its full deadline. On a DL7400 with one monitor that is
+                // three sockets doing it continuously, competing with video on the same control
+                // plane and with the other dock on the same bus.
                 {
                     let now_r = Instant::<Monotonic>::now();
                     for h in 0..data.connector_count() {
                         if !data.runtime_connector(h) {
+                            continue;
+                        }
+                        if head_probed[h] == Some(false) {
                             continue;
                         }
                         if head_known[h] || (now_r - next_reengage[h]).as_millis() < 0 {
@@ -1049,7 +1036,6 @@ impl WorkItem for BringUp {
                                 data.set_connected(h);
                                 head_known[h] = true;
                                 head_debounce[h] = 0;
-                                head_silent[h] = 0;
                                 presence_grace[h] = Instant::<Monotonic>::now() + PRESENCE_GRACE;
                                 dev_info!(
                                     cdev,
@@ -1065,7 +1051,6 @@ impl WorkItem for BringUp {
                                 )
                             }
                         }
-                        head_silent[h] = 0;
                         next_presence = Instant::<Monotonic>::now();
                     }
                 }
@@ -1090,51 +1075,20 @@ impl WorkItem for BringUp {
                         if !data.runtime_connector(h) {
                             continue;
                         }
-                        let present = match data.probe_head_present(dev, h as u8) {
-                            Some(p) => {
-                                head_silent[h] = 0;
-                                p
-                            }
-                            None => {
-                                // A head vino blanked is silent because vino asked it to be. Only
-                                // the dock's own silence is evidence of an unplug.
-                                if data.is_self_blanked(h) {
-                                    continue;
-                                }
-                                // Navarro reports all four physical sockets through the same
-                                // handler and distinguishes them with a status bit.  A missing
-                                // sealed reply has no such bit, so it is not evidence that this
-                                // particular monitor disappeared.  Retain the last known state
-                                // and wait for a decodable negative reply instead of repeatedly
-                                // tearing down a live KMS connector and exposing stale dock RAM.
-                                if data.presence_from_status() {
-                                    continue;
-                                }
-                                if head_silent[h] == 0 {
-                                    head_silent_since[h] = Instant::<Monotonic>::now();
-                                }
-                                head_silent[h] = head_silent[h].saturating_add(1);
-                                let quiet =
-                                    Instant::<Monotonic>::now() - head_silent_since[h];
-                                if head_silent[h] < PRESENCE_SILENT_LIMIT
-                                    || quiet.as_millis() < PRESENCE_SILENT_MIN.as_millis()
-                                {
-                                    // One dropped reply proves nothing, and neither does a burst
-                                    // of them across a few milliseconds of a busy link.
-                                    continue;
-                                }
-                                if head_known[h] {
-                                    dev_info!(
-                                        cdev,
-                                        "vino: head {h} presence probe silent for {} probe(s) \
-                                         over {} ms -- treating as REMOVED\n",
-                                        head_silent[h],
-                                        quiet.as_millis()
-                                    );
-                                }
-                                false
-                            }
+                        // A missing reply carries no status bit, so it is not evidence that this
+                        // monitor disappeared; wait for a decodable negative instead of tearing
+                        // down a live connector.
+                        let Some(present) = data.probe_head_present(dev, h as u8) else {
+                            continue;
                         };
+                        // A head vino blanked reports absent because vino asked it to. A downed
+                        // sink and an unplugged monitor are indistinguishable on the wire.
+                        if !present && data.is_self_blanked(h) {
+                            continue;
+                        }
+                        // The probe has spoken for this connector, so the blind re-engage retry
+                        // above stands down for it.
+                        head_probed[h] = Some(present);
                         if present == head_known[h] {
                             head_debounce[h] = 0;
                             continue;
@@ -3451,7 +3405,6 @@ impl usb::Driver for VinoDriver {
                 info.dock_buffers,
             );
             d.set_video_arm(info.video_arm);
-            d.set_presence_from_status(info.presence_from_status);
             d.set_navarro_mode_words(info.navarro_mode_words);
             d.set_connectors(info.connectors);
         }
