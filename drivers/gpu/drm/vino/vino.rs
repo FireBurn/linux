@@ -149,23 +149,6 @@ pub(crate) struct DockProfile {
     /// keyframe presentation count and the per-strip retransmit debt, so getting it wrong leaves
     /// one slot holding stale pixels and the panel ghosts on anything detailed.
     pub(crate) dock_buffers: u8,
-    /// Whether this dock's inbound frames are authenticated by their trailing Dl3Cmac.
-    ///
-    /// ⚠ Ungated change in 498a10040294, the commit a user bisect landed the D6000's "no pixels
-    /// at all" regression on. `open_in` there began verifying the tag over the whole body and
-    /// callers dropped the plaintext plausibility tests that had stood in for it. Navarro needs
-    /// the strict form -- it puts a one-hot connector selector in inner bytes 6..7, which the old
-    /// heuristic rejected for connectors 2 and 3. Ridge is decoded the historical way until the
-    /// strict form is measured on it.
-    pub(crate) cp_authenticated_in: bool,
-    /// Whether a control write waits for the reply whose inner counter echoes its own.
-    ///
-    /// ⚠ Also ungated in 498a10040294. Navarro interleaves unprompted `id=2/sub=0x86` status
-    /// pushes with its replies, and treating the first such push as the paired reply advances
-    /// EP02 before the dock has finished the transaction -- the 100-ms staircase in its failed
-    /// captures. Ridge reaped exactly one reply per write for the whole life of the driver
-    /// before that.
-    pub(crate) cp_reply_counter_match: bool,
     /// Outstanding EP84 reads to keep posted.
     ///
     /// Navarro needs exactly one, which is what DLM keeps: with four posted through a round-robin
@@ -217,8 +200,6 @@ static PROFILE_D6000: DockProfile = DockProfile {
     navarro_mode_words: false,
     connectors: 2,
     dock_buffers: 2,
-    cp_authenticated_in: false,
-    cp_reply_counter_match: true,
     ep84_queue_depth: 4,
 };
 
@@ -249,8 +230,6 @@ static PROFILE_DL7400: DockProfile = DockProfile {
     navarro_mode_words: true,
     connectors: 4,
     dock_buffers: 3,
-    cp_authenticated_in: true,
-    cp_reply_counter_match: true,
     ep84_queue_depth: 1,
 };
 
@@ -389,19 +368,6 @@ impl<'a> UsbLink<'a> {
         self.io.clear_halt(self.eps.video.get(head).ok_or(EINVAL)?)
     }
 
-    /// Resets the control endpoints' sequence state before a session is claimed.
-    ///
-    /// ⚠ Warm re-attach only. A physical plug resets a SuperSpeed bulk endpoint's sequence number
-    /// on both sides; a driver rebind does not. Once the D6000 stopped hard-resetting itself, a
-    /// second `bring_up` on the same power cycle NAKed `init_0` forever -- the dock answered every
-    /// control request, and `interface state` read all zeros, but would not drain EP02.
-    /// `clear_halt` issues CLEAR_FEATURE(ENDPOINT_HALT) and resets the host-side sequence with it,
-    /// which is what a cold plug would have done.
-    pub(crate) fn reset_control_endpoints(&self) -> Result {
-        self.io.clear_halt(&self.eps.ctrl_out)?;
-        self.io.clear_halt(&self.eps.ctrl_in)
-    }
-
     /// Reads the standard two-byte status word for a video endpoint.
     ///
     /// Bit zero is `ENDPOINT_HALT`.  This is deliberately read-only: it distinguishes a dock
@@ -536,9 +502,6 @@ mod video_arm;
 struct Session {
     ks: kernel::crypto::Secret<{ drm_hdcp::ENCRYPTED_SESSION_KEY_LEN }>,
     riv: [u8; drm_hdcp::RIV_LEN],
-    /// See `DockProfile::cp_authenticated_in`. Carried here because the EP84 decode helpers are
-    /// free functions that already take the session and nothing else about the dock.
-    authenticated_in: bool,
     /// Next inner sequence counter after the AKE messages sent by [`run_ake`].
     next_ctr: u16,
     /// Receiver key retained for each downstream repeater authentication.
@@ -788,7 +751,7 @@ impl WorkItem for BringUp {
             let result = (|| -> Result {
                 VinoDriver::bring_up(dev, profile)?;
                 vino_dev_debug!(cdev, "vino: plaintext session initialized\n");
-                let mut session = VinoDriver::run_ake(dev, profile)?;
+                let mut session = VinoDriver::run_ake(dev)?;
                 vino_dev_debug!(cdev, "vino: HDCP AKE + LC + SKE complete\n");
 
                 let mut edid_out: Option<KVec<u8>> = None;
@@ -825,8 +788,6 @@ impl WorkItem for BringUp {
                     wseq_end,
                     ctr_end,
                     profile.ep84_queue_depth,
-                    profile.cp_authenticated_in,
-                    profile.cp_reply_counter_match,
                 );
                 data.set_video_keys(video_keys);
 
@@ -847,19 +808,21 @@ impl WorkItem for BringUp {
                         data.set_edid(head, blob);
                         vino_dev_debug!(cdev, "vino: cached head {head} EDID ({n} bytes)\n");
                     }
-                    // Ridge cannot report presence for head 0 before its first probe, so it is
-                    // assumed present and corrected by the watcher.
+                    // **A recovered EDID is the presence signal**, on both platforms: without one
+                    // there is no monitor to drive, and publishing the connector anyway puts a
+                    // fallback mode into an empty socket and makes the dock lay out buffers for
+                    // outputs that do not exist.
                     //
-                    // A dock that answers a probe for all of its connectors has no such gap, and
-                    // its display-capability reply cannot separate them either. There a recovered
-                    // EDID is the presence signal: without one there is no monitor to drive, and
-                    // publishing the connector anyway puts a fallback mode into an empty socket
-                    // and makes the dock lay out buffers for outputs that do not exist.
-                    let present = if data.presence_from_status() {
-                        heads_present[head] && have_edid
-                    } else {
-                        head == 0 || heads_present[head]
-                    };
+                    // ⚠ Ridge used to publish any head the dock had reported present. That was
+                    // harmless only while an empty head failed its downstream authentication and
+                    // so was never reported; once that was fixed, head 1 of a D6000 with one
+                    // monitor came up as a second enabled output carrying the `1920x1440` fallback
+                    // list and no EDID -- a phantom screen userspace happily placed windows on.
+                    //
+                    // The one exception is Ridge's head 0, which cannot report presence before its
+                    // first probe. Assume it and let the watcher correct it, rather than making
+                    // every cold plug wait a re-engage cycle for its only monitor.
+                    let present = have_edid || (head == 0 && !data.presence_from_status());
                     if present {
                         data.set_connected(head);
                         dev_info!(cdev, "vino: head {head} monitor connected\n");
@@ -1292,24 +1255,6 @@ impl VinoDriver {
         // and an exact EP02 transcript, but leaves Navarro's video-side state machine different
         // before its later value-0 commit.
         let vendor_state = if profile.navarro_mode_words { 0 } else { 3 };
-        // ⚠ Warm re-attach. Once the fix for its reset loop landed, the D6000 stopped
-        // re-enumerating -- and then a second `bring_up` on the same power cycle NAKed `init_0`
-        // forever, because the dock was still in the vendor state the previous session left it in.
-        // The DL7400 never showed this, and it is the platform that already asks for state 0.
-        // Drive the state machine back to 0 before claiming it, so a rebind starts where a cold
-        // plug does.
-        if vendor_state != 0 && *crate::module_parameters::vendor_state_reset.value() != 0 {
-            match dev.control_send(0x24, VENDOR_OUT, 0, 0, &[], timeout(), GFP_KERNEL) {
-                Ok(()) => vino_debug!("vino: vendor state reset to 0 before claiming\n"),
-                Err(e) => vino_debug!("vino: vendor state reset stalled ({e:?})\n"),
-            }
-        }
-        if *crate::module_parameters::ctrl_clear_halt.value() != 0 {
-            match dev.reset_control_endpoints() {
-                Ok(()) => vino_debug!("vino: EP02/EP84 sequence state reset\n"),
-                Err(e) => vino_debug!("vino: control endpoint reset stalled ({e:?})\n"),
-            }
-        }
         match dev.control_send(
             0x24,
             VENDOR_OUT,
@@ -1584,7 +1529,7 @@ impl VinoDriver {
     /// * ctr=1 session-init ACK (id=0x14/0x76), ctr=2 AKE_Init, ctr=3 AKE_Transmitter_Info
     /// * ctr=4 AKE_No_Stored_km, ctr=5 LC_Init, ctr=6 SKE_Send_Eks
     /// * ctr=7 RepeaterAuth_Send_Ack, ctr=8 RepeaterAuth_Stream_Manage  (then msg0 at ctr=9)
-    fn run_ake(dev: &UsbLink<'_>, profile: &DockProfile) -> Result<Session> {
+    fn run_ake(dev: &UsbLink<'_>) -> Result<Session> {
         use ake::id;
 
         let mut saw_cap_complete = false;
@@ -1776,7 +1721,6 @@ impl VinoDriver {
         Ok(Session {
             ks,
             riv,
-            authenticated_in: profile.cp_authenticated_in,
             next_ctr: hseq as u16,
             rsa,
             rxid_list,
@@ -3080,7 +3024,7 @@ impl VinoDriver {
                 }
             }
         }
-        match cp::decode_any(&session.ks, &session.riv, frame, session.authenticated_in) {
+        match cp::decode_any(&session.ks, &session.riv, frame) {
             Some((rivtag, rid, rsub, rictr, _)) => {
                 vino_debug!("vino: EP84 {rivtag} id={rid:#x} sub={rsub:#x} ctr={rictr:#x}\n");
             }
@@ -3134,14 +3078,14 @@ impl VinoDriver {
                     // envelope acknowledgment does not mean the downstream authentication has
                     // advanced; L', V' and M' are the state-machine gates.
                     if let Some(push) =
-                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
+                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len])
                     {
                         out.observe_perhead(push);
                     }
                     if len >= 10 && u16::from_le_bytes([buf[8], buf[9]]) == 0x45 {
                         // The 0x45 wire tag is shared by status traffic. Only a valid decrypted
                         // inner header proves that this session's cipher is engaged.
-                        match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len], session.authenticated_in) {
+                        match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len]) {
                             Some((id, sub, ctr)) => {
                                 out.acks += 1;
                                 vino_debug!(
@@ -3158,8 +3102,7 @@ impl VinoDriver {
                                     if let Ok(Some(e)) = cp::parse_edid_from_reply(
                                         &session.ks,
                                         &session.riv,
-                                        &buf[..len],
-                        session.authenticated_in,
+                                        &buf[..len]
                                     ) {
                                         vino_debug!(
                                             "vino: EDID read from dock ({} bytes)\n",
@@ -3171,13 +3114,13 @@ impl VinoDriver {
                                 // Track the downstream-DDC readiness bit so
                                 // the EDID loop can distinguish pending work.
                                 if let Some(true) =
-                                    cp::edid_poll_ready(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
+                                    cp::edid_poll_ready(&session.ks, &session.riv, &buf[..len])
                                 {
                                     out.edid_ready = true;
                                 }
                             }
                             None => {
-                                match cp::decode_in_lenient(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
+                                match cp::decode_in_lenient(&session.ks, &session.riv, &buf[..len])
                                 {
                                     // A structurally valid header with an uncatalogued sub-id still
                                     // proves possession of the session key.
@@ -3190,8 +3133,7 @@ impl VinoDriver {
                                             if let Some(inner) = cp::inner_plaintext(
                                                 &session.ks,
                                                 &session.riv,
-                                                &buf[..len],
-                        session.authenticated_in,
+                                                &buf[..len]
                                             ) {
                                                 if let Some(line) = cp::dock_trace_line(&inner) {
                                                     pr_info!(
@@ -3209,8 +3151,7 @@ impl VinoDriver {
                                     None => match cp::inner_plaintext(
                                         &session.ks,
                                         &session.riv,
-                                        &buf[..len],
-                        session.authenticated_in,
+                                        &buf[..len]
                                     ) {
                                         Some(inner) => {
                                             out.acks += 1;
@@ -3260,7 +3201,7 @@ impl VinoDriver {
                     out.reads += 1;
                     Self::log_ep84(session, &buf[..len]);
                     if let Some(push) =
-                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
+                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len])
                     {
                         out.observe_perhead(push);
                         if out.saw_perhead(want_msg_id) {
@@ -3271,7 +3212,7 @@ impl VinoDriver {
                     if u16::from_le_bytes([buf[8], buf[9]]) != 0x45 {
                         continue;
                     }
-                    match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len], session.authenticated_in) {
+                    match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len]) {
                         Some((id, sub, ctr)) => {
                             out.acks += 1;
                             vino_debug!(
@@ -3281,8 +3222,7 @@ impl VinoDriver {
                         None if cp::decode_in_lenient(
                             &session.ks,
                             &session.riv,
-                            &buf[..len],
-                        session.authenticated_in,
+                            &buf[..len]
                         )
                         .is_some() => {
                             out.acks += 1;
@@ -3322,11 +3262,11 @@ impl VinoDriver {
                         continue;
                     }
                     if let Some(push) =
-                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
+                        cp::perhead_hdcp_push(&session.ks, &session.riv, &buf[..len])
                     {
                         out.observe_perhead(push);
                     }
-                    match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len], session.authenticated_in) {
+                    match cp::verify_in_ack(&session.ks, &session.riv, &buf[..len]) {
                         Some((id, sub, ctr)) => {
                             out.acks += 1;
                             let echo = if ctr == ictr {
@@ -3340,8 +3280,7 @@ impl VinoDriver {
                                 if let Ok(Some(e)) = cp::parse_edid_from_reply(
                                     &session.ks,
                                     &session.riv,
-                                    &buf[..len],
-                        session.authenticated_in,
+                                    &buf[..len]
                                 ) {
                                     vino_debug!("vino: EDID read from dock ({} bytes)\n", e.len());
                                     *edid_out = Some(e);
@@ -3352,7 +3291,7 @@ impl VinoDriver {
                                 break;
                             }
                         }
-                        None => match cp::decode_in_lenient(&session.ks, &session.riv, &buf[..len], session.authenticated_in)
+                        None => match cp::decode_in_lenient(&session.ks, &session.riv, &buf[..len])
                         {
                             // Decrypts to a plausible CP header, just an unlisted `sub` -- a valid
                             // ack (cipher engaged), not a rejection. See the drain_ep84 branch.
@@ -3558,38 +3497,6 @@ impl usb::Driver for VinoDriver {
     fn disconnect<'bound>(intf: &'bound usb::Interface<Core<'_>>, data: Pin<&VinoBoundData>) {
         let dev: &device::Device<Core<'_>> = intf.as_ref();
 
-        // ⭐ Hand the dock back before letting go of it.
-        //
-        // The D6000 accepts a new session only after it has re-enumerated. A clean vino teardown
-        // does not release it: every later `init_0` is NAKed until it times out while the dock
-        // still answers every control request. That was invisible while the dock hard-reset itself
-        // every few seconds -- the re-enumeration released it as a side effect -- and became the
-        // dominant failure once the reset was fixed. Host-side resets do not help: CLEAR_FEATURE
-        // on EP02/EP84, a re-issued SET_CONFIGURATION, deauthorize/reauthorize and a full
-        // `USBDEVFS_RESET` were each measured and each left it refusing.
-        //
-        // Request `0x24` is the vendor transition `bring_up()` uses to claim the device, with
-        // Ridge asking for state 3 and Navarro for state 0. Driving it back to 0 here is the
-        // matching release. Sending it at the *start* of the next session was measured and does
-        // not work -- by then the dock has already refused -- so it has to be sent while this
-        // session is still the owner.
-        if *crate::module_parameters::vendor_state_release.value() != 0 {
-            if let Some(reg) = data.registration.as_ref() {
-                const VENDOR_OUT: u8 = 0x40;
-                let drm_data: &drm_sink::VinoDrmData = reg.device();
-                // Must precede `shutdown()`, which closes the I/O window.
-                match drm_data.io.enter() {
-                    Ok(io) => {
-                        match io.control_send(0x24, VENDOR_OUT, 0, 0, &[], timeout(), GFP_KERNEL) {
-                            Ok(()) => vino_debug!("vino: released the dock's vendor state\n"),
-                            Err(e) => vino_debug!("vino: vendor state release failed ({e:?})\n"),
-                        }
-                    }
-                    Err(e) => vino_debug!("vino: no I/O window to release the dock ({e:?})\n"),
-                }
-            }
-        }
-
         // Stop every producer. The DRM device itself is unregistered by `Registration`'s `Drop`
         // when the bound data is released -- the accepted registration teardown already calls
         // `drm_dev_unplug()`, so there is no driver-local force-unplug here any more.
@@ -3646,26 +3553,6 @@ kernel::module_usb_driver! {
         video_clear_each: u8 {
             default: 0,
             description: "Diagnostic: clear the video endpoint halt before every transfer, to test whether the dock halts it after each one",
-        },
-        vendor_state_release: u8 {
-            default: 1,
-            description: "Drive the dock's vendor state machine back to 0 (request 0x24) at disconnect, handing the device back so the next bring-up is accepted",
-        },
-        ctrl_clear_halt: u8 {
-            default: 0,
-            description: "Diagnostic: reset EP02/EP84 sequence state at bring-up. Tried against the D6000's warm-reattach wedge on 2026-08-04 and did NOT clear it, so it is off by default rather than unproven wire behaviour",
-        },
-        vendor_state_reset: u8 {
-            default: 0,
-            description: "Diagnostic: drive the dock's vendor state machine back to 0 (request 0x24) before claiming it. Tried against the D6000's warm-reattach wedge on 2026-08-04 and did NOT clear it",
-        },
-        strip_map_persist: u8 {
-            default: 1,
-            description: "Carry the DL7400 per-strip size-class map forward between frames, so a delta does not re-declare every untouched strip as class 0 (0 = rebuild from zero each frame, DLM's literal capture behaviour)",
-        },
-        strip_class_cap: u8 {
-            default: 0,
-            description: "Diagnostic: clamp the DL7400 per-strip size class (kind=0x200f) to this value (0 = uncapped). Every measured DLM map uses only 0..3; vino emits 4 and 5 for its longest strips, which no capture covers",
         },
         video_xfer: u32 {
             default: 0,

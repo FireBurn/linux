@@ -461,11 +461,6 @@ pub(super) struct CpLink {
     wire_seq: u32,
     counter: u16,
     ep84_q: Option<super::usb::BulkInQueue>,
-    /// See `DockProfile::cp_authenticated_in`. Carried beside the key it qualifies, so no decode
-    /// site can reach one without the other.
-    authenticated_in: bool,
-    /// See `DockProfile::cp_reply_counter_match`.
-    reply_counter_match: bool,
 }
 
 /// A control-protocol operation deferred from the non-blocking atomic callbacks.
@@ -1457,8 +1452,6 @@ impl VinoDrmData {
         wire_seq: u32,
         counter: u16,
         ep84_depth: usize,
-        authenticated_in: bool,
-        reply_counter_match: bool,
     ) {
         // EP84 must remain posted between runtime EP02 writes. A queue drained synchronously leaves
         // the endpoint unposted between calls and can stall the control protocol.
@@ -1477,8 +1470,6 @@ impl VinoDrmData {
             wire_seq,
             counter,
             ep84_q,
-            authenticated_in,
-            reply_counter_match,
         });
     }
 
@@ -2938,13 +2929,8 @@ impl VinoDrmData {
         // exact 100-ms staircase visible in the failed captures.  Consume pushes here and stop only
         // at the echoed counter (or a bounded timeout for request classes which do not reply).
         //
-        // ⚠ Per dock, and ungated in 498a10040294 -- the commit a user bisect landed the D6000's
-        // regression on. Ridge reaped exactly one reply per write for the driver's whole life
-        // before that, and a request class it does not answer costs the matching form a 64-ms
-        // stall with `cp_link` held, on a keepalive that must not stall.
         //
         // Use the validated 4096-byte request size so larger logical replies arrive intact.
-        let match_counter = link.reply_counter_match;
         let mut reply = KVec::from_elem(0u8, 4096, GFP_KERNEL)?;
         let deadline = Instant::<Monotonic>::now() + Delta::from_millis(64);
         let mut matched = 0usize;
@@ -2967,15 +2953,15 @@ impl VinoDrmData {
                 let target = self.edid_target.load(Ordering::Relaxed);
                 if target != NO_EDID_TARGET {
                     if let Ok(Some(blob)) =
-                        super::cp::parse_edid_from_reply(&link.ks, &link.riv, &reply[..got], link.authenticated_in)
+                        super::cp::parse_edid_from_reply(&link.ks, &link.riv, &reply[..got])
                     {
                         *self.edid_caught.lock() = Some(blob);
                     }
                 }
                 if let Some((reply_id, reply_sub, reply_counter)) =
-                    super::cp::decode_in_lenient(&link.ks, &link.riv, &reply[..got], link.authenticated_in)
+                    super::cp::decode_in_lenient(&link.ks, &link.riv, &reply[..got])
                 {
-                    if !match_counter || reply_counter == request_counter {
+                    if reply_counter == request_counter {
                         matched = got;
                         break;
                     }
@@ -2987,18 +2973,8 @@ impl VinoDrmData {
                     }
                 } else {
                     undecodable += 1;
-                    // Historical behaviour: one reap per write, decodable or not. `consume` then
-                    // sees the bytes exactly as it did, and a request the dock does not answer
-                    // costs one read rather than the full deadline.
-                    if !match_counter {
-                        matched = got;
-                        break;
-                    }
                 }
                 reaped += 1;
-            }
-            if !match_counter && got == 0 {
-                break;
             }
             if (Instant::<Monotonic>::now() - deadline).as_millis() >= 0 {
                 break;
@@ -3097,7 +3073,7 @@ impl VinoDrmData {
                 Ok(Some(len)) if len > 0 => {
                     n += 1;
                     if let Some((id, _, _)) =
-                        super::cp::decode_in_lenient(&link.ks, &link.riv, &reply[..len], link.authenticated_in)
+                        super::cp::decode_in_lenient(&link.ks, &link.riv, &reply[..len])
                     {
                         // An EDID-handler reply arriving with no probe outstanding is the dock
                         // reporting that a downstream sink changed -- it is the *only* thing it
@@ -3255,7 +3231,7 @@ impl VinoDrmData {
                 },
             };
             if let Ok(Some(blob)) =
-                super::cp::parse_edid_from_reply(&link.ks, &link.riv, &reply[..got], link.authenticated_in)
+                super::cp::parse_edid_from_reply(&link.ks, &link.riv, &reply[..got])
             {
                 return Some(blob);
             }
@@ -3322,7 +3298,6 @@ impl VinoDrmData {
                     &link.ks,
                     &link.riv,
                     &reply[..n],
-                    link.authenticated_in,
                 ) {
                     Some((_, _, echoed)) if echoed == request_counter => break n,
                     // Undecodable frames are the dock's asynchronous pushes; keep draining.
@@ -3334,7 +3309,7 @@ impl VinoDrmData {
             }
         };
         // Decode the downstream status at inner bytes 22..26 as well as the handler ID.
-        let (id, status, _) = super::cp::probe_reply_status(&link.ks, &link.riv, &reply[..got], link.authenticated_in)?;
+        let (id, status, _) = super::cp::probe_reply_status(&link.ks, &link.riv, &reply[..got])?;
         // On Ridge a head with no monitor cannot be routed to an EDID handler, so the dock answers
         // the generic `id=0x14` rather than the rich `id=0x44` -- the same substitution it makes
         // for a wrong head selector, which is how the EDID head-selector bug was found. That is

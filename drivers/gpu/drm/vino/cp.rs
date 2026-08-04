@@ -571,7 +571,6 @@ pub(super) fn decode_any(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
     wire: &[u8],
-    authenticated: bool,
 ) -> Option<(&'static str, u16, u16, u16, [u8; 24])> {
     if wire.len() <= 16 {
         return None;
@@ -587,7 +586,7 @@ pub(super) fn decode_any(
     ];
     let mut best: Option<(i32, &'static str, u16, u16, u16, [u8; 24])> = None;
     for (tag, riv) in variants {
-        let Ok(pt) = open_in(ks, &riv, seq, body, authenticated) else {
+        let Ok(pt) = open_in(ks, &riv, seq, body) else {
             continue;
         };
         if pt.len() < 8 {
@@ -628,7 +627,6 @@ pub(super) fn verify_in_ack(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
     wire: &[u8],
-    authenticated: bool,
 ) -> Option<(u16, u16, u16)> {
     if wire.len() <= 16 || u16::from_le_bytes([wire[8], wire[9]]) != 0x45 {
         return None;
@@ -636,7 +634,7 @@ pub(super) fn verify_in_ack(
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
     let body = &wire[16..];
     for riv in inbound_reply_rivs(out_riv) {
-        let Ok(pt) = open_in(ks, &riv, seq, body, authenticated) else {
+        let Ok(pt) = open_in(ks, &riv, seq, body) else {
             continue;
         };
         if pt.len() < 8 {
@@ -665,7 +663,6 @@ pub(super) fn inner_plaintext(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
     wire: &[u8],
-    authenticated: bool,
 ) -> Option<KVec<u8>> {
     if wire.len() <= 16 {
         return None;
@@ -679,19 +676,14 @@ pub(super) fn inner_plaintext(
         0x45 => {
             let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
             for riv in inbound_reply_rivs(out_riv) {
-                let Ok(pt) = open_in(ks, &riv, seq, &wire[16..], authenticated) else {
+                let Ok(pt) = open_in(ks, &riv, seq, &wire[16..]) else {
                     continue;
                 };
-                // On an authenticated dock the verified Dl3Cmac identifies a genuine frame, and
-                // inner offsets 6..7 must not be tested: Navarro stores connector selector bits
-                // there for the third and fourth per-connector HDCP bursts. Without the tag, that
-                // zero word is the only evidence the RIV variant was the right one.
-                let plausible = if authenticated {
-                    pt.len() >= 8
-                } else {
-                    pt.len() >= 8 && u16::from_le_bytes([pt[6], pt[7]]) == 0
-                };
-                if plausible {
+                // The verified Dl3Cmac identifies a genuine frame. Inner offsets 6..7 must NOT be
+                // tested as padding: Navarro stores connector selector bits there for the third
+                // and fourth per-connector HDCP bursts, and rejecting on them dropped those
+                // connectors' authentic pushes.
+                if pt.len() >= 8 {
                     return Some(pt);
                 }
             }
@@ -730,7 +722,6 @@ pub(super) fn decode_in_lenient(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
     wire: &[u8],
-    authenticated: bool,
 ) -> Option<(u16, u16, u16)> {
     if wire.len() <= 16 || u16::from_le_bytes([wire[8], wire[9]]) != 0x45 {
         return None;
@@ -738,7 +729,7 @@ pub(super) fn decode_in_lenient(
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
     let body = &wire[16..];
     for riv in inbound_reply_rivs(out_riv) {
-        let Ok(pt) = open_in(ks, &riv, seq, body, authenticated) else {
+        let Ok(pt) = open_in(ks, &riv, seq, body) else {
             continue;
         };
         if pt.len() < 8 {
@@ -751,12 +742,9 @@ pub(super) fn decode_in_lenient(
         // range (the captured transaction boundary replies with id=0x0405/sub=0x000c). Its
         // per-connector HDCP pushes also use bytes 4--7 as a one-hot 32-bit selector, so `ctr` is
         // only an echo counter for actual request/reply classes and bytes 6..7 need not be zero --
-        // `open_in` has already authenticated the whole ciphertext. Without that tag the old
-        // `id < 0x400 && pad == 0` test is the only thing separating a real message from a wrong
-        // RIV variant, so it stays for docks decoded the historical way.
-        if authenticated || (id < 0x400 && u16::from_le_bytes([pt[6], pt[7]]) == 0) {
-            return Some((id, sub, ctr));
-        }
+        // `open_in` has already authenticated the whole ciphertext, so no plaintext plausibility
+        // restriction is needed or wanted here.
+        return Some((id, sub, ctr));
     }
     None
 }
@@ -782,7 +770,6 @@ pub(super) fn perhead_hdcp_push(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
     wire: &[u8],
-    authenticated: bool,
 ) -> Option<PerheadHdcpPush> {
     if wire.len() <= 16 {
         return None;
@@ -819,7 +806,7 @@ pub(super) fn perhead_hdcp_push(
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
     let body = &wire[16..];
     for riv in inbound_reply_rivs(out_riv) {
-        let Ok(inner) = open_in(ks, &riv, seq, body, authenticated) else {
+        let Ok(inner) = open_in(ks, &riv, seq, body) else {
             continue;
         };
         if let Some(push) = copy_push(&inner) {
@@ -1345,32 +1332,25 @@ pub(super) fn open_in(
     in_riv: &[u8; 8],
     seq: u32,
     body: &[u8],
-    authenticated: bool,
 ) -> Result<KVec<u8>> {
-    // ⚠ Per dock. Navarro's inbound frames are authenticated by the trailing Dl3Cmac over the
-    // whole body, which is what lets its per-connector HDCP pushes carry a one-hot selector in
-    // inner bytes 6..7. Ridge's callers instead read a plaintext prefix and test it for
-    // plausibility, which is what this driver did for every dock until the DL7400 landed. Turning
-    // the strict form on for Ridge is one of the four ungated changes in 498a10040294, the commit
-    // a user bisect landed the D6000 regression on, so it is a profile decision until measured.
-    let ct = if authenticated {
-        if body.len() < 16 {
-            return Err(EINVAL);
-        }
-        let (ct, wire_tag) = body.split_at(body.len() - 16);
-        let expected = dl3cmac_tag(ks, in_riv, seq as u64, ct)?;
-        // Accumulate the difference so a tag mismatch does not reveal the first differing byte.
-        let mut different = 0u8;
-        for (&actual, &want) in wire_tag.iter().zip(expected.iter()) {
-            different |= actual ^ want;
-        }
-        if different != 0 {
-            return Err(EINVAL);
-        }
-        ct
-    } else {
-        body
-    };
+    // Both platforms authenticate an inbound frame with a trailing Dl3Cmac over the whole body.
+    // Verifying it is what lets callers read the plaintext without also testing it for
+    // plausibility -- and that matters, because Navarro's per-connector HDCP pushes carry a
+    // one-hot selector in inner bytes 6..7 that the old "those bytes are zero padding" heuristic
+    // rejected.
+    if body.len() < 16 {
+        return Err(EINVAL);
+    }
+    let (ct, wire_tag) = body.split_at(body.len() - 16);
+    let expected = dl3cmac_tag(ks, in_riv, seq as u64, ct)?;
+    // Accumulate the difference so a tag mismatch does not reveal the first differing byte.
+    let mut different = 0u8;
+    for (&actual, &want) in wire_tag.iter().zip(expected.iter()) {
+        different |= actual ^ want;
+    }
+    if different != 0 {
+        return Err(EINVAL);
+    }
 
     let cipher = crypto::Aes128::new(ks)?;
     let mut pt = KVec::with_capacity(ct.len(), GFP_KERNEL)?;
@@ -1394,7 +1374,6 @@ pub(super) fn parse_edid_from_reply(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
     wire: &[u8],
-    authenticated: bool,
 ) -> Result<Option<KVec<u8>>> {
     // Wire header: [.. type@4 u32 .. sub@8 u16 .. seq@12 u32]; body at off16.
     if wire.len() <= 16 || u16::from_le_bytes([wire[8], wire[9]]) != 0x45 {
@@ -1403,7 +1382,7 @@ pub(super) fn parse_edid_from_reply(
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
     let body = &wire[16..];
     for riv in inbound_reply_rivs(out_riv) {
-        let Ok(inner) = open_in(ks, &riv, seq, body, authenticated) else {
+        let Ok(inner) = open_in(ks, &riv, seq, body) else {
             continue;
         };
         // Inner header: [id u16][sub u16][counter u16][00 00]; EDID payload at off22.
@@ -1448,7 +1427,6 @@ pub(super) fn probe_reply_status(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
     wire: &[u8],
-    authenticated: bool,
 ) -> Option<(u16, u32, bool)> {
     if wire.len() <= 16 || u16::from_le_bytes([wire[8], wire[9]]) != 0x45 {
         return None;
@@ -1456,7 +1434,7 @@ pub(super) fn probe_reply_status(
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
     let body = &wire[16..];
     for riv in inbound_reply_rivs(out_riv) {
-        let Ok(inner) = open_in(ks, &riv, seq, body, authenticated) else {
+        let Ok(inner) = open_in(ks, &riv, seq, body) else {
             continue;
         };
         if inner.len() < 8 {
@@ -1494,7 +1472,6 @@ pub(super) fn edid_poll_ready(
     ks: &[u8; 16],
     out_riv: &[u8; 8],
     wire: &[u8],
-    authenticated: bool,
 ) -> Option<bool> {
     if wire.len() <= 16 || u16::from_le_bytes([wire[8], wire[9]]) != 0x45 {
         return None;
@@ -1502,7 +1479,7 @@ pub(super) fn edid_poll_ready(
     let seq = u32::from_le_bytes([wire[12], wire[13], wire[14], wire[15]]);
     let body = &wire[16..];
     for riv in inbound_reply_rivs(out_riv) {
-        let Ok(inner) = open_in(ks, &riv, seq, body, authenticated) else {
+        let Ok(inner) = open_in(ks, &riv, seq, body) else {
             continue;
         };
         if inner.len() < 27 {

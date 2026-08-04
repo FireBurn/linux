@@ -1390,16 +1390,12 @@ pub(crate) mod wht {
     /// falls on a multiple of 512.
     #[inline]
     fn strip_size_class(len: usize) -> u8 {
-        let class = (len >> 9) as u8;
         // ⛔ The field does NOT saturate. Every map in the decrypted DLM corpus uses only classes
         // 0..3 with a longest strip of 1670 B, while vino's live desktop reaches 2598 B -- classes
-        // 4 and 5, which no capture covers. Clamping to 3 was A/B'd on hardware on 2026-08-04 and
-        // made the DL7400's artifact **worse**, so the class is a real magnitude and the corpus
-        // simply never held a strip that long. `strip_class_cap` stays as a knob, defaulting off.
-        match *crate::module_parameters::strip_class_cap.value() {
-            0 => class,
-            cap => class.min(cap),
-        }
+        // 4 and 5, which no capture covers. Clamping to 3 was A/B'd on hardware and made the
+        // DL7400's artifact **worse**, so the class is a real magnitude and the corpus simply
+        // never held a strip that long.
+        (len >> 9) as u8
     }
 
     /// Collect `(x, y, byte length)` for every strip in an already-framed set of image records.
@@ -1508,9 +1504,7 @@ pub(crate) mod wht {
         }
         let mut values: KVec<u8> = KVec::new();
         values.resize(bands * PARAM_BAND_STRIDE, 0, GFP_KERNEL)?;
-        if *crate::module_parameters::strip_map_persist.value() != 0 {
-            values.copy_from_slice(remembered);
-        }
+        values.copy_from_slice(remembered);
         let mut described = 0usize;
         let mut classes = [0usize; 8];
         let mut longest = 0usize;
