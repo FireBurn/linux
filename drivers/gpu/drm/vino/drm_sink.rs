@@ -56,30 +56,17 @@ static PRIMARY_FORMATS: [u32; 1] = [drm::fourcc::XRGB8888];
 /// Cursor-plane format list.
 static CURSOR_FORMATS: [u32; 1] = [drm::fourcc::ARGB8888];
 
-/// Per-mode pixel-clock ceiling in kHz.
+/// Per-mode pixel-clock ceiling in kHz for a dock whose profile has not been applied yet.
 ///
-/// The set-mode message carries the clock at offset 70 as a `u16` in 10 kHz units, so 655.35 MHz is
-/// the largest value it can express. Offset 72 sits above it and is zero in every decrypted DLM
-/// message, at every resolution and refresh captured, so nothing establishes it as a high half.
-/// Advertising a mode past this point produced a mode-set that failed at `timing_from_drm_mode`
-/// instead of being pruned here.
-const MAX_HEAD_CLOCK_KHZ: i32 = 655_350;
+/// Ridge's DLM never programs above 497.75 MHz, so no Ridge capture fills the high half of the
+/// offset-70 `u32`; this keeps the value that half can express on its own.
+pub(super) const DEFAULT_MAX_HEAD_CLOCK_KHZ: u32 = 655_350;
 
-/// Highest refresh rate that the D6000 has been observed to display.
+/// Refresh ceiling for a dock whose profile has not been applied yet.
 ///
-/// DLM never programs the dock above this: asked for 2560x1440@180 it puts 119.998 Hz on the wire,
-/// and asked for @85 it programs the 59.95 Hz CVT-RB timing. Every vino attempt above 120 Hz left
-/// the panel dark, so this ceiling matches the only behaviour the hardware has ever demonstrated.
-const DOCK_MAX_REFRESH_HZ: u32 = 120;
-
-pub(super) fn max_refresh_hz() -> u32 {
-    DOCK_MAX_REFRESH_HZ
-}
-
-/// Return whether DRM's rounded refresh rate is within the dock limit.
-pub(super) fn refresh_within_limit(vrefresh: i32) -> bool {
-    vrefresh <= 0 || (vrefresh as u32) <= max_refresh_hz()
-}
+/// This is Ridge's limit, which is also DLM's: asked for 2560x1440@180 it puts 119.998 Hz on the
+/// wire, and asked for @85 it programs the 59.95 Hz CVT-RB timing.
+pub(super) const DEFAULT_MAX_REFRESH_HZ: u32 = 120;
 
 /// Return the active pixel rate, saturating on invalidly large modes.
 pub(super) fn active_pixel_rate(hdisplay: u16, vdisplay: u16, vrefresh: i32) -> u32 {
@@ -953,6 +940,10 @@ pub(super) struct VinoDrmData {
     cursor_geometry: Mutex<[Option<(u16, u16)>; HEADS]>,
     /// Dock-wide pixel-rate budget in pixels per second; zero means unknown.
     dock_pixel_budget: core::sync::atomic::AtomicU32,
+    /// Highest refresh rate this dock is known to drive; see `DockProfile::max_refresh_hz`.
+    max_refresh_hz: core::sync::atomic::AtomicU32,
+    /// Highest per-mode pixel clock in kHz; see `DockProfile::max_head_clock_khz`.
+    max_head_clock_khz: core::sync::atomic::AtomicU32,
     /// Excludes scanout while a mode-set batch can submit on a video endpoint. Paired with
     /// `video_inflight` using sequentially consistent store-then-check handshakes.
     cmd_busy: core::sync::atomic::AtomicBool,
@@ -1052,6 +1043,8 @@ impl VinoDrmData {
             // D6000 default: 442,368,000 px/s (one 1440p@120) x2 compression headroom = dual
             // 1440p@120. Replace it if a dock capability supplies a limit.
             dock_pixel_budget: core::sync::atomic::AtomicU32::new(884_736_000),
+            max_refresh_hz: core::sync::atomic::AtomicU32::new(DEFAULT_MAX_REFRESH_HZ),
+            max_head_clock_khz: core::sync::atomic::AtomicU32::new(DEFAULT_MAX_HEAD_CLOCK_KHZ),
             cmd_busy: core::sync::atomic::AtomicBool::new(false),
             video_inflight: core::array::from_fn(|_| core::sync::atomic::AtomicBool::new(false)),
             scanout_fails: core::array::from_fn(|_| core::sync::atomic::AtomicU64::new(0)),
@@ -3324,6 +3317,49 @@ impl VinoDrmData {
             .load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Record this dock's pixel-rate budget, refresh ceiling and pixel-clock ceiling.
+    pub(super) fn set_mode_limits(
+        &self,
+        pixel_budget: u32,
+        max_refresh_hz: u32,
+        max_head_clock_khz: u32,
+    ) {
+        self.dock_pixel_budget
+            .store(pixel_budget, core::sync::atomic::Ordering::Relaxed);
+        self.max_refresh_hz.store(
+            if max_refresh_hz == 0 {
+                DEFAULT_MAX_REFRESH_HZ
+            } else {
+                max_refresh_hz
+            },
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        self.max_head_clock_khz.store(
+            if max_head_clock_khz == 0 {
+                DEFAULT_MAX_HEAD_CLOCK_KHZ
+            } else {
+                max_head_clock_khz
+            },
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Highest per-mode pixel clock in kHz this dock is known to accept.
+    fn max_head_clock_khz(&self) -> u32 {
+        self.max_head_clock_khz
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Highest refresh rate this dock is known to drive.
+    pub(super) fn max_refresh_hz(&self) -> u32 {
+        self.max_refresh_hz.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether DRM's rounded refresh rate is within this dock's limit.
+    pub(super) fn refresh_within_limit(&self, vrefresh: i32) -> bool {
+        vrefresh <= 0 || (vrefresh as u32) <= self.max_refresh_hz()
+    }
+
     /// Combined pixel rate of every head *except* `head` that currently has a mode driven onto it.
     ///
     /// Only active heads consume the shared limit. `last_timing` survives
@@ -4258,8 +4294,8 @@ impl crtc::DriverCrtc for VinoCrtc {
         } else {
             0
         };
-        if new_refresh > old_refresh && !refresh_within_limit(new_refresh) {
-            let limit = DOCK_MAX_REFRESH_HZ;
+        if new_refresh > old_refresh && !data.refresh_within_limit(new_refresh) {
+            let limit = data.max_refresh_hz();
             pr_warn!("vino: head {head} refresh {new_refresh} exceeds {limit} Hz\n");
             return Err(EINVAL);
         }
@@ -6314,13 +6350,11 @@ impl connector::DriverConnector for VinoConnector {
     /// ([`MAX_HEAD_CLOCK_KHZ`], ~4K@60), whose refresh rate exceeds what the dock has ever been
     /// shown to display ([`DOCK_MAX_REFRESH_HZ`]), or whose pixel rate exceeds the dock's budget.
     fn mode_valid(connector: ConnectorModeValidation<'_, Self>, mode: &DisplayMode) -> ModeStatus {
-        // Hard single-link ceiling (~4K@60) first.
-        if mode.clock() > MAX_HEAD_CLOCK_KHZ {
+        let data: &VinoDrmData = connector.drm_dev();
+        if mode.clock() < 0 || mode.clock() as u32 > data.max_head_clock_khz() {
             return ModeStatus::ClockHigh;
         }
-        // The dock clamps higher vendor-stack requests to 120 Hz and does not display native
-        // 165/180 Hz timings.
-        if !refresh_within_limit(mode.vrefresh()) {
+        if !data.refresh_within_limit(mode.vrefresh()) {
             return ModeStatus::ClockHigh;
         }
         if !super::cp::mode_supported(mode) {
@@ -6328,7 +6362,6 @@ impl connector::DriverConnector for VinoConnector {
         }
         // Reject a mode only when that head exceeds the dock's whole pixel budget. The atomic CRTC
         // check enforces the combined rate of simultaneously active heads.
-        let data: &VinoDrmData = connector.drm_dev();
         let budget = data.dock_budget();
         let head_rate = active_pixel_rate(mode.hdisplay(), mode.vdisplay(), mode.vrefresh());
         if budget != 0 && head_rate > budget {
