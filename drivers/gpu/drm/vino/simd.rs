@@ -22,7 +22,7 @@ use kernel::fpu::FpuGuard;
 use kernel::prelude::*;
 use kernel::time::{Delta, Instant, Monotonic};
 
-use super::video::wht::{transform, COEFFS, PIXELS};
+use super::video::wht::{colour_strip_at, transform, Geometry, COEFFS, PIXELS, RIDGE_GEOMETRY};
 
 /// Blocks `colour_block` transforms together: the `cr`, `cb` and `y` planes of one 8x8 block.
 ///
@@ -399,6 +399,35 @@ pub(crate) fn bench() -> Result {
         core::mem::zeroed()
     });
 
+    // How much of a real strip encode the transform actually is. Anything a faster transform can
+    // win -- or lose -- is bounded by this share, and it is the number that decides whether the
+    // rows above matter at all. A strip is 16 blocks and `colour_block` transforms three planes
+    // per block, so a strip pays 48 transforms plus the pixel gather, quantiser and entropy coder.
+    const STRIPS: usize = 512;
+    let geom: Geometry = RIDGE_GEOMETRY;
+    let mut px = |x: usize, y: usize| {
+        let v = ((x * 7) ^ (y * 13)) as u8;
+        (v, v.wrapping_add(29), v.wrapping_add(83))
+    };
+    let t = Instant::<Monotonic>::now();
+    let mut bytes = 0usize;
+    for i in 0..STRIPS {
+        let sy = (i % 64) * geom.strip_h();
+        bytes += colour_strip_at(geom, 0, sy, &mut px)?.len();
+    }
+    let strip = Instant::<Monotonic>::now() - t;
+    let strip_ns = ns_per(strip, STRIPS);
+    let transforms_per_strip = 16 * 3;
+    let in_transform = scalar_ns * transforms_per_strip as i64;
+    pr_info!(
+        "vino-simd: strip encode {} ns ({} B avg), of which {} transforms = {} ns, {}%\n",
+        strip_ns,
+        bytes / STRIPS,
+        transforms_per_strip,
+        in_transform,
+        if strip_ns > 0 { in_transform * 100 / strip_ns } else { 0 },
+    );
+    pr_info!("vino-simd: a perfect transform could save at most that share of encode CPU\n");
     pr_info!("vino-simd: 100% means parity with scalar; over 100% is faster\n");
     core::hint::black_box(sink);
     Ok(())
