@@ -772,7 +772,14 @@ impl WorkItem for BringUp {
         // Establish the transport, authenticate the link and configure the encrypted control
         // session before publishing the connectors. A transient failure must not leave an
         // otherwise bound device inert until it is physically replugged.
-        const SESSION_ATTEMPTS: usize = 3;
+        // ⚠ Not a formality. The D6000 intermittently refuses a session outright -- every control
+        // request is answered, `interface state` reads 28 zero bytes, and the very first EP02 bulk
+        // write (`init_0`) is NAKed until it times out. Three attempts over four seconds is not
+        // enough to distinguish "the dock needs a moment" from "the dock is wedged", and while it
+        // used to hard-reset itself every few seconds -- which cleared the state as a side effect
+        // -- that is fixed, so nothing else recovers it. Back off up to eight seconds and keep
+        // trying for about half a minute before giving the device up.
+        const SESSION_ATTEMPTS: usize = 8;
         let mut established = false;
         for attempt in 1..=SESSION_ATTEMPTS {
             if data.is_shutting_down() {
@@ -902,12 +909,13 @@ impl WorkItem for BringUp {
                     break;
                 }
                 Err(e) if attempt < SESSION_ATTEMPTS => {
+                    let backoff = 250i64 << (attempt - 1).min(5);
                     dev_warn!(
                         cdev,
                         "vino: control-session attempt {attempt}/{SESSION_ATTEMPTS} failed \
-                         ({e:?}); retrying\n"
+                         ({e:?}); retrying in {backoff} ms\n"
                     );
-                    fsleep(Delta::from_millis(250 * attempt as i64));
+                    fsleep(Delta::from_millis(backoff));
                 }
                 Err(e) => dev_err!(
                     cdev,
@@ -3527,6 +3535,38 @@ impl usb::Driver for VinoDriver {
     fn disconnect<'bound>(intf: &'bound usb::Interface<Core<'_>>, data: Pin<&VinoBoundData>) {
         let dev: &device::Device<Core<'_>> = intf.as_ref();
 
+        // ⭐ Hand the dock back before letting go of it.
+        //
+        // The D6000 accepts a new session only after it has re-enumerated. A clean vino teardown
+        // does not release it: every later `init_0` is NAKed until it times out while the dock
+        // still answers every control request. That was invisible while the dock hard-reset itself
+        // every few seconds -- the re-enumeration released it as a side effect -- and became the
+        // dominant failure once the reset was fixed. Host-side resets do not help: CLEAR_FEATURE
+        // on EP02/EP84, a re-issued SET_CONFIGURATION, deauthorize/reauthorize and a full
+        // `USBDEVFS_RESET` were each measured and each left it refusing.
+        //
+        // Request `0x24` is the vendor transition `bring_up()` uses to claim the device, with
+        // Ridge asking for state 3 and Navarro for state 0. Driving it back to 0 here is the
+        // matching release. Sending it at the *start* of the next session was measured and does
+        // not work -- by then the dock has already refused -- so it has to be sent while this
+        // session is still the owner.
+        if *crate::module_parameters::vendor_state_release.value() != 0 {
+            if let Some(reg) = data.registration.as_ref() {
+                const VENDOR_OUT: u8 = 0x40;
+                let drm_data: &drm_sink::VinoDrmData = reg.device();
+                // Must precede `shutdown()`, which closes the I/O window.
+                match drm_data.io.enter() {
+                    Ok(io) => {
+                        match io.control_send(0x24, VENDOR_OUT, 0, 0, &[], timeout(), GFP_KERNEL) {
+                            Ok(()) => vino_debug!("vino: released the dock's vendor state\n"),
+                            Err(e) => vino_debug!("vino: vendor state release failed ({e:?})\n"),
+                        }
+                    }
+                    Err(e) => vino_debug!("vino: no I/O window to release the dock ({e:?})\n"),
+                }
+            }
+        }
+
         // Stop every producer. The DRM device itself is unregistered by `Registration`'s `Drop`
         // when the bound data is released -- the accepted registration teardown already calls
         // `drm_dev_unplug()`, so there is no driver-local force-unplug here any more.
@@ -3583,6 +3623,10 @@ kernel::module_usb_driver! {
         video_clear_each: u8 {
             default: 0,
             description: "Diagnostic: clear the video endpoint halt before every transfer, to test whether the dock halts it after each one",
+        },
+        vendor_state_release: u8 {
+            default: 1,
+            description: "Drive the dock's vendor state machine back to 0 (request 0x24) at disconnect, handing the device back so the next bring-up is accepted",
         },
         ctrl_clear_halt: u8 {
             default: 0,
