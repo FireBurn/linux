@@ -63,6 +63,21 @@ const PID_D6000: u16 = 0x6006;
 /// `NavaDock`, i.e. the Navarro platform on DL-7000 silicon.
 const PID_DL7400: u16 = 0x7000;
 
+/// Which protocol generation a dock speaks.
+///
+/// Ridge and Navarro differ in more than parameter values: the initialisation sequence, the
+/// per-head HDCP framing, how a video stream is opened and how a mode is described are each
+/// distinct code paths. This names that split once. Everything that is merely a different *value*
+/// -- endpoints, strip geometry, connector count, link limits -- stays a field on [`DockProfile`]
+/// and is shared code driven by data.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Generation {
+    /// DL-6xxx silicon: the Dell D6000.
+    Ridge,
+    /// DL-7000 silicon: the DL-7400 quad dock.
+    Navarro,
+}
+
 /// What differs between the DisplayLink docks this driver drives.
 ///
 /// The control plane is identical across them -- bulk OUT `0x02`, bulk IN `0x84`, the same HDCP
@@ -76,28 +91,13 @@ pub(crate) struct DockProfile {
     /// Video bulk-OUT endpoint per physical connector. Navarro deliberately repeats its two
     /// endpoint addresses: connectors 0/2 share 0x08 and connectors 1/3 share 0x0a.
     pub(crate) video_eps: [u8; drm_sink::HEADS],
-    /// Whether the dock wants the cold ARM burst prefixed to the first frame after a mode set.
-    ///
-    /// Ridge does. Navarro opens a stream with a short per-head message instead, and a capture of
-    /// DLM shows no ARM-sized write on its video endpoints at all.
-    pub(crate) video_arm: bool,
+    /// Which protocol generation this dock speaks; see [`Generation`].
+    pub(crate) generation: Generation,
     /// How the dock encodes a head in a video record's `sub` field, as a left shift.
     ///
     /// Ridge uses the bare connector number (shift 0). Navarro spaces connectors eight apart --
     /// records use `0x00`/`0x08`/`0x10`/`0x18` and stream-opens `0x07`/`0x0f`/`0x17`/`0x1f`.
     pub(crate) head_sub_shift: u8,
-    /// Whether this dock's video path is established. Ridge's arm/training sequence makes Navarro
-    /// hard-reset on the first EP08 write, so video stays off there until its own sequence is
-    /// worked out; control, EDID, modes and hotplug are unaffected.
-    pub(crate) video_supported: bool,
-    /// Whether the dock runs a per-head HDCP repeater authentication after the main-link AKE.
-    ///
-    /// Both supported platforms do. Navarro's sequence is structurally identical to Ridge's and
-    /// differs only in the connector marker and the stream ids it names.
-    pub(crate) per_head_auth: bool,
-    /// Whether per-head HDCP records select a connector as a one-hot bit at byte `22 + head`.
-    /// Ridge instead has a one-based head number at byte 23.
-    pub(crate) per_head_onehot: bool,
     /// The bits a head's content-stream id sets over its record `sub`.
     ///
     /// Ridge streams are `0x08 | head`, Navarro's `(connector << 3) | 7`. See
@@ -108,20 +108,11 @@ pub(crate) struct DockProfile {
     /// Whether an image record's `sub` carries the y-band parity; see
     /// [`video::wht::Geometry::band_parity_bit`].
     pub(crate) band_parity_bit: bool,
-    /// Whether an image record's `aux` carries its zero-padding count; see
-    /// [`video::wht::Geometry::aux_is_pad_count`].
-    pub(crate) aux_is_pad_count: bool,
     /// Blocks across one strip; see [`video::wht::Geometry`]. Ridge lays a strip's sixteen
     /// blocks 8 across x 2 down (64x16 px), the DL7400 16 across x 1 down (128x8 px).
     pub(crate) strip_blocks_x: usize,
     /// Whether image records interlace y bands; see [`video::wht::Geometry::interlaced_bands`].
     pub(crate) interlaced_bands: bool,
-    /// Whether the mode set carries the DL7400's offset-46/48 words rather than Ridge's.
-    ///
-    /// Both words are platform- and resolution-specific, and vino sent Ridge's `0x4000`/`0x6000`
-    /// on every DL7400 mode set until the decrypted Navarro corpus was read. See
-    /// [`cp::navarro_mode_words`].
-    pub(crate) navarro_mode_words: bool,
     /// Number of downstream connectors the dock answers a presence probe for.
     ///
     /// This is the range of the selector at probe byte 22, and it is **not** the head count: Ridge
@@ -170,6 +161,17 @@ pub(crate) struct DockProfile {
 }
 
 impl DockProfile {
+    /// Whether this dock speaks the Navarro protocol.
+    pub(crate) fn is_navarro(&self) -> bool {
+        matches!(self.generation, Generation::Navarro)
+    }
+
+    /// Whether per-head HDCP records select a connector as a one-hot bit at byte `22 + head`.
+    /// Ridge instead has a one-based head number at byte 23.
+    pub(crate) fn perhead_onehot(&self) -> bool {
+        self.is_navarro()
+    }
+
     /// This dock's codec geometry, for the codec calls made before a DRM device exists.
     ///
     /// The steady-state path reads `VinoDrmData::geometry()` instead; both describe the same
@@ -179,7 +181,6 @@ impl DockProfile {
             self.strip_blocks_x,
             self.interlaced_bands,
             self.band_parity_bit,
-            self.aux_is_pad_count,
             self.head_sub_shift,
             self.stream_id_mask,
             self.dock_buffers,
@@ -191,18 +192,13 @@ impl DockProfile {
 static PROFILE_D6000: DockProfile = DockProfile {
     name: "Dell D6000 (Ridge, DL-6xxx)",
     video_eps: [0x08, 0x0b, 0x08, 0x0b],
-    video_arm: true,
+    generation: Generation::Ridge,
     head_sub_shift: 0,
-    video_supported: true,
-    per_head_auth: true,
-    per_head_onehot: false,
     stream_id_mask: 0x08,
     strm2_marker: 0x06,
     band_parity_bit: true,
-    aux_is_pad_count: true,
     strip_blocks_x: 8,
     interlaced_bands: false,
-    navarro_mode_words: false,
     connectors: 2,
     dock_buffers: 2,
     max_refresh_hz: 120,
@@ -218,23 +214,18 @@ static PROFILE_D6000: DockProfile = DockProfile {
 static PROFILE_DL7400: DockProfile = DockProfile {
     name: "DL-7400 quad dock (Navarro, DL-7000)",
     video_eps: [0x08, 0x0a, 0x08, 0x0a],
-    video_arm: false,
+    generation: Generation::Navarro,
     head_sub_shift: 3,
     // The shared-pipe stream-open is sent before pixels by `build_stream_open_buf()`.  Its
     // remaining per-session material is established by the connector authentication sequence.
-    video_supported: true,
-    per_head_auth: true,
-    per_head_onehot: true,
     stream_id_mask: 0x07,
     strm2_marker: 0x0c,
     band_parity_bit: false,
     // The fixed-size black carriers happen to need no padding and therefore show zero here, but
     // ordinary compressed image records carry the actual 0..15-byte pad count just like Ridge.
     // This only became visible once a non-uniform live framebuffer was compared record-by-record.
-    aux_is_pad_count: true,
     strip_blocks_x: 16,
     interlaced_bands: true,
-    navarro_mode_words: true,
     connectors: 4,
     dock_buffers: 3,
     max_refresh_hz: u32::MAX,
@@ -832,7 +823,7 @@ impl WorkItem for BringUp {
                 // state and leaving stale video URBs behind. Finish only those already-deferred,
                 // distinct physical streams before the one initial hotplug. A normal setup sends
                 // no additional control messages and remains byte-identical to the reference.
-                if profile.per_head_onehot {
+                if profile.perhead_onehot() {
                     for head in 0..usize::from(profile.connectors) {
                         if !discovery_deferred[head]
                             || !data.runtime_connector(head)
@@ -890,7 +881,7 @@ impl WorkItem for BringUp {
             // Ridge needs a bounded training interval before userspace can submit a mode set.
             // Navarro's working transcript has already performed its fixed status sequence in
             // `send_cp_setup`; another 1.3 seconds inserted ~84 messages before its first clear.
-            if data.cp_engaged() && !profile.per_head_onehot {
+            if data.cp_engaged() && !profile.perhead_onehot() {
                 let data: &drm_sink::VinoDrmData = drm_dev;
                 let start = Instant::<Monotonic>::now();
                 let window = Delta::from_millis(1300);
@@ -1210,7 +1201,7 @@ impl VinoDriver {
         // Navarro/DLM USB transcript use wValue=0. Sending Ridge's value here still permits AKE
         // and an exact EP02 transcript, but leaves Navarro's video-side state machine different
         // before its later value-0 commit.
-        let vendor_state = if profile.navarro_mode_words { 0 } else { 3 };
+        let vendor_state = if profile.is_navarro() { 0 } else { 3 };
         match dev.control_send(
             0x24,
             VENDOR_OUT,
@@ -1804,7 +1795,7 @@ impl VinoDriver {
             Some(q) => {
                 q.send(dev.io(), &frame, timeout())?;
                 q.flush(dev.io(), timeout())?;
-                if profile.navarro_mode_words {
+                if profile.is_navarro() {
                     // DLM advances as soon as the dock authenticates msg0. The old eight-drain
                     // loop waited for seven empty 10-ms windows after that reply and moved every
                     // following setup transition roughly 90 ms later on the wire.
@@ -1911,7 +1902,7 @@ impl VinoDriver {
                 // Navarro's reference transaction is reply-lockstep: the next operation follows
                 // the matching authenticated counter immediately. A generic burst drain adds an
                 // empty 10-ms read after every acknowledgment and changes the EP0/EP02 ordering.
-                let d = if profile.navarro_mode_words {
+                let d = if profile.is_navarro() {
                     Self::lockstep_reply(
                         dev,
                         ep84_q.as_mut(),
@@ -1939,12 +1930,12 @@ impl VinoDriver {
         }
         // Navarro-only. Ridge's sequence begins below; sending these three messages there shifts
         // every later inner counter and AES block.
-        if profile.navarro_mode_words {
+        if profile.is_navarro() {
             send_init!(0x0014, 0x0030, &[]);
             send_init!(0x0015, 0x000b, &[0x01]);
         }
 
-        if profile.navarro_mode_words {
+        if profile.is_navarro() {
             // The working DLM transaction places the video-engine transition at this exact
             // authenticated boundary: after the reply to 0x15/0x0b (counter 11), before the four
             // connector-selecting 0x16/0x2a records (counters 12..15). Measured submit times are
@@ -1966,7 +1957,7 @@ impl VinoDriver {
             dev.control_recv(0x22, 0xc1, 1, 0, &mut state2, timeout(), GFP_KERNEL)?;
             fsleep(Delta::from_millis(3));
         }
-        if profile.navarro_mode_words {
+        if profile.is_navarro() {
             for connector in 0..connector_count {
                 let prefix = [connector as u8, 0x01];
                 send_init!(0x0016, 0x002a, &prefix);
@@ -2000,12 +1991,6 @@ impl VinoDriver {
         let mut head_ok = [false; Self::CP_SETUP_HEADS];
         let mut heads_authenticated = 0usize;
         'per_head: for head in 0..connector_count {
-            if !profile.per_head_auth {
-                // This platform authenticates the link once and never per head; see
-                // `DockProfile::per_head_auth`. Sending the burst anyway just waits for replies
-                // that are not coming.
-                break 'per_head;
-            }
             // Derive an independent HDCP 2.2 authentication chain for this downstream head.
             let mut rtx_h = [0u8; drm_hdcp::RTX_LEN];
             rng::fill(&mut rtx_h);
@@ -2066,7 +2051,7 @@ impl VinoDriver {
                     // Ridge retains the older reply-drain path and has only the dock-wide list
                     // available here. Navarro replaces this after SKE with the verified list from
                     // this exact head.
-                    if !profile.per_head_onehot {
+                    if !profile.perhead_onehot() {
                         let vf = hdcp::compute_v_full(&kd, &session.rxid_list);
                         let mut ack = [0u8; drm_hdcp::V_PRIME_HALF_LEN];
                         ack.copy_from_slice(&vf[drm_hdcp::V_PRIME_HALF_LEN..]);
@@ -2082,13 +2067,13 @@ impl VinoDriver {
                         cp_ctr,
                         head as u8,
                         stream_id,
-                        profile.per_head_onehot,
+                        profile.perhead_onehot(),
                     )?;
                     let frame =
                         cp::seal_interactive(&session.ks, &session.riv, id, wseq, &content)?;
                     Self::submit_cp_frame(dev, &mut out_q, &frame)?;
                     sent += 1;
-                    let d = if profile.per_head_onehot {
+                    let d = if profile.perhead_onehot() {
                         Self::wait_perhead_push(
                             dev,
                             ep84_q.as_mut(),
@@ -2111,7 +2096,7 @@ impl VinoDriver {
                     acks += d.acks;
                     rejects += d.rejects;
                     fresh_rrx = fresh_rrx.or(d.perhead_rrx);
-                    if profile.per_head_onehot && d.perhead_mprime.is_none() {
+                    if profile.perhead_onehot() && d.perhead_mprime.is_none() {
                         pr_err!(
                             "vino: head {head} downstream HDCP never returned M'/Stream_Ready\n"
                         );
@@ -2132,7 +2117,7 @@ impl VinoDriver {
                 match i {
                     // AKE restatements: head marker @23, HDCP msg-id tag @27, HDCP field @28..
                     0 | 1 | 2 | 3 | 4 | 5 => {
-                        cp::connector_marker(&mut c, head as u8, profile.per_head_onehot);
+                        cp::connector_marker(&mut c, head as u8, profile.perhead_onehot());
                         c[27] = match i {
                             0 => 0x02, // AKE_Init (rtx)
                             1 => 0x13, // AKE_Transmitter_Info
@@ -2202,7 +2187,7 @@ impl VinoDriver {
                 let frame = cp::seal_interactive(&session.ks, &session.riv, id, wseq, &c)?;
                 Self::submit_cp_frame(dev, &mut out_q, &frame)?;
                 sent += 1;
-                let mut d = if profile.per_head_onehot && i <= 5 {
+                let mut d = if profile.perhead_onehot() && i <= 5 {
                     let want = match i {
                         0 => ake::id::AKE_SEND_CERT,
                         1 => 0x14, // DisplayLink AKE_Receiver_Info
@@ -2219,7 +2204,7 @@ impl VinoDriver {
                         want,
                         Delta::from_millis(30),
                     )
-                } else if profile.per_head_onehot {
+                } else if profile.perhead_onehot() {
                     Self::lockstep_reply(
                         dev,
                         ep84_q.as_mut(),
@@ -2245,7 +2230,7 @@ impl VinoDriver {
                 // result; H' and pairing info are later milestones, and DLM sends no LC_Init
                 // (i == 3) until both have crossed EP84. Both platforms need the wait and the
                 // drain, or the head authenticates on material that never arrived.
-                if i == 2 && !profile.per_head_onehot {
+                if i == 2 && !profile.perhead_onehot() {
                     hold_until(send_at, HDCP_HPRIME_WAIT_US);
                     let dh = Self::drain_ep84(
                         dev,
@@ -2259,7 +2244,7 @@ impl VinoDriver {
                     perhead_repeater = perhead_repeater.or(dh.perhead_repeater);
                     d.add(dh);
                 }
-                if i == 2 && profile.per_head_onehot {
+                if i == 2 && profile.perhead_onehot() {
                     let Some(rrx_h) = fresh_rrx else {
                         cp_ctr += 1;
                         wseq += ((content_len + 15) / 16) as u32;
@@ -2309,7 +2294,7 @@ impl VinoDriver {
                     vino_debug!("vino: head {head} downstream H' verified\n");
                 }
 
-                if i == 3 && profile.per_head_onehot {
+                if i == 3 && profile.perhead_onehot() {
                     let Some(lprime) = d.perhead_lprime else {
                         pr_err!("vino: head {head} downstream HDCP returned no L'\n");
                         return Err(EPROTO);
@@ -2324,7 +2309,7 @@ impl VinoDriver {
                     vino_debug!("vino: head {head} downstream L' verified\n");
                 }
 
-                if i == 4 && profile.per_head_onehot {
+                if i == 4 && profile.perhead_onehot() {
                     let Some((list_header, vprime)) = d.perhead_v else {
                         pr_err!(
                             "vino: head {head} downstream HDCP returned no ReceiverID_List/V'\n"
@@ -2350,7 +2335,7 @@ impl VinoDriver {
                     vino_debug!("vino: head {head} downstream V' verified\n");
                 }
 
-                if i == 5 && profile.per_head_onehot {
+                if i == 5 && profile.perhead_onehot() {
                     let Some(status) = d.perhead_auth_status else {
                         pr_err!(
                             "vino: head {head} downstream HDCP returned no receiver-auth status\n"
@@ -2411,32 +2396,16 @@ impl VinoDriver {
             head_ok[head] = true;
             heads_authenticated += 1;
         }
-        if profile.per_head_auth {
-            pr_info!(
-                "vino: {heads_authenticated}/{} head(s) authenticated\n",
-                connector_count
-            );
-        } else {
-            // With no per-head SKE there is no per-head video key to derive, and the link session
-            // key is the only one the dock and host share. Give every head that, with its own
-            // content nonce.
-            for head in 0..connector_count {
-                video_keys[head] = kernel::crypto::Secret::zeroed();
-                video_keys[head][..16].copy_from_slice(&session.ks[..]);
-                let vnonce =
-                    cp::stream_content_nonce(&session.riv, profile.geometry().stream_id(head as u8));
-                video_keys[head][16..24].copy_from_slice(&vnonce);
-            }
-            pr_info!(
-                "vino: platform has no per-head authentication; link AKE only, video keys from the link session\n"
-            );
-        }
+        pr_info!(
+            "vino: {heads_authenticated}/{} head(s) authenticated\n",
+            connector_count
+        );
 
         // Navarro performs one dock-wide state transition after the last per-connector AKE and
         // before any connector finalizer. This message was absent from vino even though its
         // authenticated DLM reply reports state 2. Keep it Navarro-only until a Ridge transcript
         // establishes that platform's behavior.
-        if profile.per_head_onehot {
+        if profile.perhead_onehot() {
             let state = cp::post_auth_state_req(cp_ctr)?;
             let frame =
                 cp::seal_interactive(&session.ks, &session.riv, 0x15, wseq, &state)?;
@@ -2516,7 +2485,7 @@ impl VinoDriver {
 
         // Ridge commits after finalization. Navarro has already committed at its measured
         // post-0x15/pre-0x16 boundary above.
-        if !profile.navarro_mode_words {
+        if !profile.is_navarro() {
             dev.control_send(
                 0x24,
                 0x40, /* VENDOR_OUT */
@@ -2563,7 +2532,7 @@ impl VinoDriver {
         }
 
         // Complete downstream discovery on the authenticated counter stream.
-        if profile.per_head_onehot {
+        if profile.perhead_onehot() {
             // Navarro's authenticated DLM transcript is a compact, ordered transaction. Keep it
             // separate from Ridge's older retry-heavy discovery below: hundreds of extra status
             // polls delayed Navarro's first mode by ~23 seconds and changed every live counter.
@@ -2702,7 +2671,7 @@ impl VinoDriver {
             // when its per-head display-capability transaction reported no monitor. Navarro has no
             // such transaction, so discover all four physical sockets directly.
             for head in 0..connector_count {
-                if profile.per_head_auth && head != 0 && !heads_present[head] {
+                if head != 0 && !heads_present[head] {
                     continue;
                 }
                 let hu8 = head as u8;
@@ -3370,27 +3339,6 @@ impl usb::Driver for VinoDriver {
             // whether the platform actually requires its sealed stream-open, or whether correct
             // record framing alone is enough. It is off by default because the way a dock rejects
             // a malformed video write is to reset itself, taking the control session with it.
-            let force_video = *crate::module_parameters::force_video.value() != 0;
-            // `force_video` remains useful for profiles whose established ARM/training path is
-            // merely disabled for an experiment. Navarro has no such fallback: its observed
-            // stream-open is a different sealed message, and forcing the Ridge ARM burst makes
-            // the dock watchdog-reset. Do not let a generic debug knob silently bypass that
-            // protocol boundary.
-            let forced_supported = force_video && info.video_arm;
-            if force_video && !info.video_supported {
-                if forced_supported {
-                    dev_info!(
-                        cdev,
-                        "vino: force_video set -- driving video this profile disables\n"
-                    );
-                } else {
-                    dev_warn!(
-                        cdev,
-                        "vino: force_video ignored -- this profile has no established video-open path\n"
-                    );
-                }
-            }
-            d.set_video_supported(info.video_supported || forced_supported);
             // This device's codec geometry, passed into every codec call made on its behalf.
             // It is per device because two docks of different generations lay a strip's sixteen
             // blocks over different pixels; see `video::wht::Geometry`.
@@ -3398,7 +3346,6 @@ impl usb::Driver for VinoDriver {
                 info.strip_blocks_x,
                 info.interlaced_bands,
                 info.band_parity_bit,
-                info.aux_is_pad_count,
                 info.head_sub_shift,
                 info.stream_id_mask,
                 info.dock_buffers,
@@ -3408,8 +3355,7 @@ impl usb::Driver for VinoDriver {
                 info.max_refresh_hz,
                 info.max_head_clock_khz,
             );
-            d.set_video_arm(info.video_arm);
-            d.set_navarro_mode_words(info.navarro_mode_words);
+            d.set_navarro(info.is_navarro());
             d.set_connectors(info.connectors);
         }
         let bringup = BringUp::new(ddev.clone(), info)?;
@@ -3494,10 +3440,6 @@ kernel::module_usb_driver! {
         rtc_utc_offset_minutes: i32 {
             default: 0,
             description: "Local UTC offset used by Navarro RTC synchronization (minutes east of UTC)",
-        },
-        force_video: u8 {
-            default: 0,
-            description: "Drive video on docks whose profile disables it (experiment; may reset the dock)",
         },
         idle_opens: u8 {
             default: 0,

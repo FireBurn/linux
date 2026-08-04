@@ -837,20 +837,13 @@ pub(super) struct VinoDrmData {
     /// Set once the dock engages the CP cipher (`wsub=0x45` acks > 0); EP08 scanout is gated on it.
     /// Per device, so a second connected dock does not share one dock's engagement state.
     cp_engaged: core::sync::atomic::AtomicBool,
-    /// Whether this dock's video path is understood well enough to write to it.
-    ///
-    /// The Ridge arm/training sequence makes Navarro hard-reset on the very first EP08 write, so
-    /// the platform gates video until its own sequence is worked out. Everything short of video --
-    /// control session, EDID, modes, hotplug -- works either way, and a dock that resets every few
-    /// seconds cannot be developed against at all.
-    video_supported: core::sync::atomic::AtomicBool,
     /// This device's codec geometry, packed; see [`VinoDrmData::geometry`] and
     /// [`super::video::wht::Geometry`].
     codec_geometry: core::sync::atomic::AtomicU32,
-    /// Whether to prefix the cold ARM burst to the first frame; see `DockProfile::video_arm`.
-    video_arm: core::sync::atomic::AtomicBool,
-    /// Whether the mode set carries the DL7400's offset-46/48 words; see `DockProfile`.
-    navarro_mode_words: core::sync::atomic::AtomicBool,
+    /// Which protocol generation this dock speaks; see `DockProfile::generation`. The two
+    /// platforms differ in their initialisation, per-head HDCP framing, stream open and mode
+    /// description, so one flag drives all of them rather than three that can disagree.
+    is_navarro: core::sync::atomic::AtomicBool,
     /// How many downstream connectors this dock answers a presence probe for; see
     /// `DockProfile::connectors`. Ridge: 2; Navarro: all four physical sockets.
     connectors: core::sync::atomic::AtomicU8,
@@ -1055,11 +1048,9 @@ impl VinoDrmData {
             edid_target: core::sync::atomic::AtomicU32::new(NO_EDID_TARGET),
             edid_caught <- new_mutex!(None),
             self_blanked: core::sync::atomic::AtomicU32::new(0),
-            video_supported: core::sync::atomic::AtomicBool::new(true),
             codec_geometry: core::sync::atomic::AtomicU32::new(0),
-            navarro_mode_words: core::sync::atomic::AtomicBool::new(false),
             connectors: core::sync::atomic::AtomicU8::new(HEADS as u8),
-            video_arm: core::sync::atomic::AtomicBool::new(true),
+            is_navarro: core::sync::atomic::AtomicBool::new(false),
             video_keys <- new_mutex!(core::array::from_fn(
                 |_| kernel::crypto::Secret::zeroed()
             )),
@@ -1238,23 +1229,7 @@ impl VinoDrmData {
         self.color.lock().get(head).copied().flatten()
     }
 
-    /// Record whether this dock has engaged its CP cipher (`wsub=0x45` acks > 0). The plane
-    /// scanout path is gated on it, so pushing frames at a dock whose CP channel is dead cannot
-    /// fault it. Set by the bring-up work item once the CP setup completes.
-    /// Record whether this dock wants the cold ARM burst.
-    pub(super) fn set_video_arm(&self, ok: bool) {
-        self.video_arm.store(ok, Ordering::Release);
-    }
 
-    /// Record whether this dock's video path may be driven; see [`VinoDrmData::video_supported`].
-    pub(super) fn set_video_supported(&self, ok: bool) {
-        self.video_supported.store(ok, Ordering::Release);
-    }
-
-    /// Whether video writes are permitted for this dock.
-    pub(super) fn video_supported(&self) -> bool {
-        self.video_supported.load(Ordering::Acquire)
-    }
 
     /// Record this device's codec geometry; see [`Self::geometry`].
     pub(super) fn set_codec_geometry(
@@ -1262,7 +1237,6 @@ impl VinoDrmData {
         strip_blocks_x: usize,
         interlaced: bool,
         band_parity: bool,
-        aux_is_pad: bool,
         head_sub_shift: u8,
         stream_id_mask: u8,
         dock_buffers: u8,
@@ -1270,7 +1244,6 @@ impl VinoDrmData {
         let packed = (strip_blocks_x as u32 & 0xff)
             | ((interlaced as u32) << 8)
             | ((band_parity as u32) << 9)
-            | ((aux_is_pad as u32) << 10)
             | ((head_sub_shift as u32) << 16)
             | ((stream_id_mask as u32) << 20)
             | ((dock_buffers as u32) << 28);
@@ -1291,21 +1264,31 @@ impl VinoDrmData {
             ((p & 0xff) as usize).max(1),
             p & (1 << 8) != 0,
             p & (1 << 9) != 0,
-            p & (1 << 10) != 0,
             ((p >> 16) & 0xf) as u8,
             ((p >> 20) & 0xff) as u8,
             ((p >> 28) & 0xf) as u8,
         )
     }
 
-    /// Record whether mode sets carry the DL7400's offset-46/48 words.
-    pub(super) fn set_navarro_mode_words(&self, on: bool) {
-        self.navarro_mode_words.store(on, Ordering::Release);
+
+    /// Record which protocol generation this dock speaks.
+    pub(super) fn set_navarro(&self, on: bool) {
+        self.is_navarro.store(on, Ordering::Release);
+    }
+
+    /// Whether this dock speaks the Navarro protocol.
+    pub(super) fn is_navarro(&self) -> bool {
+        self.is_navarro.load(Ordering::Acquire)
     }
 
     /// Whether mode sets carry the DL7400's offset-46/48 words.
     pub(super) fn navarro_mode_words(&self) -> bool {
-        self.navarro_mode_words.load(Ordering::Acquire)
+        self.is_navarro()
+    }
+
+    /// Whether the first frame after a mode set carries the cold ARM burst.
+    pub(super) fn uses_arm_burst(&self) -> bool {
+        !self.is_navarro()
     }
 
     /// Record how many connectors this dock exposes; see [`DockProfile::connectors`].
@@ -1662,13 +1645,6 @@ impl VinoDrmData {
         duration_ms: i64,
         with_arm: bool,
     ) -> Result<u32> {
-        if !self.video_supported() {
-            // The platform's video sequence is not established yet. Writing the Ridge one makes
-            // this dock hard-reset on the first EP08 transfer, which takes the control session,
-            // the EDID and the connectors down with it.
-            vino_debug!("vino: head={head} video suppressed -- platform video path not enabled\n");
-            return Ok(0);
-        }
         if frames.is_empty() {
             return Err(kernel::error::code::EINVAL);
         }
@@ -2220,7 +2196,7 @@ impl VinoDrmData {
             let mut ei = 0usize;
             // Replaying Ridge's choreography at Navarro leaves its video endpoint unarmed, so the
             // timeline follows the dock, not the driver.
-            let timeline: &ColdTimeline = if self.video_arm.load(Ordering::Acquire) {
+            let timeline: &ColdTimeline = if self.uses_arm_burst() {
                 &COLD_RIDGE
             } else {
                 &COLD_NAVARRO
@@ -2339,7 +2315,7 @@ impl VinoDrmData {
             // Name the streams vino will not drive, before any head sends pixels. DLM does this
             // for every connector without a monitor and only then starts a frame; the connectors
             // that are about to stream open with their pipe descriptor instead.
-            if !self.video_arm.load(Ordering::Acquire)
+            if !self.uses_arm_burst()
                 && *crate::module_parameters::idle_opens.value() != 0
             {
                 let idle = !sent & ((1u32 << HEADS) - 1);
@@ -2490,7 +2466,7 @@ impl VinoDrmData {
     /// Build the records that close a frame, in this dock's format.
     fn build_frame_trailer(&self, head: u8, seq0: u32) -> super::video::wht::FrameTrailer {
         let geom = self.geometry();
-        if self.video_arm.load(Ordering::Acquire) {
+        if self.uses_arm_burst() {
             super::video::wht::frame_trailer(geom, head, seq0)
         } else {
             super::video::wht::navarro_frame_trailer(geom, head, seq0)
@@ -2502,7 +2478,7 @@ impl VinoDrmData {
     /// Ridge carries its slot transition in the three-record trailer. Navarro terminates the old
     /// frame after its close record and starts the next USB transfer with this opener instead.
     fn build_frame_opener(&self, head: u8, seq0: u32, prologue: bool) -> Option<[u8; 32]> {
-        if self.video_arm.load(Ordering::Acquire) || prologue {
+        if self.uses_arm_burst() || prologue {
             None
         } else {
             Some(super::video::wht::navarro_frame_opener(self.geometry(), head, seq0))
@@ -2552,7 +2528,7 @@ impl VinoDrmData {
     /// Only heads whose video queue is already open are fed: a head that has never streamed has
     /// nothing to keep alive, and opening a queue here would start a stream nothing follows.
     pub(super) fn send_video_keepalive(&self, dev: &BoundInterface<'_>) {
-        if self.video_arm.load(Ordering::Acquire) || self.shutting_down.load(Ordering::Acquire) {
+        if self.uses_arm_burst() || self.shutting_down.load(Ordering::Acquire) {
             return;
         }
         let now = Instant::<Monotonic>::now();
@@ -2585,7 +2561,7 @@ impl VinoDrmData {
     }
 
     fn build_stream_prefix_buf(&self, head: usize) -> Result<KVec<u8>> {
-        if self.video_arm.load(Ordering::Acquire) {
+        if self.uses_arm_burst() {
             self.build_arm_burst_buf(head)
         } else {
             self.build_navarro_prologue_buf(head)
@@ -2607,7 +2583,7 @@ impl VinoDrmData {
     /// and, because the prologue then also started at block 0, used the head's first keystream
     /// block twice.
     fn build_stream_open_buf(&self, head: usize) -> Result<Option<KVec<u8>>> {
-        if self.video_arm.load(Ordering::Acquire) {
+        if self.uses_arm_burst() {
             return Ok(None);
         }
         let keys = self.video_keys.lock();
@@ -2635,7 +2611,7 @@ impl VinoDrmData {
     /// `aux=0x0002` form restates the mode and goes out with the frame that carries the prologue,
     /// which is the frame right after a mode set.
     fn build_stream_report_buf(&self, head: usize) -> Result<Option<KVec<u8>>> {
-        if self.video_arm.load(Ordering::Acquire) {
+        if self.uses_arm_burst() {
             return Ok(None);
         }
         let keys = self.video_keys.lock();
@@ -4767,13 +4743,6 @@ impl plane::DriverPlane for VinoPlane {
 /// Compress and submit one coalesced primary-plane flip on the deferred worker. Keeping all slow
 /// work here makes the DRM atomic callback bounded to state inspection plus an `ARef` increment.
 fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: PendingScanout) {
-    if !data.video_supported() {
-        // Every scanout write funnels through here. See `VinoDrmData::video_supported`: the Ridge
-        // video sequence hard-resets this platform's dock on the first EP08 transfer, taking the
-        // control session and the connectors with it, so video stays off until the platform's own
-        // sequence is established.
-        return;
-    }
     use core::sync::atomic::Ordering::Relaxed;
 
     let head_i = frame.head as usize;
@@ -4930,7 +4899,7 @@ fn run_pending_scanout(dev: &BoundInterface<'_>, data: &VinoDrmData, frame: Pend
                 // the unbounded keyframe loop that made a static desktop stream ~2.7 MB/s per head.
                 // A dock that tears the link down over a silent video endpoint has to be re-fed
                 // whether or not anything changed, so its repaint is periodic and unbudgeted.
-                let keepalive = !data.video_arm.load(Ordering::Acquire);
+                let keepalive = data.is_navarro();
                 let unbudgeted = sustaining || keepalive;
                 let charged = unbudgeted
                     || data.settle_budget[head_i]

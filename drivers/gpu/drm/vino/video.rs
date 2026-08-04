@@ -492,12 +492,6 @@ pub(crate) mod wht {
         /// image records carry only the connector, and fill to the stride cap across band
         /// boundaries.
         pub(crate) band_parity_bit: bool,
-        /// Whether an image record's `aux` carries its zero-padding count.
-        ///
-        /// Both Ridge and Navarro image records count their 0..15 padding bytes here. Navarro also
-        /// uses `aux` as a subtype on non-image records; its fixed black carriers masked the image
-        /// rule because their 4048-byte strides require no padding.
-        pub(crate) aux_is_pad_count: bool,
         /// How the dock encodes a head in a video record's `sub` field, as a left shift.
         ///
         /// Ridge puts the bare head number there (0, 1). Navarro shifts it by three: its records
@@ -526,7 +520,6 @@ pub(crate) mod wht {
             strip_blocks_x: usize,
             interlaced_bands: bool,
             band_parity_bit: bool,
-            aux_is_pad_count: bool,
             head_sub_shift: u8,
             stream_id_mask: u8,
             dock_buffers: u8,
@@ -540,7 +533,6 @@ pub(crate) mod wht {
                 strip_h_shift,
                 interlaced_bands,
                 band_parity_bit,
-                aux_is_pad_count,
                 head_sub_shift,
                 stream_id_mask,
                 dock_buffers: dock_buffers.max(1),
@@ -603,7 +595,6 @@ pub(crate) mod wht {
         strip_h_shift: 4,
         interlaced_bands: false,
         band_parity_bit: true,
-        aux_is_pad_count: true,
         head_sub_shift: 0,
         stream_id_mask: 0x08,
         dock_buffers: 2,
@@ -1225,9 +1216,12 @@ pub(crate) mod wht {
         let Geometry {
             band_parity_bit,
             interlaced_bands,
-            aux_is_pad_count,
             ..
         } = geom;
+        // Both platforms count an image record's 0..15 padding bytes in `aux`. Navarro also uses
+        // `aux` as a subtype on non-image records; its fixed black carriers masked the image rule
+        // because their 4048-byte strides require no padding.
+        let aux_is_pad_count = true;
         const PREFIX: usize = 8;
         const STRIDE_CAP: usize = 0x0ff0;
         // Allocation boundary only, not wire framing.
