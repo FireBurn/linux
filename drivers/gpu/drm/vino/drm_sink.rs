@@ -3061,9 +3061,15 @@ impl VinoDrmData {
     ///
     /// Rather than carry a second EDID source, this hands the head to DRM's own override, which
     /// already accepts a blob two ways -- `drm_kms_helper.edid_firmware=<connector>:<path>` or a
-    /// write to the connector's debugfs `edid_override`. The core applies it only when a connector
-    /// reports connected and its `get_modes` returns none, so both of those become this head's
-    /// behaviour while no EDID has been read.
+    /// write to the connector's debugfs `edid_override`. The core applies it only to a connector
+    /// that is connected and whose `get_modes` returned none, so all this flag does is make the
+    /// head report no modes of its own while no EDID has been read.
+    ///
+    /// ⚠ It deliberately does NOT report the head connected. Connecting a modeless connector hands
+    /// fbdev emulation a blank cheque, and its 640x480 default mode-set resets this dock -- into a
+    /// 25 s re-enumeration loop, measured. Userspace supplies the description and then forces the
+    /// connector on (`echo on > .../status`), in that order, which is also what makes the whole
+    /// sequence race-free.
     ///
     /// ⚠ An override describes the SINK, not the link. A blob claiming a mode the converter cannot
     /// carry gives a black screen just the same: this substitutes for a broken read, it does not
@@ -3170,14 +3176,17 @@ impl VinoDrmData {
                 Ok(true)
             }
             None => {
-                // The engage messages above were still sent, so the dock's own state is whatever
-                // it would have been; only the sink's description is coming from elsewhere.
+                // Deliberately NOT published here, even under `edid_override`. A connector that
+                // reports connected with no modes is immediately mode-set by fbdev emulation at
+                // its own 640x480 default, and driving that at the dock resets it -- measured, in
+                // a 25 s re-enumeration loop. The head stays disconnected until userspace has
+                // supplied the description AND forced the connector on; see `edid_from_userspace`.
                 if self.edid_from_userspace(head as usize) {
                     pr_info!(
-                        "vino: head {head} re-engaged with no EDID from the dock -- publishing it \
-                         anyway for DRM's override (edid_override)\n"
+                        "vino: head {head} has no EDID from the dock and is waiting for one from \
+                         userspace (edid_override); it stays disconnected until then\n"
                     );
-                    return Ok(true);
+                    return Ok(false);
                 }
                 vino_debug!(
                     "vino: head {head} re-engaged but no EDID came back -- no monitor, or it is \
