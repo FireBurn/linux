@@ -1461,9 +1461,23 @@ pub(super) fn parse_edid_from_reply(
             continue;
         }
         let edid = &inner[EDID_OFF..];
+        // Say what arrived, not just that nothing valid did. "no EDID came back" is true of a
+        // sink that answered with a block this rejected and of one that never answered at all,
+        // and those want opposite fixes.
+        if crate::debug_enabled() {
+            pr_info!(
+                "vino: EDID reply candidate: inner {} B, payload {} B, first 8 {:02x?}\n",
+                inner.len(),
+                edid.len(),
+                &edid[..8.min(edid.len())]
+            );
+        }
         // Validate the EDID base-block magic `00 FF FF FF FF FF FF 00`.
         const MAGIC: [u8; 8] = [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00];
         if edid[..8] != MAGIC {
+            if crate::debug_enabled() {
+                pr_info!("vino: EDID reply rejected: bad base-block magic\n");
+            }
             continue;
         }
         // ...and its checksum. The magic is only eight bytes and a dock with an empty port can
@@ -1474,7 +1488,17 @@ pub(super) fn parse_edid_from_reply(
             continue;
         }
         if edid[..128].iter().fold(0u8, |a, b| a.wrapping_add(*b)) != 0 {
+            if crate::debug_enabled() {
+                pr_info!("vino: EDID reply rejected: base block checksum\n");
+            }
             continue;
+        }
+        if crate::debug_enabled() {
+            pr_info!(
+                "vino: EDID base block accepted: {} extension block(s) declared, {} B available\n",
+                edid[126],
+                edid.len()
+            );
         }
         let total = ((1 + edid[126] as usize) * 128).min(edid.len());
         let mut out = KVec::with_capacity(total, GFP_KERNEL)?;

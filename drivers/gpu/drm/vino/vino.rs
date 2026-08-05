@@ -25,7 +25,7 @@ use kernel::{
 };
 
 /// Whether the load-time `debug` parameter requested verbose protocol and scanout diagnostics.
-fn debug_enabled() -> bool {
+pub(crate) fn debug_enabled() -> bool {
     *crate::module_parameters::debug.value() != 0
 }
 

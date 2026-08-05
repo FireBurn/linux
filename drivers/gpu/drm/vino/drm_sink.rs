@@ -3246,7 +3246,8 @@ impl VinoDrmData {
             }
         };
         // Decode the downstream status at inner bytes 22..26 as well as the handler ID.
-        let (id, status, _) = super::cp::probe_reply_status(&link.ks, &link.riv, &reply[..got])?;
+        let (id, status, ready) =
+            super::cp::probe_reply_status(&link.ks, &link.riv, &reply[..got])?;
         // Presence is bit 0x10 of inner byte 23, which lands in bits 8..15 of the status word:
         // `05 11 27 00` for an occupied connector, `05 01 <20|21|60|61> 00` for an empty one.
         // Which handler answered says nothing about it -- both docks reply `id=0x44` either way.
@@ -3272,7 +3273,7 @@ impl VinoDrmData {
             // as the wrong dock's is exactly how this session lost time.
             pr_info!(
                 "vino: [{}conn] head {head} presence reply id={id:#06x} status={status:#010x} \
-                 -> present={present} (was id={:#06x} status={:#06x})\n",
+                 -> present={present} ready={ready} (was id={:#06x} status={:#06x})\n",
                 self.connector_count(),
                 prev >> 16,
                 prev & 0xffff
