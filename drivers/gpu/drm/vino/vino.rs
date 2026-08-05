@@ -841,9 +841,10 @@ impl usb::Driver for VinoDriver {
             // endpoint map, and needing a debug build to see it costs a whole test round trip.
             dev_info!(
                 cdev,
-                "vino: matched profile \"{}\", video endpoints {:#04x?}\n",
+                "vino: matched profile \"{}\", video endpoints {:#04x?}, 10-bit capable {}\n",
                 info.name,
-                info.video_eps
+                info.video_eps,
+                info.hdr_capable
             );
         }
         if ifnum != 0 {

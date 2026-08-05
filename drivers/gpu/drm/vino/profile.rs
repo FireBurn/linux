@@ -98,6 +98,14 @@ pub(crate) struct DockProfile {
     /// Ridge's is DLM's declared `pixel_per_second_limit` for both heads. The DL7400's is the
     /// dual-head rate DLM was measured sustaining.
     pub(crate) pixel_budget: u32,
+    /// Whether this dock has the DL-7000 "10bit profile", i.e. can be driven at 10 bits per
+    /// channel for HDR.
+    ///
+    /// DisplayLink documents HDR10 as DL-7000 only, and the D6000's own head reports
+    /// `HDR supported = False` to Windows even with an HDR-capable monitor on it -- so this is a
+    /// silicon generation property, not a mode one. It says the dock *could* be put in that
+    /// profile; it does not say vino knows how to ask yet. See `docs/hdr.md` §6.
+    pub(crate) hdr_capable: bool,
     /// Outstanding EP84 reads to keep posted.
     ///
     /// Navarro needs exactly one, as DLM keeps: a deeper queue delays an EDID reply behind an
@@ -150,6 +158,7 @@ pub(crate) static PROFILE_D6000: DockProfile = DockProfile {
     max_refresh_hz: 120,
     max_head_clock_khz: 655_350,
     pixel_budget: 884_736_000,
+    hdr_capable: false,
     ep84_queue_depth: 4,
 };
 
@@ -177,6 +186,7 @@ pub(crate) static PROFILE_DL7400: DockProfile = DockProfile {
     max_refresh_hz: u32::MAX,
     max_head_clock_khz: 699_500,
     pixel_budget: 1_216_512_000,
+    hdr_capable: true,
     ep84_queue_depth: 1,
 };
 

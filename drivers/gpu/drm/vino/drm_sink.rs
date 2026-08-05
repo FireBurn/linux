@@ -857,6 +857,12 @@ pub(super) struct VinoDrmData {
     /// This device's codec geometry, packed; see [`VinoDrmData::geometry`] and
     /// [`super::video::wht::Geometry`].
     codec_geometry: core::sync::atomic::AtomicU32,
+    /// Bit `h` set when head `h`'s committed framebuffer is 10 bits per channel.
+    ///
+    /// Separate from `codec_geometry` because it is the one part of the codec's configuration that
+    /// is neither device-wide nor fixed: the DL7400 negotiates depth per connector, measured on
+    /// Windows holding one head at 8 bits while the other ran at 10 (`docs/hdr.md` §0.4).
+    head_ten_bit: core::sync::atomic::AtomicU32,
     /// Which protocol generation this dock speaks; see `DockProfile::generation`. The two
     /// platforms differ in their initialisation, per-head HDCP framing, stream open and mode
     /// description, so one flag drives all of them rather than three that can disagree.
@@ -1066,6 +1072,7 @@ impl VinoDrmData {
             edid_caught <- new_mutex!(None),
             self_blanked: core::sync::atomic::AtomicU32::new(0),
             codec_geometry: core::sync::atomic::AtomicU32::new(0),
+            head_ten_bit: core::sync::atomic::AtomicU32::new(0),
             connectors: core::sync::atomic::AtomicU8::new(HEADS as u8),
             is_navarro: core::sync::atomic::AtomicBool::new(false),
             video_keys <- new_mutex!(core::array::from_fn(
@@ -1285,6 +1292,34 @@ impl VinoDrmData {
             ((p >> 20) & 0xff) as u8,
             ((p >> 28) & 0xf) as u8,
         )
+    }
+
+    /// This device's codec geometry at one head's committed sample depth.
+    ///
+    /// Every path that touches pixels wants this rather than [`Self::geometry`]: the depth decides
+    /// the entropy coder's escape ceiling, and getting it wrong desynchronises the dock's decoder
+    /// rather than merely degrading the picture. See [`super::video::wht::Depth`].
+    pub(super) fn geometry_for_head(&self, head: u8) -> super::video::wht::Geometry {
+        let ten = self.head_ten_bit.load(Ordering::Acquire) & (1 << u32::from(head)) != 0;
+        self.geometry().with_depth(if ten {
+            super::video::wht::Depth::Ten
+        } else {
+            super::video::wht::Depth::Eight
+        })
+    }
+
+    /// Record the sample depth of the framebuffer a head is scanning out.
+    ///
+    /// Driven by the committed framebuffer's fourcc rather than by any state of our own, so it
+    /// cannot drift from the pixels actually in hand. A format the codec does not know leaves the
+    /// head where it was; `atomic_check` is what rejects those, and a plane list that only offers
+    /// `XRGB8888` means this never sees one.
+    pub(super) fn set_head_depth(&self, head: u8, depth: super::video::wht::Depth) {
+        let bit = 1u32 << u32::from(head);
+        match depth {
+            super::video::wht::Depth::Ten => self.head_ten_bit.fetch_or(bit, Ordering::Release),
+            super::video::wht::Depth::Eight => self.head_ten_bit.fetch_and(!bit, Ordering::Release),
+        };
     }
 
     /// Record which protocol generation this dock speaks.
@@ -3383,6 +3418,11 @@ impl VinoDrmData {
         let head = frame.head as usize;
         if head >= HEADS || self.shutting_down.load(Ordering::Acquire) {
             return;
+        }
+        // The snapshot below is format-agnostic -- both layouts are four bytes per pixel -- so the
+        // depth only has to be recorded, not acted on, before the copy.
+        if let Some(depth) = super::video::wht::Depth::from_fourcc(fb.format()) {
+            self.set_head_depth(frame.head, depth);
         }
         let (source_w, source_h) = src_dims(frame.rotation, frame.w, frame.h);
         // Reserve a slot and lend its surface out, so the ~14.7 MB copy below runs with the pool

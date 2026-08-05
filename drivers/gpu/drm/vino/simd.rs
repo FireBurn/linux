@@ -612,8 +612,8 @@ pub(crate) fn bench() -> Result {
     const STRIPS: usize = 512;
     let geom: Geometry = RIDGE_GEOMETRY;
     let mut px = |x: usize, y: usize| {
-        let v = ((x * 7) ^ (y * 13)) as u8;
-        (v, v.wrapping_add(29), v.wrapping_add(83))
+        let v = (((x * 7) ^ (y * 13)) & 0xff) as u16;
+        (v, (v + 29) & 0xff, (v + 83) & 0xff)
     };
     let t = Instant::<Monotonic>::now();
     let mut bytes = 0usize;
@@ -643,7 +643,11 @@ pub(crate) fn bench() -> Result {
     // the three around it have no shuffle and no transpose, so they vectorise where it does not.
     let mut planes = ([0i32; PIXELS], [0i32; PIXELS], [0i32; PIXELS]);
     for i in 0..PIXELS {
-        let (y, cb, cr) = colour((i * 7) as u8, (i * 13) as u8, (i * 29) as u8);
+        let (y, cb, cr) = colour(
+            ((i * 7) & 0xff) as i32,
+            ((i * 13) & 0xff) as i32,
+            ((i * 29) & 0xff) as i32,
+        );
         planes.0[i] = cr;
         planes.1[i] = cb;
         planes.2[i] = y;
@@ -652,8 +656,8 @@ pub(crate) fn bench() -> Result {
 
     let t = Instant::<Monotonic>::now();
     for i in 0..N {
-        let v = core::hint::black_box(i as u8);
-        core::hint::black_box(colour(v, v.wrapping_add(29), v.wrapping_add(83)));
+        let v = core::hint::black_box((i & 0xff) as i32);
+        core::hint::black_box(colour(v, (v + 29) & 0xff, (v + 83) & 0xff));
     }
     let px_ns = ns_per(Instant::<Monotonic>::now() - t, N);
 
@@ -696,7 +700,7 @@ pub(crate) fn bench() -> Result {
     }
     let t = Instant::<Monotonic>::now();
     for i in 0..512 {
-        core::hint::black_box(colour_strip(&blocks, 0, (i % 64) as u16 * 16)?.len());
+        core::hint::black_box(colour_strip(geom, &blocks, 0, (i % 64) as u16 * 16)?.len());
     }
     let entropy_ns = ns_per(Instant::<Monotonic>::now() - t, 512);
     pr_info!(

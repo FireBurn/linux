@@ -98,6 +98,7 @@ pub(super) fn run_pending_scanout(
             color,
             direct,
             hashes,
+            depth: data.geometry_for_head(frame.head).depth(),
         },
         GFP_KERNEL,
     ) {
@@ -457,6 +458,12 @@ pub(super) struct PixelSource {
     /// Strip hashes computed during the snapshot -- see [`ShadowSurface::hashes`]. Carried through
     /// so the encoder does not re-read the whole surface just to re-derive them.
     hashes: KVVec<u64>,
+    /// Bits per channel of the snapshot's pixels, and therefore of the frame the codec produces.
+    ///
+    /// Both layouts this handles are four bytes per pixel, so the snapshot copy above is
+    /// depth-agnostic and only the unpack here differs: `XRGB8888` is three bytes in the low 24
+    /// bits, `XRGB2101010` three 10-bit fields in the low 30.
+    depth: crate::video::wht::Depth,
 }
 
 /// Whether the encoder can read output pixels straight out of the snapshot. See
@@ -473,9 +480,28 @@ fn direct_pixel_map(
 }
 
 impl PixelSource {
+    /// Split one packed 32-bit pixel into channels at this source's depth.
+    #[inline]
+    fn unpack(&self, p: u32) -> (u16, u16, u16) {
+        match self.depth {
+            // Little-endian XRGB8888.
+            crate::video::wht::Depth::Eight => (
+                ((p >> 16) & 0xff) as u16,
+                ((p >> 8) & 0xff) as u16,
+                (p & 0xff) as u16,
+            ),
+            // XRGB2101010: two ignored bits, then R, G, B ten bits each.
+            crate::video::wht::Depth::Ten => (
+                ((p >> 20) & 0x3ff) as u16,
+                ((p >> 10) & 0x3ff) as u16,
+                (p & 0x3ff) as u16,
+            ),
+        }
+    }
+
     /// Read one gamma-corrected pixel in untransformed framebuffer coordinates.
     #[inline]
-    fn source_px(&self, sx: usize, sy: usize) -> (u8, u8, u8) {
+    fn source_px(&self, sx: usize, sy: usize) -> (u16, u16, u16) {
         if sx >= self.w || sy >= self.h {
             return (0, 0, 0);
         }
@@ -488,14 +514,28 @@ impl PixelSource {
         let Ok(bytes) = <[u8; 4]>::try_from(chunk) else {
             return (0, 0, 0);
         };
-        let p = u32::from_le_bytes(bytes);
-        let (r, g, b) = (
-            ((p >> 16) & 0xff) as u8,
-            ((p >> 8) & 0xff) as u8,
-            (p & 0xff) as u8,
-        );
+        let (r, g, b) = self.unpack(u32::from_le_bytes(bytes));
         match &self.color {
-            Some(pipeline) => pipeline.apply(r, g, b),
+            // ⚠ The colour pipeline's tables are 8-bit (`color.rs` is shared verbatim with evdi and
+            // its `GAMMA_LUT_SIZE` is 256), so a 10-bit surface is corrected at 8-bit precision and
+            // scaled back. That loses up to two low bits of a corrected pixel -- but ignoring the
+            // correction instead would leave a compositor's night-colour shift silently unapplied
+            // on exactly the outputs most likely to be colour-managed. Revisit with a 10-bit LUT if
+            // banding is ever measured on a corrected HDR head; see `docs/hdr.md`.
+            Some(pipeline) => match self.depth {
+                crate::video::wht::Depth::Eight => {
+                    let (r, g, b) = pipeline.apply(r as u8, g as u8, b as u8);
+                    (r as u16, g as u16, b as u16)
+                }
+                crate::video::wht::Depth::Ten => {
+                    let (r, g, b) = pipeline.apply((r >> 2) as u8, (g >> 2) as u8, (b >> 2) as u8);
+                    (
+                        (r as u16) << 2 | (r as u16 >> 6),
+                        (g as u16) << 2 | (g as u16 >> 6),
+                        (b as u16) << 2 | (b as u16 >> 6),
+                    )
+                }
+            },
             None => (r, g, b),
         }
     }
@@ -505,7 +545,7 @@ impl PixelSource {
     /// Keeping the transform in the immutable shared source gives serial and parallel encoding
     /// exactly the same sampler. Codec padding is black and never reads beyond the snapshot.
     #[inline]
-    fn px(&self, dx: usize, dy: usize) -> (u8, u8, u8) {
+    fn px(&self, dx: usize, dy: usize) -> (u16, u16, u16) {
         if self.direct {
             // The codec pads the surface up to whole strips and expects black outside the image, so
             // the bounds check stays: without it a read past the row wraps into the next one.
@@ -516,8 +556,14 @@ impl PixelSource {
             let Some(chunk) = self.pixels.get(off..off + 4) else {
                 return (0, 0, 0);
             };
-            // Little-endian XRGB8888: byte 0 is blue, 1 green, 2 red.
-            return (chunk[2], chunk[1], chunk[0]);
+            if let crate::video::wht::Depth::Eight = self.depth {
+                // Little-endian XRGB8888: byte 0 is blue, 1 green, 2 red.
+                return (chunk[2] as u16, chunk[1] as u16, chunk[0] as u16);
+            }
+            let Ok(bytes) = <[u8; 4]>::try_from(chunk) else {
+                return (0, 0, 0);
+            };
+            return self.unpack(u32::from_le_bytes(bytes));
         }
         if dx >= self.output_w || dy >= self.output_h {
             return (0, 0, 0);
@@ -742,6 +788,7 @@ pub(crate) fn parallel_rotation_matches_serial(rotation: plane::Rotation) -> Res
             color: None,
             direct: direct_pixel_map(rotation, &None, w, h, output_w, output_h),
             hashes: KVVec::new(),
+            depth: crate::video::wht::Depth::Eight,
         },
         GFP_KERNEL,
     )?;
@@ -793,7 +840,7 @@ fn encode_and_send_wht(
     w: usize,
     h: usize,
 ) -> Result {
-    let geom = data.geometry();
+    let geom = data.geometry_for_head(head);
     // Gate video on the matching mode-set reaching the dock. Plane updates run before the CRTC
     // enable queues that mode-set, and the dock rejects video on an unconfigured stream. Deferring
     // does not advance the codec sequence; the next scanout pass retries the frame.

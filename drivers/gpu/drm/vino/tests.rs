@@ -193,11 +193,11 @@ mod protocol {
     #[test]
     fn colour_frame_ep08_damage_selects_changed_strips() -> Result {
         // Deterministic gradient source (a plain fn item so it's Copy/reusable across calls).
-        fn g(x: usize, y: usize) -> (u8, u8, u8) {
+        fn g(x: usize, y: usize) -> (u16, u16, u16) {
             (
-                ((x * 7) & 0xff) as u8,
-                ((y * 5) & 0xff) as u8,
-                (((x + y) * 3) & 0xff) as u8,
+                ((x * 7) & 0xff) as u16,
+                ((y * 5) & 0xff) as u16,
+                (((x + y) * 3) & 0xff) as u16,
             )
         }
         let total = |fs: &KVec<KVec<u8>>| fs.iter().map(|f| f.len()).sum::<usize>();
@@ -1094,6 +1094,76 @@ mod protocol {
         // AC clamps to the 12-bit signed long-token range.
         assert_eq!(wht::quantize(1_000_000, 16), 2047);
         assert_eq!(wht::quantize(-1_000_000, 16), -2048);
+    }
+
+    /// The escape codebook's ceiling is part of the wire format and follows the sample depth.
+    ///
+    /// Measured against a DL7400 driven by Windows in its 10-bit profile (`docs/hdr.md` §0.2): a
+    /// captured PQ ramp decodes monotonically at ceiling 12 and at no other value, and the SDR half
+    /// of the same capture only at 10. Getting this wrong does not degrade the picture, it
+    /// desynchronises the dock's decoder -- at the maximum category `esc` omits the unary
+    /// 0-terminator, so the next value's first bit is read as an offset bit.
+    #[test]
+    fn wht_depth_selects_the_dc_codebook() {
+        use video::wht::Depth;
+        assert_eq!(Depth::Eight.dc_cmax(), 10);
+        assert_eq!(Depth::Ten.dc_cmax(), 12);
+        // A luma DC is four times the sample, so each ceiling is exactly the category that holds
+        // its depth's largest value: 4 x 255 = 1020 (c=10) and 4 x 1023 = 4092 (c=12).
+        assert_eq!(video::wht::mag_category(4 * 255), Depth::Eight.dc_cmax());
+        assert_eq!(video::wht::mag_category(4 * 1023), Depth::Ten.dc_cmax());
+    }
+
+    /// The depth comes from the committed framebuffer's fourcc, never from state of our own.
+    #[test]
+    fn wht_depth_from_fourcc() {
+        use video::wht::Depth;
+        assert!(matches!(
+            Depth::from_fourcc(kernel::drm::fourcc::XRGB8888),
+            Some(Depth::Eight)
+        ));
+        assert!(matches!(
+            Depth::from_fourcc(kernel::drm::fourcc::XRGB2101010),
+            Some(Depth::Ten)
+        ));
+        assert!(Depth::from_fourcc(kernel::drm::fourcc::ARGB8888).is_none());
+    }
+
+    /// The colour transform is depth-agnostic: it carries code words, applies no transfer function
+    /// and no matrix, and the host has already encoded whatever curve the sink wants.
+    #[test]
+    fn wht_colour_carries_ten_bit_unchanged() {
+        use video::wht;
+        assert_eq!(wht::colour(1023, 1023, 1023), (64 * 1023, 0, 0));
+        assert_eq!(wht::colour(512, 512, 512), (512 * 64, 0, 0));
+        assert_eq!(wht::colour(1023, 0, 0), (64 * (1023 >> 2), 64 * 1023, 0));
+        // 10-bit white quantises to 4092 at DC, which is why the ceiling has to move.
+        let (y, _, _) = wht::colour(1023, 1023, 1023);
+        assert_eq!(wht::quantize(wht::transform(&[y; wht::BLOCK])[0], 0), 4092);
+    }
+
+    /// The same quantised blocks encode to different bytes at the two depths.
+    ///
+    /// This is the whole of the HDR difference on this wire, so it is worth a test that would fail
+    /// if the depth ever stopped reaching the entropy coder: a DC of 4092 saturates to category
+    /// 10's largest value at 8 bits and survives intact at 10.
+    #[test]
+    fn wht_strip_encoding_follows_the_depth() -> Result {
+        use video::wht::{self, Depth};
+        let white = wht::colour(1023, 1023, 1023).0;
+        let plane = [white; wht::PIXELS];
+        let zero = [0i32; wht::PIXELS];
+        let mut blocks = KVec::new();
+        for _ in 0..16 {
+            blocks.push(wht::colour_block(&zero, &zero, &plane), GFP_KERNEL)?;
+        }
+        let geom = wht::RIDGE_GEOMETRY;
+        let eight = wht::colour_strip(geom, &blocks, 0, 0)?;
+        let ten = wht::colour_strip(geom.with_depth(Depth::Ten), &blocks, 0, 0)?;
+        assert_ne!(eight[..], ten[..]);
+        // Saturating at the lower ceiling costs bits, so the 8-bit encoding is the shorter one.
+        assert!(eight.len() <= ten.len());
+        Ok(())
     }
 
     #[test]
