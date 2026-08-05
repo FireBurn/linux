@@ -3051,6 +3051,27 @@ impl VinoDrmData {
         *slot = Some(blob);
     }
 
+    /// Whether userspace has taken responsibility for describing `head`'s sink, because the dock
+    /// cannot read it.
+    ///
+    /// A DP→HDMI converter that mangles or drops DDC leaves the dock unable to read the monitor at
+    /// all: the presence probe reports the socket occupied, but no `id=0x194` ever arrives, so the
+    /// head stays disconnected and nothing is ever driven. The monitor is real, and its EDID is
+    /// readable from a working port on another machine.
+    ///
+    /// Rather than carry a second EDID source, this hands the head to DRM's own override, which
+    /// already accepts a blob two ways -- `drm_kms_helper.edid_firmware=<connector>:<path>` or a
+    /// write to the connector's debugfs `edid_override`. The core applies it only when a connector
+    /// reports connected and its `get_modes` returns none, so both of those become this head's
+    /// behaviour while no EDID has been read.
+    ///
+    /// ⚠ An override describes the SINK, not the link. A blob claiming a mode the converter cannot
+    /// carry gives a black screen just the same: this substitutes for a broken read, it does not
+    /// negotiate anything.
+    pub(super) fn edid_from_userspace(&self, head: usize) -> bool {
+        usize::from(*crate::module_parameters::edid_override.value()) & (1 << head) != 0
+    }
+
     /// Mark a head connected from CP engagement alone (no raw EDID). Bring-up fires one hotplug
     /// after every head's EDID has also been cached, so the compositor never probes partial state.
     /// Called once the head's DISPLAY-CAP push confirms monitor presence.
@@ -3149,6 +3170,15 @@ impl VinoDrmData {
                 Ok(true)
             }
             None => {
+                // The engage messages above were still sent, so the dock's own state is whatever
+                // it would have been; only the sink's description is coming from elsewhere.
+                if self.edid_from_userspace(head as usize) {
+                    pr_info!(
+                        "vino: head {head} re-engaged with no EDID from the dock -- publishing it \
+                         anyway for DRM's override (edid_override)\n"
+                    );
+                    return Ok(true);
+                }
                 vino_debug!(
                     "vino: head {head} re-engaged but no EDID came back -- no monitor, or it is \
                      not ready yet\n"

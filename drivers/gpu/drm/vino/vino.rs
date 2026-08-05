@@ -414,6 +414,36 @@ impl WorkItem for BringUp {
                 );
                 data.set_video_keys(video_keys);
 
+                // One line naming what setup found on every physical socket, including the ones
+                // this dock does not drive as distinct streams. Which socket a monitor is in is
+                // otherwise invisible from dmesg, and it decides whether a dark output is a sink
+                // problem at all: a head vino never drives cannot light whatever is plugged into
+                // it. `cap` is the socket's DISPLAY-CAP push, `edid` its raw EDID; the pair
+                // distinguishes an empty socket from one whose sink cannot be read.
+                for head in 0..usize::from(profile.connectors) {
+                    dev_info!(
+                        cdev,
+                        "vino: socket {} -- cap:{} edid:{} deferred:{} driven:{}\n",
+                        head + 1,
+                        if heads_present[head] { "yes" } else { "no " },
+                        if edid_heads[head].is_some() {
+                            "yes"
+                        } else {
+                            "no "
+                        },
+                        if discovery_deferred[head] {
+                            "yes"
+                        } else {
+                            "no "
+                        },
+                        if data.runtime_connector(head) {
+                            "yes"
+                        } else {
+                            "no "
+                        },
+                    );
+                }
+
                 // Cache complete per-head discovery results before emitting the single initial
                 // hotplug event. A timed-out head remains absent and the keepalive's existing
                 // bounded re-engagement path retries it without discarding the live session.
@@ -1006,6 +1036,10 @@ kernel::module_usb_driver! {
         rtc_utc_offset_minutes: i32 {
             default: 0,
             description: "Local UTC offset used by Navarro RTC synchronization (minutes east of UTC)",
+        },
+        edid_override: u8 {
+            default: 0,
+            description: "Bitmask of heads whose sink is described by DRM's EDID override (drm_kms_helper.edid_firmware=<connector>:<path>, or a debugfs edid_override write) because the dock cannot read its EDID -- typically a DP-to-HDMI converter that mangles DDC",
         },
         idle_opens: u8 {
             default: 0,

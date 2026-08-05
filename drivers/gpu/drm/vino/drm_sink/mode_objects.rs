@@ -699,6 +699,14 @@ impl connector::DriverConnector for VinoConnector {
         }
         drop(edids);
         let _ = guard;
+        // A head handed to DRM's EDID override must report NO modes here: the core applies the
+        // override (`drm_kms_helper.edid_firmware=`, or a debugfs `edid_override` write) purely as
+        // a fallback for a connector that is connected and produced none. Synthesising the
+        // built-in list below would satisfy the probe helper and the override would never be
+        // consulted.
+        if data.edid_from_userspace(connector.head as usize) {
+            return 0;
+        }
         // No downstream EDID yet: advertise the standard mode list up to the fallback resolution
         // and prefer it, keeping the connector usable until the dock delivers a real EDID.
         let n = connector.add_modes_noedid((FALLBACK_W as u32, FALLBACK_H as u32));
