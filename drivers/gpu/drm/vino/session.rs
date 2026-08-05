@@ -1404,13 +1404,13 @@ impl VinoDriver {
 
             let mut active = [false; Self::CP_SETUP_HEADS];
             for head in 0..connector_count {
-                // Navarro exposes four connector numbers on two physical video pipes. The
-                // working two-panel DLM session discovers all four sockets but opens only the
-                // first connector on each distinct pipe (0/1, not their 2/3 aliases).
-                let endpoint = profile.video_eps[head];
-                if profile.video_eps[..head].contains(&endpoint) {
-                    continue;
-                }
+                // Navarro exposes four connector numbers on two physical video pipes, and the
+                // reference DLM session opened only the first connector on each pipe -- but that
+                // session had its two panels in sockets 1 and 2. Sockets 3 and 4 are not aliases
+                // of them: they are separate physical connectors that happen to share a bulk
+                // endpoint, with their own selector, EDID and stream. Skipping them by endpoint
+                // made a monitor in socket 3 or 4 invisible, with the dock never even probed for
+                // it. Read every socket; engagement below is what stays selective.
                 active[head] = true;
                 *edid_out = None;
                 let hu8 = head as u8;
@@ -1424,9 +1424,12 @@ impl VinoDriver {
                 edid_heads[head] = edid_out.take();
                 discovery_deferred[head] = edid_heads[head].is_none();
             }
-            // DLM engages each active connector once, after all kick/probe/fetch triplets.
+            // Engage each connector that answered with an EDID, once, after all kick/probe/fetch
+            // triplets. Gated on a recovered EDID because that is the presence signal on this
+            // platform, and because driving setup at a socket with nothing in it is exactly what
+            // makes this dock hard-reset a few seconds later.
             for head in 0..connector_count {
-                if active[head] {
+                if active[head] && edid_heads[head].is_some() {
                     let engage = cp::edid_engage_req(cp_ctr, head as u8)?;
                     navarro_send!(0x16, engage);
                 }

@@ -1356,21 +1356,16 @@ impl VinoDrmData {
 
     /// Whether `head` represents a distinct runtime stream on this dock.
     ///
-    /// The DL7400 exposes four connector selectors but maps them in pairs onto two video bulk
-    /// endpoints. DLM discovers all four selectors during setup, then drives and polls only the
-    /// first selector for each distinct endpoint. Treating selectors 2/3 as independent heads
-    /// interleaves spurious re-engage traffic into the authenticated mode-set transcript.
+    /// Every physical connector does. The DL7400 maps its four connectors in pairs onto two video
+    /// bulk endpoints, and this used to treat the second of each pair as an alias and skip it --
+    /// which made a monitor in socket 3 or 4 invisible: never probed, never published, no way to
+    /// drive it. Sharing an endpoint is a transport detail, and it is handled where it belongs, by
+    /// [`UsbLink::video_pipe_index`] giving both connectors of a pair the same persistent queue.
+    ///
+    /// Empty sockets cost nothing here: the presence probe answers negative for them, and the
+    /// keepalive's re-engage retry stands down permanently once it has.
     pub(super) fn runtime_connector(&self, head: usize) -> bool {
-        if head >= self.connector_count() {
-            return false;
-        }
-        if !self.is_navarro() {
-            return true;
-        }
-        let address = self.eps.video[head].address();
-        !self.eps.video[..head]
-            .iter()
-            .any(|endpoint| endpoint.address() == address)
+        head < self.connector_count()
     }
 
     pub(super) fn set_cp_engaged(&self, engaged: bool) {
