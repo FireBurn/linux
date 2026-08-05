@@ -318,6 +318,24 @@ enum NavarroColdOp {
     Clear(u8),
 }
 
+impl NavarroColdOp {
+    /// Translate this op's transcript slot into the head that slot stands for in this activation.
+    ///
+    /// The captured sequence names connectors 0 and 1 because that is where DLM's panels were. It
+    /// describes the first and second head being brought up, whichever sockets those are.
+    fn remap_head(self, remap: &impl Fn(u8) -> u8) -> Self {
+        match self {
+            Self::Poll => Self::Poll,
+            Self::EdidState(h, s) => Self::EdidState(remap(h), s),
+            Self::Probe(h) => Self::Probe(remap(h)),
+            Self::Fetch(h) => Self::Fetch(remap(h)),
+            Self::SinkState(h, s) => Self::SinkState(remap(h), s),
+            Self::PostEdid(h) => Self::PostEdid(remap(h)),
+            Self::Clear(h) => Self::Clear(remap(h)),
+        }
+    }
+}
+
 /// Authenticated DLM transaction between Navarro's first clear pair and its first real mode.
 ///
 /// Offsets are milliseconds from the first head-0 clear in
@@ -2193,23 +2211,44 @@ impl VinoDrmData {
         let mut started = 0u32;
         let timeline = (|| -> Result<(u32, u32)> {
             if self.is_navarro() {
+                // The transcript's connector numbers are SLOTS, not connectors. DLM was captured
+                // with its two panels in the first two sockets, so its messages name 0 and 1; the
+                // sequence is about "the first head being activated" and "the second". With
+                // panels in sockets 3 and 4 the literal numbers address two empty sockets, which
+                // engages the wrong sinks, leaves the real ones untouched, and stalls the
+                // transaction on fetches nothing will answer.
+                let mut slots = [0u8; 2];
+                let mut n = 0;
+                for head in 0..HEADS {
+                    if valid & (1u32 << head) != 0 && n < slots.len() {
+                        slots[n] = head as u8;
+                        n += 1;
+                    }
+                }
+                let remap = |slot: u8| slots[usize::from(slot).min(slots.len() - 1)];
+
                 // DLM's first clear pair begins a dock-wide sink reset. The authenticated
                 // transcript then stops/restarts each EDID reader, disengages/re-engages the
                 // downstream sinks, and clears each pipe a second time before any real mode.
-                for head in 0..HEADS {
-                    if valid & (1u32 << head) == 0 {
-                        continue;
-                    }
-                    if head == 1 {
+                for (slot, &head) in slots.iter().enumerate() {
+                    if slot == 1 {
                         Self::wait_mode_offset(activation_started, NAVARRO_PRIME_CLEAR_H1_MS);
                     }
-                    self.send_cp(dev, 0x48, 0, |ctr| super::cp::clear_mode(ctr, head as u8))?;
+                    self.send_cp(dev, 0x48, 0, |ctr| super::cp::clear_mode(ctr, head))?;
                 }
                 for &(at, op) in NAVARRO_COLD_PRELUDE {
                     Self::wait_mode_offset(activation_started, at);
-                    self.navarro_cold_op(dev, op)?;
+                    self.navarro_cold_op(dev, op.remap_head(&remap))?;
                 }
-                Self::wait_mode_offset(activation_started, NAVARRO_REAL_MODE_H0_MS);
+                // The captured offset is where DLM put its first real mode, not a measured
+                // requirement -- and its own prelude finishes at 2016 ms, so nearly a second of
+                // it is dead air. `navarro_mode_offset_ms` exists to settle that on hardware
+                // rather than by argument; 0 keeps the transcript's value.
+                let offset = match *crate::module_parameters::navarro_mode_offset_ms.value() {
+                    0 => NAVARRO_REAL_MODE_H0_MS,
+                    ms => i64::from(ms),
+                };
+                Self::wait_mode_offset(activation_started, offset);
                 anchor = Instant::<Monotonic>::now();
             }
 

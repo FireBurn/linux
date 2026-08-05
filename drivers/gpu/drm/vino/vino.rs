@@ -485,6 +485,20 @@ impl WorkItem for BringUp {
                         {
                             continue;
                         }
+                        // Ask before engaging. A re-engage is seven control messages carrying
+                        // ~575 ms of mandated inter-step delay; the presence probe is one message
+                        // with a 64 ms deadline and answers the same question for an empty
+                        // socket. On a four-connector dock with two panels that is over a second
+                        // of pure latency in the critical path, ahead of the heads that do have a
+                        // monitor. A probe that cannot answer (`None`) is not evidence of
+                        // absence, so it still falls through to the re-engage.
+                        if data.probe_head_present(dev, head as u8) == Some(false) {
+                            vino_dev_debug!(
+                                cdev,
+                                "vino: head {head} probe says empty -- skipping its re-engage\n"
+                            );
+                            continue;
+                        }
                         match data.reengage_head(dev, head as u8) {
                             Ok(true) => {
                                 data.set_connected(head);
@@ -672,6 +686,14 @@ impl WorkItem for BringUp {
                             continue;
                         }
                         next_reengage[h] = Instant::<Monotonic>::now() + REENGAGE_RETRY;
+                        // Same trade as the initial recovery: one cheap probe instead of seven
+                        // paced messages. It also keeps an empty socket's retry from interleaving
+                        // ~575 ms of engage traffic into a mode-set transaction on another head,
+                        // which is measurable as delayed activation, not merely as noise.
+                        if data.probe_head_present(dev, h as u8) == Some(false) {
+                            head_probed[h] = Some(false);
+                            continue;
+                        }
                         vino_dev_debug!(
                             cdev,
                             "vino: head {h} absent -- retrying the sink re-engage\n"
@@ -1040,6 +1062,10 @@ kernel::module_usb_driver! {
         edid_override: u8 {
             default: 0,
             description: "Bitmask of heads whose sink is described by DRM's EDID override (drm_kms_helper.edid_firmware=<connector>:<path>, or a debugfs edid_override write) because the dock cannot read its EDID -- typically a DP-to-HDMI converter that mangles DDC",
+        },
+        navarro_mode_offset_ms: u32 {
+            default: 0,
+            description: "Milliseconds from the Navarro cold-activation anchor to the first real mode set (0 = the captured 2978). The captured prelude ends at 2016 ms, so the remainder is unexplained wait; this settles how much of it the dock needs",
         },
         idle_opens: u8 {
             default: 0,
