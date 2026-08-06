@@ -588,6 +588,29 @@ impl WorkItem for BringUp {
             // forward; without a floor it would run once per loop iteration for as long as the
             // dock keeps talking.
             const PRESENCE_MIN_GAP: Delta = Delta::from_millis(50);
+            /// How long a connector must read absent before its monitor is called removed.
+            ///
+            /// A removal must be debounced in TIME, not in probes. Every `id=0x44` reply -- which
+            /// is what a presence probe itself gets -- sets the downstream-event flag, so the probe
+            /// brings itself forward to `PRESENCE_MIN_GAP` and the old "two consecutive contrary
+            /// reads" rule fired 132 ms after the first negative.
+            ///
+            /// That is far shorter than the dock's own settling: measured on the DL7400, a mode
+            /// change makes it report the sink gone for 1.24 s, 2.0 s and 2.46 s on three
+            /// occasions before reporting it back. Each of those blips dropped a live connector,
+            /// which made KWin re-lay-out its outputs and re-apply their modes -- and a mode set
+            /// is exactly what the dock cannot take while another head is lit. One blip therefore
+            /// cost a dock reset and tens of seconds of dark panels.
+            ///
+            /// A real unplug stays absent forever, so waiting costs nothing but latency on a
+            /// genuine removal. Arrivals keep the two-probe rule: they are cheap to act on and
+            /// nothing downstream is torn down by one.
+            /// Measured on this dock while idle and lit: the absent runs are 0.11 s to 2.29 s
+            /// (29 of them over three minutes, mean 0.9 s), separated by present runs of 1.1 s to
+            /// 19.7 s. Five seconds clears the longest measured blip twice over.
+            const PRESENCE_REMOVE_MS: i64 = 5000;
+            let mut head_absent_since: [Option<Instant<Monotonic>>; VinoDriver::CP_SETUP_HEADS] =
+                [None; VinoDriver::CP_SETUP_HEADS];
             // A recovered sink need not emit a uniquely identifiable event, so a head whose
             // discovery was deferred is retried at a bounded cadence until the probe answers.
             const REENGAGE_RETRY: Delta = Delta::from_millis(4000);
@@ -760,6 +783,7 @@ impl WorkItem for BringUp {
                         head_probed[h] = Some(present);
                         if present == head_known[h] {
                             head_debounce[h] = 0;
+                            head_absent_since[h] = None;
                             continue;
                         }
                         // Inside the settling window after a recovery, a negative answer is not
@@ -768,14 +792,31 @@ impl WorkItem for BringUp {
                             && (Instant::<Monotonic>::now() - presence_grace[h]).as_millis() < 0
                         {
                             head_debounce[h] = 0;
+                            head_absent_since[h] = None;
                             continue;
                         }
-                        // Require two consecutive contrary reads before acting.
-                        head_debounce[h] = head_debounce[h].saturating_add(1);
-                        if head_debounce[h] < 2 {
-                            continue;
+                        if present {
+                            // Require two consecutive contrary reads before announcing an arrival.
+                            head_absent_since[h] = None;
+                            head_debounce[h] = head_debounce[h].saturating_add(1);
+                            if head_debounce[h] < 2 {
+                                continue;
+                            }
+                            head_debounce[h] = 0;
+                        } else {
+                            // A removal must be sustained for `PRESENCE_REMOVE_MS`, because the
+                            // dock reports a live sink absent for seconds at a time around a mode
+                            // change.
+                            let since = *head_absent_since[h]
+                                .get_or_insert_with(Instant::<Monotonic>::now);
+                            if (Instant::<Monotonic>::now() - since).as_millis()
+                                < PRESENCE_REMOVE_MS
+                            {
+                                continue;
+                            }
+                            head_absent_since[h] = None;
+                            head_debounce[h] = 0;
                         }
-                        head_debounce[h] = 0;
                         if present {
                             // Re-engage the downstream sink before accepting another mode set.
                             match data.reengage_head(dev, h as u8) {
