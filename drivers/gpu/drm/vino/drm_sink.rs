@@ -3550,6 +3550,26 @@ impl VinoDrmData {
     /// Each operation class has one fixed slot, so updates cannot fail allocation and obsolete
     /// cursor positions or stream states do not build a backlog.
     fn queue_cmd(&self, dev: &VinoDrmDevice, cmd: KmsCmd) {
+        // ⛔ The hardware cursor is not working on the DL-7400 and is off by default.
+        //
+        // Its head selector came from a two-entry table, so on a four-head dock with monitors in
+        // sockets 3 and 4 every cursor message returned `EINVAL` and was dropped. That failure was
+        // load-bearing: the cursor plane's commit failed, so the compositor fell back to
+        // compositing the pointer into the primary plane. Making the selector `head + 1` gets the
+        // messages onto the wire -- confirmed, 16448-byte control writes -- and the dock accepts
+        // them and shows nothing, while the now-successful plane commit stops the compositor
+        // drawing its own. The visible result is a pointer that disappears.
+        //
+        // So the fix to the selector is necessary but not sufficient, and until the rest of the
+        // cursor protocol is understood the safe state is the one that leaves userspace drawing
+        // the pointer itself.
+        if matches!(
+            cmd,
+            KmsCmd::CursorCreate { .. } | KmsCmd::CursorImage { .. } | KmsCmd::CursorMove { .. }
+        ) && *crate::module_parameters::cursor_enabled.value() == 0
+        {
+            return;
+        }
         let mut pending = self.pending_kms.lock();
         if self.shutting_down.load(Ordering::Acquire) {
             return;
