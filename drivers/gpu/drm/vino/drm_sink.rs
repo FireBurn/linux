@@ -1568,6 +1568,22 @@ impl VinoDrmData {
     /// frames are an ordinary accepted write, not a write onto a torn-down pipe.
     fn blank_head(&self, dev: &BoundInterface<'_>, head: u8) -> Result {
         let head_i = head as usize;
+        // ⛔ The DL-7400 re-enumerates about two seconds after any blank, whatever the blank does:
+        // measured with the Ridge close bracket, without it, and with the sink power-down both on
+        // and off -- seven for seven. An idle screen blank alone therefore puts the dock into a
+        // reset loop and takes the whole desktop down with it, which is far worse than a panel
+        // that keeps showing its last frame while the compositor thinks it is off.
+        //
+        // Until a Navarro transcript establishes how DLM disables an output, do nothing. The
+        // scanout has already stopped, because `atomic_disable` zeroed this head's mode
+        // generation before queueing this command.
+        if self.is_navarro() {
+            vino_debug!(
+                "vino: head {head} blank suppressed -- Navarro's disable sequence resets the \
+                 dock and is not established\n"
+            );
+            return Ok(());
+        }
         let Some(timing) = self.last_timing.lock()[head_i] else {
             // Never modeset, so there is nothing lit to blank.
             return Ok(());
@@ -1591,8 +1607,19 @@ impl VinoDrmData {
             BLANK_PRESENT_MS,
             false,
         )?;
-        // Close the stream with the validated bracket. This stops the DisplayLink stream without
-        // forcing the monitor into hard standby.
+        // Closing the stream bracket is a Ridge behaviour and it is measured to be wrong here.
+        // On the DL-7400 every blank is followed by a dock re-enumeration about two seconds
+        // later -- six for six, with and without the sink power-down below -- so an idle screen
+        // blank alone puts the dock into a reset loop and takes the desktop with it. Navarro's
+        // stream markers are known to differ (`strm2_marker` 0x0c against Ridge's 0x06), so this
+        // is not a timing accident. Present black and leave the stream configured until a
+        // Navarro transcript establishes the right sequence.
+        if self.is_navarro() {
+            vino_debug!(
+                "vino: head {head} blanked to black ({sent} presentation(s)); stream left open                  -- Navarro's close sequence is not established\n"
+            );
+            return Ok(());
+        }
         self.stream_marker(dev, head, 0x2f, 0)?;
         self.stream_marker(dev, head, 0x2e, 0)?;
         // Do not take the sink down for a head whose monitor has already gone away.
