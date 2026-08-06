@@ -652,25 +652,36 @@ mod protocol {
 
     #[test]
     fn cursor_messages_structure() -> Result {
-        // Shared 32-byte cursor layout: marker 0x02 at 22, head ID at 23, and two little-endian u16
-        // fields at 24 and 26.
-        // Create (head 0): id=0x1b sub=0x42, fields = w,h.
+        // Shared 32-byte cursor layout: the dock's head selector at 22, the visible flag at 23,
+        // and two little-endian u16 fields at 24 and 26. The selector is one-based -- this test
+        // used to assert a constant `0x02` marker at offset 22, from before the head encoding was
+        // measured, and it went on passing only because head 1 happens to select 0x02.
+        // Create (head 0): id=0x1b sub=0x42, fields = w,h. An upload is not a show, so hidden.
         let c = cp::cursor_create(7, 0, 64, 64)?;
         assert_eq!(c.len(), 32);
         assert_eq!(&c[0..6], &[0x1b, 0x00, 0x42, 0x00, 0x07, 0x00]); // id, sub, counter (LE)
-        assert_eq!(c[22], 0x02); // marker
-        assert_eq!(c[23], 0); // head id
+        assert_eq!(c[22], 0x01); // head 0 -> dock head 1
+        assert_eq!(c[23], 0x00); // not visible
         assert_eq!(u16::from_le_bytes([c[24], c[25]]), 64); // width
         assert_eq!(u16::from_le_bytes([c[26], c[27]]), 64); // height
 
-        // Move (head 1): id=0x1a sub=0x43, marker@22, head@23, X@24, Y@26 (LE).
+        // Move (head 1): id=0x1a sub=0x43, head@22, visible@23, X@24, Y@26 (LE).
         let m = cp::cursor_move(9, 1, 0x0140, 0x00f0, true)?;
         assert_eq!(m.len(), 32);
         assert_eq!(&m[0..4], &[0x1a, 0x00, 0x43, 0x00]); // id, sub
-        assert_eq!(m[22], 0x02); // marker
-        assert_eq!(m[23], 1); // head id
+        assert_eq!(m[22], 0x02); // head 1 -> dock head 2
+        assert_eq!(m[23], 0x01); // visible
         assert_eq!(u16::from_le_bytes([m[24], m[25]]), 0x0140); // X
         assert_eq!(u16::from_le_bytes([m[26], m[27]]), 0x00f0); // Y
+
+        // Every head this driver exposes must produce a message. A two-entry lookup table left the
+        // DL7400's third and fourth connectors returning `EINVAL`, which `cmd_work` drops rather
+        // than retries -- so a monitor in socket 3 or 4 had no hardware cursor at all.
+        for head in 0..drm_sink::HEADS as u8 {
+            let m = cp::cursor_move(1, head, 0, 0, true)?;
+            assert_eq!(m[22], head + 1);
+        }
+        assert!(cp::cursor_move(1, drm_sink::HEADS as u8, 0, 0, true).is_err());
 
         // Image: 32-byte header (inner id 0x401c, the 0x40 bitmap flag) + w*h*4 BGRA at off32;
         // wrong-size input rejected.
@@ -678,8 +689,11 @@ mod protocol {
         let img = cp::cursor_image(3, 0, 64, 64, &bitmap)?;
         assert_eq!(img.len(), 32 + 64 * 64 * 4);
         assert_eq!(&img[0..4], &[0x1c, 0x40, 0x41, 0x00]); // inner id 0x401c, sub 0x41
-        assert_eq!(img[22], 0x02); // marker
-        assert_eq!(img[32], 0xab); // bitmap begins at off32
+        assert_eq!(img[22], 0x01); // head 0 -> dock head 1
+        // The bitmap begins at off34, not off32: offsets 32..33 are zero and the last pixel is
+        // truncated so the message still measures `32 + w*h*4`.
+        assert_eq!(&img[32..34], &[0x00, 0x00]);
+        assert_eq!(img[34], 0xab);
         assert!(cp::cursor_image(3, 0, 64, 64, &[0u8; 16]).is_err()); // wrong bitmap length
         Ok(())
     }

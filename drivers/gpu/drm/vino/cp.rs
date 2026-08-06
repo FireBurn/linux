@@ -929,7 +929,21 @@ pub(super) fn perhead_hdcp_push(
 /// [`cursor_header`], with the head selector at off22 and a flag at off23.
 ///
 /// The dock numbers its heads from **one**; `0` is not a valid selector.
-const CURSOR_HEAD_IDS: [u8; 2] = [0x01, 0x02];
+///
+/// ⚠ This was a two-entry table, `[0x01, 0x02]`, indexed by vino's head number -- written when the
+/// only dock had two heads. The DL-7400 has four, and its two monitors sit in sockets 3 and 4, so
+/// every cursor message for them looked up past the end of the table and returned `EINVAL`.
+/// `EINVAL` is deliberately non-retryable, so `cmd_work` dropped each one with
+/// "dropping invalid asynchronous KMS command" and **no cursor byte ever reached the dock**: the
+/// hardware cursor was not unreliable on this dock, it was absent.
+///
+/// The selector is the head number plus one, which is what the two measured entries were.
+fn cursor_head_id(head: u8) -> Result<u8> {
+    if usize::from(head) >= crate::drm_sink::HEADS {
+        return Err(EINVAL);
+    }
+    Ok(head + 1)
+}
 
 /// off23 is the cursor's **visible** flag, not a message-kind tag: set to show the cursor, clear to
 /// hide it. The bitmap-bearing messages carry it clear because an upload is not itself a show.
@@ -957,7 +971,7 @@ fn cursor_header(
 /// cursor create: `id=0x1b sub=0x42`, advertises `w x h`. Sent once per bitmap geometry.
 pub(super) fn cursor_create(counter: u16, head: u8, w: u16, h: u16) -> Result<KVec<u8>> {
     let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
-    let dock_head = CURSOR_HEAD_IDS.get(head as usize).copied().ok_or(EINVAL)?;
+    let dock_head = cursor_head_id(head)?;
     cursor_header(&mut b, 0x1b, 0x42, counter, dock_head, CURSOR_HIDDEN)?;
     b.extend_from_slice(&w.to_le_bytes(), GFP_KERNEL)?; // off24..25
     b.extend_from_slice(&h.to_le_bytes(), GFP_KERNEL)?; // off26..27
@@ -973,7 +987,7 @@ pub(super) fn cursor_move(
     visible: bool,
 ) -> Result<KVec<u8>> {
     let mut b = KVec::with_capacity(32, GFP_KERNEL)?;
-    let dock_head = CURSOR_HEAD_IDS.get(head as usize).copied().ok_or(EINVAL)?;
+    let dock_head = cursor_head_id(head)?;
     let visible_flag = if visible {
         CURSOR_VISIBLE
     } else {
@@ -1007,7 +1021,7 @@ pub(super) fn cursor_image(
         return Err(EINVAL);
     }
     let mut b = KVec::with_capacity(32 + bgra.len(), GFP_KERNEL)?;
-    let dock_head = CURSOR_HEAD_IDS.get(head as usize).copied().ok_or(EINVAL)?;
+    let dock_head = cursor_head_id(head)?;
     cursor_header(&mut b, 0x401c, 0x41, counter, dock_head, CURSOR_HIDDEN)?;
     pad_to(&mut b, 32)?; // off24..31 zero (no w/h here)
     b.extend_from_slice(&[0, 0], GFP_KERNEL)?; // off32..33

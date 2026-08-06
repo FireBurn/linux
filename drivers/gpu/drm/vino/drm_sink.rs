@@ -518,6 +518,23 @@ impl KmsCmd {
     }
 }
 
+/// The cursor state one head's dock connector is holding, as last acknowledged on the wire.
+///
+/// A mode set leaves the dock's cursor undefined -- `owe_keyframe` says so by bumping
+/// `cursor_epoch` -- but vino could only act on that when the compositor next committed the cursor
+/// plane. A pointer that is not moving produces no commit, so the cursor simply vanished until it
+/// was moved, and every mode set is now dock-wide, so it vanished on *both* panels for a change
+/// made to one. Keeping the last accepted bitmap and position lets the mode-set path put it back
+/// itself.
+struct CursorShot {
+    w: u16,
+    h: u16,
+    bgra: KVec<u8>,
+    x: u16,
+    y: u16,
+    visible: bool,
+}
+
 struct PendingKmsHead {
     stream: Option<KmsCmd>,
     cursor_create: Option<KmsCmd>,
@@ -978,6 +995,9 @@ pub(super) struct VinoDrmData {
     /// own -- correct either way, at the cost of one extra upload per shape change.
     #[pin]
     cursor_geometry: Mutex<[Option<(u16, u16)>; HEADS]>,
+    /// The cursor each head's connector is holding; see [`CursorShot`].
+    #[pin]
+    cursor_shot: Mutex<[Option<CursorShot>; HEADS]>,
     /// Dock-wide pixel-rate budget in pixels per second; zero means unknown.
     dock_pixel_budget: core::sync::atomic::AtomicU32,
     /// Highest refresh rate this dock is known to drive; see `DockProfile::max_refresh_hz`.
@@ -1082,6 +1102,7 @@ impl VinoDrmData {
             cursor_epoch: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
             shadow_rr: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
             cursor_geometry <- new_mutex!([None; HEADS]),
+            cursor_shot <- new_mutex!([const { None }; HEADS]),
             // D6000 default: 442,368,000 px/s (one 1440p@120) x2 compression headroom = dual
             // 1440p@120. Replace it if a dock capability supplies a limit.
             dock_pixel_budget: core::sync::atomic::AtomicU32::new(884_736_000),
@@ -3733,6 +3754,89 @@ impl VinoDrmData {
         self.cursor_geometry.lock()[head] = None;
     }
 
+    /// Note a cursor command the dock has just accepted, so [`Self::rearm_cursor`] can replay it.
+    fn record_cursor(&self, cmd: &KmsCmd) {
+        let head = cmd.head();
+        if head >= HEADS {
+            return;
+        }
+        let mut slots = self.cursor_shot.lock();
+        match cmd {
+            KmsCmd::CursorImage { w, h, bgra, .. } => {
+                let mut copy = KVec::new();
+                if copy.extend_from_slice(bgra, GFP_KERNEL).is_err() {
+                    // A cursor that cannot be cached is still on the dock; it just will not be
+                    // restored across the next mode set. Nothing else depends on this.
+                    return;
+                }
+                match &mut slots[head] {
+                    Some(shot) => {
+                        shot.w = *w;
+                        shot.h = *h;
+                        shot.bgra = copy;
+                    }
+                    slot @ None => {
+                        *slot = Some(CursorShot {
+                            w: *w,
+                            h: *h,
+                            bgra: copy,
+                            x: 0,
+                            y: 0,
+                            visible: false,
+                        })
+                    }
+                }
+            }
+            KmsCmd::CursorMove { x, y, visible, .. } => {
+                if let Some(shot) = &mut slots[head] {
+                    shot.x = *x;
+                    shot.y = *y;
+                    shot.visible = *visible;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Re-upload the cursor on every head in `heads` after a mode set discarded it.
+    ///
+    /// `owe_keyframe` marks the dock's cursor stale, but only a compositor commit on the cursor
+    /// plane acted on that mark -- and a pointer that is not moving never produces one, so the
+    /// cursor stayed missing until it was moved. Replaying the cached shot closes that window
+    /// without waiting for userspace.
+    fn rearm_cursor(&self, dev: &VinoDrmDevice, heads: u32) {
+        for head in 0..HEADS {
+            if heads & (1u32 << head) == 0 {
+                continue;
+            }
+            let (w, h, bgra, x, y, visible) = {
+                let slots = self.cursor_shot.lock();
+                let Some(shot) = &slots[head] else {
+                    continue;
+                };
+                let mut copy = KVec::new();
+                if copy.extend_from_slice(&shot.bgra, GFP_KERNEL).is_err() {
+                    continue;
+                }
+                (shot.w, shot.h, copy, shot.x, shot.y, shot.visible)
+            };
+            let head = head as u8;
+            // The same order the plane callback uses, and the same order `cmd_work` drains them
+            // in: geometry, then bitmap, then position.
+            self.queue_cmd(dev, KmsCmd::CursorCreate { head, w, h });
+            self.queue_cmd(dev, KmsCmd::CursorImage { head, w, h, bgra });
+            self.queue_cmd(
+                dev,
+                KmsCmd::CursorMove {
+                    head,
+                    x,
+                    y,
+                    visible,
+                },
+            );
+        }
+    }
+
     /// Choose the next frame or delay for `head`.
     ///
     /// Neither means this head is idle and its worker can exit.
@@ -3996,6 +4100,71 @@ impl WorkItem for VinoDrmData {
             // needs the same exclusion against the scanout workers -- otherwise a frame already in
             // flight interleaves its records with the blanking frames on the wire.
             let has_modeset = pending.has_stream();
+            // ⛔ On the DL7400 a mode set is DOCK-WIDE, not per head. Configuring one connector
+            // while any other connector is lit makes the dock re-enumerate about 100 ms after the
+            // next video write -- measured five times over, on every shape of the change:
+            // 120 -> 165, 165 -> 120 and 120 -> 60 on a live head, waking a second head one
+            // second after the first, and reconfiguring a head whose sibling had been lit and
+            // idle for over three minutes. The same changes with the sibling disabled are clean,
+            // and so is the simultaneous `activate_dual_wake` path. That is DLM's own behaviour:
+            // its log says `[Profile change] Recreating device` and it re-runs a bring-up-shaped
+            // burst rather than re-configuring one connector in place.
+            //
+            // So fold every already-active head into this batch. Zeroing its mode generation
+            // makes `activate_dual_wake` treat it as a fresh wake, and the whole dock is then
+            // taken through the one choreography the hardware accepts. The cost is that the
+            // sibling blinks through a mode change on its neighbour; the alternative is a dock
+            // reset and tens of seconds of dark panels on both.
+            // `cmd_heads` rather than `has_modeset`: a `Blank`-only batch also counts as a stream
+            // command, and it must not drag every lit head through a re-activation.
+            if cmd_heads != 0 && data.is_navarro() {
+                // Gather the whole dock's desired state first, and only commit to it if at least
+                // two heads end up in it. Below two there is nothing for the dual path to do and
+                // the per-head schedule is the proven one, so nothing is disturbed.
+                let mut fold: [Option<super::cp::Timing>; HEADS] = [None; HEADS];
+                for head in 0..HEADS {
+                    // A head this batch is already mode-setting: take the requested timing, even
+                    // if the head is currently lit. A live reconfigure is exactly the case that
+                    // must not go down the per-head path.
+                    if cmd_heads & (1u32 << head) != 0 {
+                        if let Some(timing) = data.last_timing.lock()[head] {
+                            if data.modeset_requested[head].load(Ordering::Acquire)
+                                == timing_key(&timing)
+                            {
+                                fold[head] = Some(timing);
+                            }
+                        }
+                        continue;
+                    }
+                    // A head this batch does not name, but which is lit and still wants the mode
+                    // it is showing. One whose request has already moved on has its own `ModeSet`
+                    // queued behind this batch and is left to it.
+                    let active = data.modeset_active[head].load(Ordering::Acquire);
+                    if active != 0
+                        && data.modeset_requested[head].load(Ordering::Acquire) == active
+                    {
+                        fold[head] = data.last_timing.lock()[head];
+                    }
+                }
+                if fold.iter().flatten().count() >= 2 {
+                    for head in 0..HEADS {
+                        let Some(timing) = fold[head] else {
+                            continue;
+                        };
+                        // `activate_dual_wake` only accepts a head whose generation is zero; a
+                        // dock-wide transaction re-establishes every head from scratch, so say so.
+                        data.modeset_active[head].store(0, Ordering::Release);
+                        dual_timings[head] = Some(timing);
+                        cmd_heads |= 1u32 << head;
+                        vino_debug!(
+                            "vino: head {head} joins a dock-wide mode set ({}x{}@{})\n",
+                            timing.hactive,
+                            timing.vactive,
+                            timing.refresh_hz
+                        );
+                    }
+                }
+            }
             if has_modeset {
                 data.cmd_busy
                     .store(true, core::sync::atomic::Ordering::SeqCst);
@@ -4026,6 +4195,9 @@ impl WorkItem for VinoDrmData {
                         false
                     }
                 };
+            // Heads whose mode this batch actually re-programmed, and whose dock-side cursor is
+            // therefore gone. See `rearm_cursor`.
+            let mut relit = if dual_complete { cmd_heads } else { 0 };
             let mut cmds: [Option<KmsCmd>; HEADS * 4] = [const { None }; HEADS * 4];
             for (head, pending) in pending.heads.into_iter().enumerate() {
                 cmds[head] = pending.stream;
@@ -4073,6 +4245,15 @@ impl WorkItem for VinoDrmData {
                     }),
                     KmsCmd::Blank { head } => data.blank_head(dev, *head),
                 };
+                // Remember what the dock accepted, so a later mode set can put it back. Recorded
+                // here rather than where the atomic callback queues it, because only a command
+                // that actually went out describes the dock's state.
+                if res.is_ok() {
+                    data.record_cursor(&cmd);
+                    if let KmsCmd::ModeSet { head, .. } = &cmd {
+                        relit |= 1u32 << head;
+                    }
+                }
                 if let Err(e) = res {
                     if !kms_error_retryable(e) {
                         pr_warn!("vino: dropping invalid asynchronous KMS command ({e:?})\n");
@@ -4095,6 +4276,12 @@ impl WorkItem for VinoDrmData {
             if has_modeset {
                 data.cmd_busy
                     .store(false, core::sync::atomic::Ordering::SeqCst);
+            }
+            // Put each re-programmed head's cursor back. Queued rather than sent inline so it
+            // drains through the ordinary path on the next turn of this loop, behind anything the
+            // compositor has published in the meantime -- a real cursor commit always wins.
+            if relit != 0 && !retry {
+                data.rearm_cursor(&this, relit);
             }
 
             if retry {
