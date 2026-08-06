@@ -1194,6 +1194,18 @@ impl VinoDrmData {
         for timer in timers.iter().flatten() {
             let published = timer.crtc.lock().take();
             if let Some(crtc_ref) = published {
+                // The software vblank clock has just stopped, and a page flip armed by
+                // `atomic_flush` is waiting on a tick that will never come. `drm_crtc_vblank_off()`
+                // both refuses further vblank references -- so `drm_atomic_helper_wait_for_vblanks`
+                // skips this CRTC instead of warning -- and sends every event still queued on the
+                // device's vblank list, which is exactly where `PendingVblankEvent::arm` put ours.
+                //
+                // Without it an unplug left the compositor's `commit_tail` blocked until DRM's own
+                // deadlines expired: this boot logged 73 `vblank wait timed out` warnings and 110
+                // pairs of `flip_done timed out` / `commit wait timed out`, ten seconds each, on
+                // top of every dock reset. That is most of the delay between a dock coming back and
+                // pixels reappearing.
+                crtc_ref.crtc().vblank_off();
                 let crtc: &VinoCrtc = crtc_ref.crtc();
                 drop(crtc.vblank_pinned.lock().take());
                 drop(crtc_ref);
