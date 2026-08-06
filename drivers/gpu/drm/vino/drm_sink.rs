@@ -4448,25 +4448,36 @@ impl KmsDriver for VinoDrmDriver {
                     | plane::Rotation::REFLECT_X
                     | plane::Rotation::REFLECT_Y,
             )?;
-            let cursor = plane::UnregisteredPlane::<VinoPlane>::new(
-                dev,
-                crtc_mask,
-                &CURSOR_FORMATS,
-                None,
-                plane::Type::Cursor,
-                None,
-                PlaneArgs {
-                    head: head as u8,
-                    is_cursor: true,
-                },
-            )?;
-            // An alpha framebuffer requires a blend-mode property. The dock composites the cursor
-            // from a premultiplied bitmap, so premultiplied is the only supported mode.
-            cursor.create_blend_mode_property(plane::BlendModes::PREMULTIPLIED)?;
+            // No cursor plane at all while the hardware cursor is off. Merely declining to send
+            // the messages is not enough: the plane's atomic commit still *succeeds*, so the
+            // compositor goes on handing the pointer to hardware and stops drawing its own, and
+            // the pointer simply vanishes. A CRTC with no cursor plane is how a driver says "draw
+            // it yourself", and it is what this dock effectively had while every cursor message
+            // was being rejected for an out-of-range head selector.
+            let cursor = if *crate::module_parameters::cursor_enabled.value() != 0 {
+                let cursor = plane::UnregisteredPlane::<VinoPlane>::new(
+                    dev,
+                    crtc_mask,
+                    &CURSOR_FORMATS,
+                    None,
+                    plane::Type::Cursor,
+                    None,
+                    PlaneArgs {
+                        head: head as u8,
+                        is_cursor: true,
+                    },
+                )?;
+                // An alpha framebuffer requires a blend-mode property. The dock composites the
+                // cursor from a premultiplied bitmap, so premultiplied is the only supported mode.
+                cursor.create_blend_mode_property(plane::BlendModes::PREMULTIPLIED)?;
+                Some(cursor)
+            } else {
+                None
+            };
             let crtc_obj = crtc::UnregisteredCrtc::<VinoCrtc>::new(
                 dev,
                 primary,
-                Some(&cursor),
+                cursor.as_deref(),
                 None,
                 head as u8,
             )?;
