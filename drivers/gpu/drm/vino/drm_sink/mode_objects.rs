@@ -213,7 +213,13 @@ impl crtc::DriverCrtc for VinoCrtc {
         // mode-set, so any silence from here is the dock's news, not vino's.
         data.set_self_blanked(head as usize, false);
         let timing = match crate::cp::timing_from_drm_mode(new.mode(), data.is_navarro()) {
-            Ok(timing) => timing,
+            Ok(mut timing) => {
+                // The depth the dock is told must match the depth the plane will actually send.
+                // `head_ten_bit` is set from the committed framebuffer's fourcc, so a head that
+                // never gets a 10-bit buffer is never announced as 30 bpp.
+                timing.ten_bit = data.head_is_ten_bit(head as usize);
+                timing
+            }
             Err(e) => {
                 pr_err!(
                     "vino: head {} reached atomic enable with an unsupported mode ({e:?})\n",

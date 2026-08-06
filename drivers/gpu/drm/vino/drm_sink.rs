@@ -70,6 +70,12 @@ const FALLBACK_H: i32 = 1440;
 /// Primary-plane format list (opaque 32bpp scanout).
 static PRIMARY_FORMATS: [u32; 1] = [drm::fourcc::XRGB8888];
 
+/// Primary-plane format list for a dock whose pipeline carries 10 bits per channel.
+///
+/// `XRGB8888` stays first: it is what every ordinary desktop commits, and a compositor choosing
+/// between them should not be pushed towards the deeper one by list order alone.
+static PRIMARY_FORMATS_HDR: [u32; 2] = [drm::fourcc::XRGB8888, drm::fourcc::XRGB2101010];
+
 /// Cursor-plane format list.
 static CURSOR_FORMATS: [u32; 1] = [drm::fourcc::ARGB8888];
 
@@ -1005,6 +1011,8 @@ pub(super) struct VinoDrmData {
     edid_caught: Mutex<Option<KVec<u8>>>,
     /// Heads intentionally blanked by Vino. Their expected probe silence is not a hot-unplug.
     self_blanked: core::sync::atomic::AtomicU32,
+    /// Whether this dock's video pipeline can carry ten bits per channel, from its profile.
+    hdr_capable: AtomicBool,
     /// Per-head key and nonce used to seal pipe-arm records.
     #[pin]
     video_keys: Mutex<[kernel::crypto::Secret<32>; HEADS]>,
@@ -1089,6 +1097,7 @@ impl VinoDrmData {
             edid_target: core::sync::atomic::AtomicU32::new(NO_EDID_TARGET),
             edid_caught <- new_mutex!(None),
             self_blanked: core::sync::atomic::AtomicU32::new(0),
+            hdr_capable: AtomicBool::new(false),
             codec_geometry: core::sync::atomic::AtomicU32::new(0),
             head_ten_bit: core::sync::atomic::AtomicU32::new(0),
             connectors: core::sync::atomic::AtomicU8::new(HEADS as u8),
@@ -1310,6 +1319,25 @@ impl VinoDrmData {
             ((p >> 20) & 0xff) as u8,
             ((p >> 28) & 0xf) as u8,
         )
+    }
+
+    /// Record whether this dock's pipeline carries ten bits per channel.
+    pub(super) fn set_hdr_capable(&self, on: bool) {
+        self.hdr_capable.store(on, Ordering::Release);
+    }
+
+    /// Whether this dock can be driven at ten bits per channel; see [`DockProfile::hdr_capable`].
+    pub(super) fn hdr_capable(&self) -> bool {
+        self.hdr_capable.load(Ordering::Acquire)
+    }
+
+    /// Whether `head`'s committed framebuffer is 10 bits per channel.
+    ///
+    /// Read by the mode-set path, which must announce a depth to the dock that matches the one the
+    /// plane will actually send: the dock sizes its buffer from the pair and mis-sizes it if they
+    /// disagree.
+    pub(super) fn head_is_ten_bit(&self, head: usize) -> bool {
+        self.head_ten_bit.load(Ordering::Acquire) & (1u32 << head) != 0
     }
 
     /// This device's codec geometry at one head's committed sample depth.
@@ -4122,6 +4150,7 @@ impl KmsDriver for VinoDrmDriver {
     }
 
     fn create_objects(dev: &UnregisteredKmsDevice<'_, Self>) -> Result {
+        let data: &VinoDrmData = dev;
         // Build one independent head (CRTC + primary/cursor plane + encoder + connector) per
         // wired display, each pinned to its own video endpoint via its head index.
         for head in 0..HEADS {
@@ -4133,7 +4162,11 @@ impl KmsDriver for VinoDrmDriver {
             let primary = plane::UnregisteredPlane::<VinoPlane>::new(
                 dev,
                 crtc_mask,
-                &PRIMARY_FORMATS,
+                if data.hdr_capable() {
+                    &PRIMARY_FORMATS_HDR[..]
+                } else {
+                    &PRIMARY_FORMATS[..]
+                },
                 None,
                 plane::Type::Primary,
                 None,
@@ -4204,6 +4237,20 @@ impl KmsDriver for VinoDrmDriver {
                 head as u8,
             )?;
             conn.attach_encoder(&*enc)?;
+            // HDR is a property of the dock's pipeline, not of the monitor: a sink that declares
+            // ST 2084 is useless if the dock cannot be told to carry ten bits. Attaching these
+            // only where the profile says so keeps a Ridge connector from advertising an output
+            // it has no set-mode encoding for.
+            //
+            // All three are needed together. `max bpc` is what a compositor raises to ask for a
+            // deeper pipeline; the colorimetry property is how it selects BT.2020; and
+            // HDR_OUTPUT_METADATA carries the mastering display and content light levels through
+            // to the sink's own tone mapping. Attach two and KWin will not offer HDR at all.
+            if data.hdr_capable() {
+                conn.attach_max_bpc_property(8, 10)?;
+                conn.attach_colorspace_property()?;
+                conn.attach_hdr_output_metadata_property();
+            }
         }
         Ok(())
     }

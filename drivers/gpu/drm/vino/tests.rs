@@ -1403,6 +1403,7 @@ mod protocol {
             stride: 0x4000,
             total_rows: 0x6000,
             vic_word: 0x0800,
+            ten_bit: false,
         };
         let m = cp::set_mode(0x1234, 1, &timing)?;
         assert_eq!(m.len(), 80);

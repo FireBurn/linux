@@ -975,6 +975,7 @@ impl usb::Driver for VinoDriver {
             );
             d.set_navarro(info.is_navarro());
             d.set_connectors(info.connectors);
+            d.set_hdr_capable(info.hdr_capable);
         }
         let bringup = BringUp::new(ddev.clone(), info)?;
         let bringup_slot = KBox::pin_init(new_mutex!(Some(bringup.clone())), GFP_KERNEL)?;
@@ -1066,6 +1067,10 @@ kernel::module_usb_driver! {
         navarro_mode_offset_ms: u32 {
             default: 0,
             description: "Milliseconds from the Navarro cold-activation anchor to the first real mode set (0 = the captured 2978). The captured prelude ends at 2016 ms, so the remainder is unexplained wait; this settles how much of it the dock needs",
+        },
+        hdr_dma_format: u8 {
+            default: 0,
+            description: "Offset-23 DMA buffer format for a 10-bit head (0 = the default 1). The dock's bytes-per-pixel table has two four-byte entries, 1 and 3, and no capture distinguishes them; this settles it on hardware",
         },
         idle_opens: u8 {
             default: 0,

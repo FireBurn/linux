@@ -277,6 +277,11 @@ pub(super) struct Timing {
     pub total_rows: u16,
     /// Picture aspect and CTA VIC at offset 66; see [`vic_word`].
     pub vic_word: u16,
+    /// Whether this head scans out 10 bits per channel, which selects the offset-68 colour depth
+    /// and the offset-23 DMA buffer format together. They are one decision: the dock sizes its own
+    /// buffer from the format's bytes-per-pixel and interprets the samples by the depth, so a
+    /// mismatched pair mis-sizes the allocation.
+    pub ten_bit: bool,
 }
 
 /// Pixel granularity the render stride is quantised to.
@@ -453,6 +458,8 @@ pub(super) fn mode_supported(mode: &kernel::drm::kms::modes::DisplayMode) -> boo
 /// capture carries as zero. The three values above 24bpp are 10, 12 and 16 bits per channel --
 /// the deep-colour ladder -- and vino drives none of them.
 const COLOUR_DEPTH_24BPP: u16 = 0x0200;
+/// Offset-68 for 30 bpp: the same enum, one step up the deep-colour ladder (10 bits per channel).
+const COLOUR_DEPTH_30BPP: u16 = 0x0300;
 
 /// Offset-23 of the `0x48/0x22` message: the DMA buffer format the head scans out.
 ///
@@ -461,6 +468,18 @@ const COLOUR_DEPTH_24BPP: u16 = 0x0200;
 /// teardown writes no timing at all and leaves the field zero.
 const DMA_FORMAT_RGB888: u8 = 2;
 const DMA_FORMAT_NONE: u8 = 0;
+/// Offset-23 for a 10-bit head. The dock's table gives 2, 4, 3 and 4 bytes per pixel for formats 0
+/// through 3, so a 30 bpp sample -- four bytes packed as 2:10:10:10 -- must be one of the two
+/// four-byte entries. No capture distinguishes 1 from 3, so `hdr_dma_format` exists to settle it
+/// on hardware; 1 is the default only because it is the lower of the two.
+const DMA_FORMAT_RGB101010_DEFAULT: u8 = 1;
+
+fn dma_format_ten_bit() -> u8 {
+    match *crate::module_parameters::hdr_dma_format.value() {
+        0 => DMA_FORMAT_RGB101010_DEFAULT,
+        n => n,
+    }
+}
 
 /// Build the set-mode message's teardown form: every timing word zero and
 /// [`SYNC_FLAGS_TEARDOWN`] at offset 42.
@@ -492,7 +511,14 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
     header(&mut b, 0x48, 0x22, counter)?;
     pad_to(&mut b, 22)?;
     b.push(head, GFP_KERNEL)?; // off22: downstream head selector
-    b.push(DMA_FORMAT_RGB888, GFP_KERNEL)?;
+    b.push(
+        if t.ten_bit {
+            dma_format_ten_bit()
+        } else {
+            DMA_FORMAT_RGB888
+        },
+        GFP_KERNEL,
+    )?;
     pad_to(&mut b, 26)?; // off24..25 zero; timing begins at off26
     for v in [
         t.hactive,
@@ -515,7 +541,15 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
     b.extend_from_slice(&0x00ffu16.to_le_bytes(), GFP_KERNEL)?; // off60: profile constant
     pad_to(&mut b, 66)?;
     b.extend_from_slice(&t.vic_word.to_le_bytes(), GFP_KERNEL)?; // off66: see `vic_word`
-    b.extend_from_slice(&COLOUR_DEPTH_24BPP.to_le_bytes(), GFP_KERNEL)?;
+    b.extend_from_slice(
+        &if t.ten_bit {
+            COLOUR_DEPTH_30BPP
+        } else {
+            COLOUR_DEPTH_24BPP
+        }
+        .to_le_bytes(),
+        GFP_KERNEL,
+    )?;
 
     // off70..73: pixel clock in 10 kHz units, a full u32. Ridge only ever fills the low half, so
     // this is byte-identical there to the old u16 followed by two zero bytes.
@@ -583,6 +617,9 @@ pub(super) fn timing_from_drm_mode(
         stride,
         total_rows,
         vic_word: profile.vic_word,
+        // Filled by the caller, which knows the committed framebuffer's format; the mode alone
+        // does not say what depth will be scanned out.
+        ten_bit: false,
     })
 }
 /// Known CP `sub` identifiers used to validate a decrypted header.
