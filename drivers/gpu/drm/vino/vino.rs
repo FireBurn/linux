@@ -1163,6 +1163,10 @@ kernel::module_usb_driver! {
             default: 0,
             description: "Offset-23 DMA buffer format for a 10-bit head (0 = the default 1). The dock's bytes-per-pixel table has two four-byte entries, 1 and 3, and no capture distinguishes them; this settles it on hardware",
         },
+        hdr_advertise: u8 {
+            default: 0,
+            description: "Attach the Colorspace and HDR_OUTPUT_METADATA connector properties (0 = no). They are what make a compositor encode PQ/BT.2020, and nothing yet carries the colorimetry to the dock, so enabling HDR turns the desktop grey. Set 1 to work on it",
+        },
         flap_repair: u8 {
             default: 1,
             description: "Absorb the dock's transient sink drops instead of dropping the DRM connector the moment one is reported (0 = off, tear down on two contrary probes as before). A drop that outlasts the window is still a removal",

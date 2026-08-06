@@ -4584,11 +4584,20 @@ impl KmsDriver for VinoDrmDriver {
             // only where the profile says so keeps a Ridge connector from advertising an output
             // it has no set-mode encoding for.
             //
-            // All three are needed together. `max bpc` is what a compositor raises to ask for a
-            // deeper pipeline; the colorimetry property is how it selects BT.2020; and
-            // HDR_OUTPUT_METADATA carries the mastering display and content light levels through
-            // to the sink's own tone mapping. Attach two and KWin will not offer HDR at all.
-            if data.hdr_capable() {
+            // ⛔ OFF BY DEFAULT, because advertising it is worse than not having it. `Colorspace`
+            // and HDR_OUTPUT_METADATA are what make a compositor switch its output encoding to
+            // PQ/BT.2020. Vino attaches them and reads neither: nothing carries the colorimetry or
+            // the mastering-display metadata to the dock, so the monitor stays in SDR while being
+            // fed PQ code words. User-visible result, measured by eye: the whole desktop goes
+            // grey. `max bpc` and the 10-bit plane format are harmless on their own -- they only
+            // describe what could be carried -- so they stay.
+            //
+            // What is missing is the field in `id=0x48 sub=0x22` that selects the transfer
+            // function. The depth is settled (offset 68, with offset 23 following it) but the
+            // colorimetry is not, and the Windows HDR A/B capture cannot settle it: its control
+            // plane is sealed, and only Navarro's *video* is plaintext. It needs a keyed capture
+            // of DLM toggling HDR on this dock.
+            if data.hdr_capable() && *crate::module_parameters::hdr_advertise.value() != 0 {
                 conn.attach_max_bpc_property(8, 10)?;
                 conn.attach_colorspace_property()?;
                 conn.attach_hdr_output_metadata_property();
