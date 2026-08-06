@@ -1053,9 +1053,15 @@ pub(super) struct VinoDrmData {
 }
 
 impl VinoDrmData {
+    /// `hdr_capable` comes from the dock's profile and must be supplied here rather than stored
+    /// afterwards: `create_objects` runs inside `drm::Registration::new_static`,
+    /// which is *before* probe reaches the block that publishes the rest of the profile. Set late,
+    /// it was always false while the connectors and planes were being built, so the ten-bit format
+    /// and the three HDR properties were silently never attached.
     pub(super) fn new(
         io: Arc<super::usb::IoWindow>,
         eps: super::Endpoints,
+        hdr_capable: bool,
     ) -> impl PinInit<Self, Error> {
         try_pin_init!(Self {
             io,
@@ -1118,7 +1124,7 @@ impl VinoDrmData {
             edid_target: core::sync::atomic::AtomicU32::new(NO_EDID_TARGET),
             edid_caught <- new_mutex!(None),
             self_blanked: core::sync::atomic::AtomicU32::new(0),
-            hdr_capable: AtomicBool::new(false),
+            hdr_capable: AtomicBool::new(hdr_capable),
             codec_geometry: core::sync::atomic::AtomicU32::new(0),
             head_ten_bit: core::sync::atomic::AtomicU32::new(0),
             connectors: core::sync::atomic::AtomicU8::new(HEADS as u8),
@@ -1352,11 +1358,6 @@ impl VinoDrmData {
             ((p >> 20) & 0xff) as u8,
             ((p >> 28) & 0xf) as u8,
         )
-    }
-
-    /// Record whether this dock's pipeline carries ten bits per channel.
-    pub(super) fn set_hdr_capable(&self, on: bool) {
-        self.hdr_capable.store(on, Ordering::Release);
     }
 
     /// Whether this dock can be driven at ten bits per channel; see [`DockProfile::hdr_capable`].
@@ -4117,7 +4118,14 @@ impl WorkItem for VinoDrmData {
             // reset and tens of seconds of dark panels on both.
             // `cmd_heads` rather than `has_modeset`: a `Blank`-only batch also counts as a stream
             // command, and it must not drag every lit head through a re-activation.
-            if cmd_heads != 0 && data.is_navarro() {
+            // ⚠ DEFAULT OFF. Folding the lit heads in makes `activate_dual_wake` replay the *cold*
+            // choreography -- a dock-wide sink reset and pipe clears -- on a dock that is already
+            // driving its sinks. It does stop the re-enumeration, and the wire stays byte-correct,
+            // but "the dock accepts every byte" is NOT evidence that it is driving the panels: this
+            // dock will take a whole frame and never start the downstream pixel clock. Until the
+            // panels have been confirmed lit by eye after a live mode change, this stays behind a
+            // switch so it can be A/B'd on hardware without a rebuild.
+            if cmd_heads != 0 && data.is_navarro() && *crate::module_parameters::dock_wide_modeset.value() != 0 {
                 // Gather the whole dock's desired state first, and only commit to it if at least
                 // two heads end up in it. Below two there is nothing for the dual path to do and
                 // the per-head schedule is the proven one, so nothing is disturbed.

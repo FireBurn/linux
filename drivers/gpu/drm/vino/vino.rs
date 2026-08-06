@@ -976,7 +976,10 @@ impl usb::Driver for VinoDriver {
         // driver-local force-unplug.
         let unreg = drm::UnregisteredDevice::<drm_sink::VinoDrmDriver>::new(
             intf,
-            drm_sink::VinoDrmData::new(io.clone(), eps),
+            // The ten-bit flag has to arrive here, not in the profile block below: the KMS objects
+            // are built during this call, and they decide then whether to offer a 10-bit format
+            // and the HDR connector properties.
+            drm_sink::VinoDrmData::new(io.clone(), eps, info.hdr_capable),
             &THIS_MODULE,
         )?;
         // `Core` derefs to `Bound`; name the context explicitly so `as_ref()`
@@ -1016,7 +1019,6 @@ impl usb::Driver for VinoDriver {
             );
             d.set_navarro(info.is_navarro());
             d.set_connectors(info.connectors);
-            d.set_hdr_capable(info.hdr_capable);
         }
         let bringup = BringUp::new(ddev.clone(), info)?;
         let bringup_slot = KBox::pin_init(new_mutex!(Some(bringup.clone())), GFP_KERNEL)?;
@@ -1112,6 +1114,10 @@ kernel::module_usb_driver! {
         hdr_dma_format: u8 {
             default: 0,
             description: "Offset-23 DMA buffer format for a 10-bit head (0 = the default 1). The dock's bytes-per-pixel table has two four-byte entries, 1 and 3, and no capture distinguishes them; this settles it on hardware",
+        },
+        dock_wide_modeset: u8 {
+            default: 0,
+            description: "Re-activate every lit DL-7400 head when any head is mode-set (0 = off). It stops the re-enumeration a live mode change otherwise causes, but it replays the cold activation choreography on a dock that is already driving its sinks, and the dock accepting video is not evidence that it is driving the panels. Confirm the panels by eye before turning this on",
         },
         idle_opens: u8 {
             default: 0,
