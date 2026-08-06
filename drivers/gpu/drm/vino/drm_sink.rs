@@ -995,6 +995,12 @@ pub(super) struct VinoDrmData {
     /// own -- correct either way, at the cost of one extra upload per shape change.
     #[pin]
     cursor_geometry: Mutex<[Option<(u16, u16)>; HEADS]>,
+    /// Heads whose next activation is a *repair* of a sink the dock dropped underneath us,
+    /// rather than a cold bring-up. A repair must not run the cold training window: the link
+    /// is already trained, and that window presents full keyframes at [`FRAME_PERIOD_MS`]
+    /// for three seconds -- measured at 1.07 GB over 12 seconds across two heads, which is
+    /// the documented way to destabilise this dock.
+    repair_heads: core::sync::atomic::AtomicU32,
     /// The cursor each head's connector is holding; see [`CursorShot`].
     #[pin]
     cursor_shot: Mutex<[Option<CursorShot>; HEADS]>,
@@ -1108,6 +1114,7 @@ impl VinoDrmData {
             cursor_epoch: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
             shadow_rr: core::array::from_fn(|_| core::sync::atomic::AtomicU32::new(0)),
             cursor_geometry <- new_mutex!([None; HEADS]),
+            repair_heads: core::sync::atomic::AtomicU32::new(0),
             cursor_shot <- new_mutex!([const { None }; HEADS]),
             // D6000 default: 442,368,000 px/s (one 1440p@120) x2 compression headroom = dual
             // 1440p@120. Replace it if a dock capability supplies a limit.
@@ -2183,8 +2190,7 @@ impl VinoDrmData {
             }
 
             self.modeset_active[head_i].store(want, Ordering::Release);
-            self.sustain_until.lock()[head_i] =
-                Some(Instant::<Monotonic>::now() + Delta::from_millis(3000));
+            self.sustain_until.lock()[head_i] = self.sustain_window(head_i);
             let bit = 1u32 << head;
             self.arm_prefix_pending.fetch_or(bit, Ordering::Release);
             // A driven connector's stream opens with its pipe descriptor, not the idle open.
@@ -2450,8 +2456,7 @@ impl VinoDrmData {
                     continue;
                 }
                 self.modeset_active[head].store(keys[head], Ordering::Release);
-                self.sustain_until.lock()[head] =
-                    Some(Instant::<Monotonic>::now() + Delta::from_millis(3000));
+                self.sustain_until.lock()[head] = self.sustain_window(head);
                 self.arm_prefix_pending.fetch_or(bit, Ordering::Release);
                 // A driven connector's stream opens with its pipe descriptor, not the idle open.
                 self.stream_open_pending.fetch_and(!bit, Ordering::Release);
@@ -3459,6 +3464,79 @@ impl VinoDrmData {
         }
     }
 
+    /// How long this head should hold the post-mode-set training cadence.
+    ///
+    /// A cold activation needs it: the dock will not program its downstream pixel clock without a
+    /// sustained stream. A repair does not -- the link is already trained and the sink was dropped
+    /// underneath us -- and running it there costs the dock three seconds of full keyframes at
+    /// `FRAME_PERIOD_MS`. Consumes the repair flag, so the window returns for the next real
+    /// bring-up.
+    fn sustain_window(&self, head: usize) -> Option<Instant<Monotonic>> {
+        let bit = 1u32 << head;
+        if self.repair_heads.fetch_and(!bit, Ordering::AcqRel) & bit != 0 {
+            return None;
+        }
+        Some(Instant::<Monotonic>::now() + Delta::from_millis(3000))
+    }
+
+    /// Re-drive every lit head after the dock dropped a downstream sink underneath us.
+    ///
+    /// The presence flap is the dock really taking a sink down, and the only thing that used to
+    /// repair it was letting the DRM connector disappear so the compositor would re-enable the
+    /// output. That cure was worse than the disease: it re-lays-out userspace, and the mode set it
+    /// produces names one head while its sibling is lit, which re-enumerates the dock. So vino
+    /// repairs the head itself and leaves the connector alone.
+    ///
+    /// Every lit head is re-queued, not just the one that flapped, and they go into one batch: a
+    /// mode set this dock accepts is one that names every head at once
+    /// (`activate_dual_wake`). Zeroing the mode generation is what makes that path take them.
+    ///
+    /// Returns the number of heads queued.
+    pub(super) fn repair_flapped_head(&self, dev: &VinoDrmDevice, flapped: usize) -> u32 {
+        let mut queued = 0u32;
+        let mut cmds: [Option<super::cp::Timing>; HEADS] = [None; HEADS];
+        for head in 0..HEADS {
+            let active = self.modeset_active[head].load(Ordering::Acquire);
+            if active == 0 || self.modeset_requested[head].load(Ordering::Acquire) != active {
+                continue;
+            }
+            let Some(timing) = self.last_timing.lock()[head] else {
+                continue;
+            };
+            if timing_key(&timing) != active {
+                continue;
+            }
+            cmds[head] = Some(timing);
+        }
+        if cmds.iter().flatten().count() == 0 {
+            return 0;
+        }
+        for head in 0..HEADS {
+            let Some(timing) = cmds[head] else {
+                continue;
+            };
+            // The dock's copy of this head is gone, so nothing it holds can be diffed against.
+            self.repair_heads
+                .fetch_or(1u32 << head, Ordering::Release);
+            self.modeset_active[head].store(0, Ordering::Release);
+            self.owe_keyframe(head);
+            self.strip_hashes.lock()[head] = None;
+            self.dirty_ttl.lock()[head] = None;
+            self.queue_cmd(
+                dev,
+                KmsCmd::ModeSet {
+                    head: head as u8,
+                    timing,
+                },
+            );
+            queued += 1;
+        }
+        pr_info!(
+            "vino: head {flapped} sink flap -- re-driving {queued} lit head(s) together\n"
+        );
+        queued
+    }
+
     /// Whether head `head`'s presence bit is currently set (for the keepalive to seed its baseline
     /// before watching for runtime connect/remove transitions).
     pub(super) fn head_present(&self, head: usize) -> bool {
@@ -4138,13 +4216,11 @@ impl WorkItem for VinoDrmData {
             // reset and tens of seconds of dark panels on both.
             // `cmd_heads` rather than `has_modeset`: a `Blank`-only batch also counts as a stream
             // command, and it must not drag every lit head through a re-activation.
-            // ⚠ DEFAULT OFF. Folding the lit heads in makes `activate_dual_wake` replay the *cold*
-            // choreography -- a dock-wide sink reset and pipe clears -- on a dock that is already
-            // driving its sinks. It does stop the re-enumeration, and the wire stays byte-correct,
-            // but "the dock accepts every byte" is NOT evidence that it is driving the panels: this
-            // dock will take a whole frame and never start the downstream pixel clock. Until the
-            // panels have been confirmed lit by eye after a live mode change, this stays behind a
-            // switch so it can be A/B'd on hardware without a rebuild.
+            // Folding the lit heads in makes `activate_dual_wake` name every head at once, which
+            // is the only shape of mode set this dock accepts while more than one head is lit.
+            // Kept behind a switch because it also replays the cold choreography -- a dock-wide
+            // sink reset and pipe clears -- on a dock that is already driving its sinks, and that
+            // is worth being able to take back out without a rebuild.
             if cmd_heads != 0 && data.is_navarro() && *crate::module_parameters::dock_wide_modeset.value() != 0 {
                 // Gather the whole dock's desired state first, and only commit to it if at least
                 // two heads end up in it. Below two there is nothing for the dual path to do and
@@ -4448,12 +4524,12 @@ impl KmsDriver for VinoDrmDriver {
                     | plane::Rotation::REFLECT_X
                     | plane::Rotation::REFLECT_Y,
             )?;
-            // No cursor plane at all while the hardware cursor is off. Merely declining to send
-            // the messages is not enough: the plane's atomic commit still *succeeds*, so the
-            // compositor goes on handing the pointer to hardware and stops drawing its own, and
-            // the pointer simply vanishes. A CRTC with no cursor plane is how a driver says "draw
-            // it yourself", and it is what this dock effectively had while every cursor message
-            // was being rejected for an out-of-range head selector.
+            // The cursor plane is withdrawn entirely when the hardware cursor is off, not merely
+            // starved of messages: its atomic commit would still succeed, so the compositor would
+            // go on handing the pointer to hardware and stop drawing its own, and the pointer
+            // would simply vanish. A CRTC with no cursor plane is how a driver says "draw it
+            // yourself" -- and it is the state this dock was in for its whole life so far, because
+            // every cursor message was rejected for an out-of-range head selector.
             let cursor = if *crate::module_parameters::cursor_enabled.value() != 0 {
                 let cursor = plane::UnregisteredPlane::<VinoPlane>::new(
                     dev,

@@ -588,6 +588,24 @@ impl WorkItem for BringUp {
             // forward; without a floor it would run once per loop iteration for as long as the
             // dock keeps talking.
             const PRESENCE_MIN_GAP: Delta = Delta::from_millis(50);
+            /// How long a connector must read absent before its monitor is called removed.
+            ///
+            /// A removal has to be debounced in TIME, not in probes: every `id=0x44` reply sets the
+            /// downstream-event flag, and a presence probe's own reply *is* an `id=0x44`, so the
+            /// watcher kept pulling itself forward to `PRESENCE_MIN_GAP` and "two consecutive
+            /// contrary reads" fired 132 ms after the first negative.
+            ///
+            /// Measured on a lit, idle DL-7400: the absent runs are 0.11 s to 2.29 s, twenty-nine
+            /// of them over three minutes, reaching 2.46 s around a mode change.
+            ///
+            /// ⚠ The debounce is only half of it. Those blips are the dock really dropping the
+            /// sink, and letting the connector disappear was what repaired them -- the compositor
+            /// re-enabled the output and the resulting mode set relit the panel. Debouncing alone
+            /// leaves the head dark for good. `repair_flapped_head` is the other half, and the two
+            /// only work together.
+            const PRESENCE_REMOVE_MS: i64 = 5000;
+            let mut head_absent_since: [Option<Instant<Monotonic>>; VinoDriver::CP_SETUP_HEADS] =
+                [None; VinoDriver::CP_SETUP_HEADS];
             // A recovered sink need not emit a uniquely identifiable event, so a head whose
             // discovery was deferred is retried at a bounded cadence until the probe answers.
             const REENGAGE_RETRY: Delta = Delta::from_millis(4000);
@@ -760,6 +778,20 @@ impl WorkItem for BringUp {
                         head_probed[h] = Some(present);
                         if present == head_known[h] {
                             head_debounce[h] = 0;
+                            // The sink came back before the removal deadline, so the connector was
+                            // never dropped and nothing downstream will re-drive this head. The
+                            // dock has forgotten it, so vino has to put it back itself.
+                            if present && head_absent_since[h].take().is_some() {
+                                if *crate::module_parameters::flap_repair.value() != 0 {
+                                    let _ = data.reengage_head(dev, h as u8);
+                                    data.repair_flapped_head(drm_dev, h);
+                                } else {
+                                    dev_info!(
+                                        cdev,
+                                        "vino: head {h} sink flap absorbed; repair disabled\n"
+                                    );
+                                }
+                            }
                             continue;
                         }
                         // Inside the settling window after a recovery, a negative answer is not
@@ -768,12 +800,32 @@ impl WorkItem for BringUp {
                             && (Instant::<Monotonic>::now() - presence_grace[h]).as_millis() < 0
                         {
                             head_debounce[h] = 0;
+                            head_absent_since[h] = None;
                             continue;
                         }
-                        // Require two consecutive contrary reads before acting.
-                        head_debounce[h] = head_debounce[h].saturating_add(1);
-                        if head_debounce[h] < 2 {
-                            continue;
+                        if present {
+                            // Two consecutive contrary reads before announcing an arrival.
+                            head_absent_since[h] = None;
+                            head_debounce[h] = head_debounce[h].saturating_add(1);
+                            if head_debounce[h] < 2 {
+                                continue;
+                            }
+                        } else if *crate::module_parameters::flap_repair.value() != 0 {
+                            // A removal must be sustained: the dock reports a lit sink absent for
+                            // seconds at a time.
+                            let since = *head_absent_since[h]
+                                .get_or_insert_with(Instant::<Monotonic>::now);
+                            if (Instant::<Monotonic>::now() - since).as_millis()
+                                < PRESENCE_REMOVE_MS
+                            {
+                                continue;
+                            }
+                            head_absent_since[h] = None;
+                        } else {
+                            head_debounce[h] = head_debounce[h].saturating_add(1);
+                            if head_debounce[h] < 2 {
+                                continue;
+                            }
                         }
                         head_debounce[h] = 0;
                         if present {
@@ -1074,12 +1126,16 @@ kernel::module_usb_driver! {
             default: 0,
             description: "Offset-23 DMA buffer format for a 10-bit head (0 = the default 1). The dock's bytes-per-pixel table has two four-byte entries, 1 and 3, and no capture distinguishes them; this settles it on hardware",
         },
+        flap_repair: u8 {
+            default: 1,
+            description: "Absorb the dock's transient sink drops and re-drive the lit heads instead of letting the DRM connector disappear (0 = off). Needs the dock-wide mode set to be safe, since the repair names every lit head at once",
+        },
         cursor_enabled: u8 {
-            default: 0,
-            description: "Send hardware-cursor messages (0 = no). Off by default: the DL-7400 accepts them and displays nothing, and a cursor plane whose commit succeeds stops the compositor drawing its own -- so turning this on loses the pointer rather than moving it into hardware. Set 1 to work on the protocol",
+            default: 1,
+            description: "Publish a cursor plane and send hardware-cursor messages (1 = yes). Set 0 to withdraw the plane entirely, which puts the pointer back in the compositor's hands -- the state this dock was in while its head selector was out of range",
         },
         dock_wide_modeset: u8 {
-            default: 0,
+            default: 1,
             description: "Re-activate every lit DL-7400 head when any head is mode-set (0 = off). It stops the re-enumeration a live mode change otherwise causes, but it replays the cold activation choreography on a dock that is already driving its sinks, and the dock accepting video is not evidence that it is driving the panels. Confirm the panels by eye before turning this on",
         },
         idle_opens: u8 {
