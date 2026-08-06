@@ -922,6 +922,47 @@ pub trait RawConnectorState: AsRawConnectorState {
         // `self.state.connector` points to a valid instance of a `Connector<T>`
         unsafe { Self::Connector::from_raw((*self.as_raw()).connector) }
     }
+
+    /// The colorimetry userspace has requested through the `Colorspace` property, as a
+    /// [`enum drm_colorspace`] value.
+    ///
+    /// Meaningful only on a connector that
+    /// [`UnregisteredConnector::attach_colorspace_property`] was called for; everything else
+    /// leaves it at `DRM_MODE_COLORIMETRY_DEFAULT`.
+    ///
+    /// [`enum drm_colorspace`]: srctree/include/drm/drm_connector.h
+    fn colorspace(&self) -> u32 {
+        // SAFETY: `as_raw()` is a valid `drm_connector_state`.
+        unsafe { (*self.as_raw()).colorspace }
+    }
+
+    /// The electro-optical transfer function from the `HDR_OUTPUT_METADATA` blob, or [`None`] if
+    /// userspace has not set one.
+    ///
+    /// The value is one of the `HDMI_EOTF_*` constants; `HDMI_EOTF_SMPTE_ST2084` is what a
+    /// compositor sets when it drives the output in PQ. This is deliberately just the one byte:
+    /// the rest of the infoframe is mastering-display metadata for the sink, and a driver that
+    /// only needs to know *which curve the pixels are encoded in* should not have to reason about
+    /// the union's other members or their versioning.
+    ///
+    /// [`struct hdr_output_metadata`]: srctree/include/uapi/drm/drm_mode.h
+    fn hdr_output_eotf(&self) -> Option<u8> {
+        // SAFETY: `as_raw()` is a valid `drm_connector_state`.
+        let blob = unsafe { (*self.as_raw()).hdr_output_metadata };
+        if blob.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null `hdr_output_metadata` blob is valid for the state's lifetime.
+        let (data, length) = unsafe { ((*blob).data, (*blob).length) };
+        // DRM validates the blob length when the property is set, but this is the boundary where
+        // a short blob would become an out-of-bounds read.
+        if data.is_null() || length < core::mem::size_of::<bindings::hdr_output_metadata>() {
+            return None;
+        }
+        // SAFETY: the blob is at least a whole `hdr_output_metadata` and lives as long as the
+        // state. `eotf` is the first byte of the only union member DRM defines.
+        Some(unsafe { (*data.cast::<bindings::hdr_output_metadata>()).__bindgen_anon_1.hdmi_metadata_type1.eotf })
+    }
 }
 impl<T: AsRawConnectorState> RawConnectorState for T {}
 
