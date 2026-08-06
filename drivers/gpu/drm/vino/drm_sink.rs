@@ -3492,6 +3492,7 @@ impl VinoDrmData {
     /// (`activate_dual_wake`). Zeroing the mode generation is what makes that path take them.
     ///
     /// Returns the number of heads queued.
+    #[expect(dead_code, reason = "kept for the flap-repair experiment; see its doc comment")]
     pub(super) fn repair_flapped_head(&self, dev: &VinoDrmDevice, flapped: usize) -> u32 {
         let mut queued = 0u32;
         let mut cmds: [Option<super::cp::Timing>; HEADS] = [None; HEADS];

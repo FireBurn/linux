@@ -499,22 +499,56 @@ impl WorkItem for BringUp {
                             );
                             continue;
                         }
-                        match data.reengage_head(dev, head as u8) {
-                            Ok(true) => {
-                                data.set_connected(head);
+                        // Keep asking until the deadline. On a cold plug this dock can answer a
+                        // head's EDID fetch about four seconds after the session comes up, and a
+                        // single re-engage gives up in well under one -- its `id=0x15` steps just
+                        // go unanswered. One attempt therefore publishes a partial topology: the
+                        // compositor sees one monitor, mode-sets that head alone, and a mode set
+                        // naming one head while a sibling is still arriving is exactly what this
+                        // dock will not take. The whole point of the single initial hotplug is
+                        // that userspace configures the dock once, so it is worth waiting for.
+                        //
+                        // Only heads the probe has not called empty get here, so an unoccupied
+                        // socket still costs one message rather than this deadline.
+                        const INITIAL_RECOVERY_MS: i64 = 6000;
+                        let give_up =
+                            Instant::<Monotonic>::now() + Delta::from_millis(INITIAL_RECOVERY_MS);
+                        let mut tries = 0u32;
+                        loop {
+                            tries += 1;
+                            match data.reengage_head(dev, head as u8) {
+                                Ok(true) => {
+                                    data.set_connected(head);
+                                    dev_info!(
+                                        cdev,
+                                        "vino: head {head} monitor connected during initial \
+                                         recovery (attempt {tries})\n"
+                                    );
+                                    break;
+                                }
+                                Ok(false) => vino_dev_debug!(
+                                    cdev,
+                                    "vino: head {head} initial recovery found no monitor \
+                                     (attempt {tries})\n"
+                                ),
+                                Err(e) => vino_dev_debug!(
+                                    cdev,
+                                    "vino: head {head} initial recovery failed ({e:?}) \
+                                     (attempt {tries})\n"
+                                ),
+                            }
+                            if (Instant::<Monotonic>::now() - give_up).as_millis() >= 0
+                                || data.is_shutting_down()
+                            {
                                 dev_info!(
                                     cdev,
-                                    "vino: head {head} monitor connected during initial recovery\n"
+                                    "vino: head {head} never answered its EDID fetch in \
+                                     {INITIAL_RECOVERY_MS} ms ({tries} attempts); publishing \
+                                     without it\n"
                                 );
+                                break;
                             }
-                            Ok(false) => vino_dev_debug!(
-                                cdev,
-                                "vino: head {head} initial recovery found no monitor\n"
-                            ),
-                            Err(e) => dev_warn!(
-                                cdev,
-                                "vino: head {head} initial recovery failed ({e:?})\n"
-                            ),
+                            fsleep(Delta::from_millis(250));
                         }
                     }
                 }
@@ -781,16 +815,19 @@ impl WorkItem for BringUp {
                             // The sink came back before the removal deadline, so the connector was
                             // never dropped and nothing downstream will re-drive this head. The
                             // dock has forgotten it, so vino has to put it back itself.
+                            // ⛔ Do NOT re-drive the head here. Most of these blips heal on their
+                            // own -- the dock brings the sink back within a second or two -- and a
+                            // repair costs a full dock-wide re-activation, four seconds of cold
+                            // choreography for both panels. Measured: firing one per flap put the
+                            // dock into a permanent re-activation loop, one every five to fifteen
+                            // seconds, and neither panel ever stayed lit. Absorbing the blip is
+                            // the whole point; a drop that does *not* heal still falls through to
+                            // the timed removal below.
                             if present && head_absent_since[h].take().is_some() {
-                                if *crate::module_parameters::flap_repair.value() != 0 {
-                                    let _ = data.reengage_head(dev, h as u8);
-                                    data.repair_flapped_head(drm_dev, h);
-                                } else {
-                                    dev_info!(
-                                        cdev,
-                                        "vino: head {h} sink flap absorbed; repair disabled\n"
-                                    );
-                                }
+                                vino_dev_debug!(
+                                    cdev,
+                                    "vino: head {h} sink flap healed on its own\n"
+                                );
                             }
                             continue;
                         }
@@ -1128,7 +1165,7 @@ kernel::module_usb_driver! {
         },
         flap_repair: u8 {
             default: 1,
-            description: "Absorb the dock's transient sink drops and re-drive the lit heads instead of letting the DRM connector disappear (0 = off). Needs the dock-wide mode set to be safe, since the repair names every lit head at once",
+            description: "Absorb the dock's transient sink drops instead of dropping the DRM connector the moment one is reported (0 = off, tear down on two contrary probes as before). A drop that outlasts the window is still a removal",
         },
         cursor_enabled: u8 {
             default: 1,
