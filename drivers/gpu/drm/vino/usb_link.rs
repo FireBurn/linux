@@ -105,22 +105,6 @@ impl<'a> UsbLink<'a> {
         usb::BulkOutQueue::new(self.window, &self.io, ep, depth, buf_len)
     }
 
-    /// Writes one video transfer synchronously for transport diagnostics.
-    ///
-    /// This is deliberately not described as DLM's normal transport. The authenticated Navarro
-    /// capture reaches eight outstanding video URBs. Only its first prologue chunk is synchronous;
-    /// after that completion and a measured producer delay, DLM pipelines the remaining chunks.
-    pub(crate) fn video_send(
-        &self,
-        head: usize,
-        data: &[u8],
-        timeout: Delta,
-        gfp: Flags,
-    ) -> Result<usize> {
-        let ep = self.eps.video.get(head).ok_or(EINVAL)?;
-        self.io.bulk_send(ep, data, timeout, gfp)
-    }
-
     /// The underlying I/O token, for the paths that open a persistent queue.
     pub(crate) fn io(&self) -> &usb::Io<'a> {
         &self.io
@@ -134,11 +118,6 @@ impl<'a> UsbLink<'a> {
     /// Reads a control-plane reply from EP84.
     pub(crate) fn ctrl_recv(&self, data: &mut [u8], timeout: Delta, gfp: Flags) -> Result<usize> {
         self.io.bulk_recv(&self.eps.ctrl_in, data, timeout, gfp)
-    }
-
-    /// Clears a stall on `head`'s video endpoint.
-    pub(crate) fn clear_video_halt(&self, head: usize) -> Result {
-        self.io.clear_halt(self.eps.video.get(head).ok_or(EINVAL)?)
     }
 
     /// Reads the standard two-byte status word for a video endpoint.

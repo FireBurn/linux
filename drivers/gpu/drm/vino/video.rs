@@ -820,12 +820,10 @@ pub(crate) mod wht {
         cb: &[i32; PIXELS],
         y: &[i32; PIXELS],
     ) -> ColourBlock {
-        #[cfg(target_arch = "x86_64")]
-        let (tcr, tcb, ty) = match crate::simd::colour_block_transforms(cr, cb, y) {
-            Some(t) => t,
-            None => (transform(cr), transform(cb), transform(y)),
-        };
-        #[cfg(not(target_arch = "x86_64"))]
+        // ⛔ Do not reach for SIMD here. An AVX2 in-block Haar was written, verified byte-exact
+        // and measured in-kernel: it is parity-to-slower once `kernel_fpu_begin`/`end` are paid
+        // per block, costing about 18% more CPU on a live encode. A strip is ~72% entropy coder,
+        // which is bit-serial, so even a free transform caps the whole win near 23%.
         let (tcr, tcb, ty) = (transform(cr), transform(cb), transform(y));
         // Quantise all three planes and find each one's last significant coefficient in a single
         // pass. These were separate steps, so every block ran three further 63-element reverse

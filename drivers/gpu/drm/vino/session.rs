@@ -866,13 +866,10 @@ impl VinoDriver {
             let stream_id = profile.geometry().stream_id(head as u8);
             video_keys[head] = kernel::crypto::Secret::zeroed();
             // Whether the dock applies the control-plane whitening constant to a per-head SKE key
-            // is proven only for the link stream; the per-head rule is carried over from Ridge.
-            if *crate::module_parameters::video_key_raw.value() != 0 {
-                video_keys[head][..16].copy_from_slice(&ske_ks_h[..]);
-            } else {
-                let video_key = cp::cp_session_key(&ske_ks_h);
-                video_keys[head][..16].copy_from_slice(&video_key[..]);
-            }
+            // is proven only for the link stream; the per-head rule is carried over from Ridge,
+            // and both docks accept the sealed records it produces.
+            let video_key = cp::cp_session_key(&ske_ks_h);
+            video_keys[head][..16].copy_from_slice(&video_key[..]);
             let vnonce = cp::stream_content_nonce(&riv_h, stream_id);
             video_keys[head][16..24].copy_from_slice(&vnonce);
             for (i, (id, sub, content_len)) in cp::CP_SETUP_PER_HEAD.iter().copied().enumerate() {

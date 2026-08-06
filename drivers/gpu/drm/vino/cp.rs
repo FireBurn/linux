@@ -521,23 +521,10 @@ const DMA_FORMAT_NONE: u8 = 0;
 /// Offset-23 for a 10-bit head: `NM30`, the second of the table's two four-byte formats.
 ///
 /// The choice between the two used to be a coin flip -- both are four bytes, and no capture on
-/// either dock generation carries anything but `NM24` -- which is what `hdr_dma_format` was added
-/// to settle on hardware. The name settles it instead: 30 bits per pixel packed into four bytes is
-/// what a 2:10:10:10 sample is, and `NM32` is the 8-bit-with-padding format vino already has no
-/// use for.
+/// either dock generation carries anything but `NM24`. The name settles it: 30 bits per pixel
+/// packed into four bytes is what a 2:10:10:10 sample is, and `NM32` is the 8-bit-with-padding
+/// format vino has no use for.
 const DMA_FORMAT_NM30: u8 = 3;
-
-/// The offset-23 format for a 10-bit head, overridable by `hdr_dma_format`.
-///
-/// The override is kept now that the value is known, because it is the one field where being
-/// wrong is silent: the dock sizes its own allocation from the bytes-per-pixel this selects, so a
-/// wrong-but-same-width format mis-sizes nothing and would fail somewhere far away.
-fn dma_format_ten_bit() -> u8 {
-    match *crate::module_parameters::hdr_dma_format.value() {
-        0 => DMA_FORMAT_NM30,
-        n => n,
-    }
-}
 
 /// Build the set-mode message's teardown form: every timing word zero and
 /// [`SYNC_FLAGS_TEARDOWN`] at offset 42.
@@ -571,7 +558,7 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
     b.push(head, GFP_KERNEL)?; // off22: downstream head selector
     b.push(
         if t.ten_bit {
-            dma_format_ten_bit()
+            DMA_FORMAT_NM30
         } else {
             DMA_FORMAT_NM24
         },

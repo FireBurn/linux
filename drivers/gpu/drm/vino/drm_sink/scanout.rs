@@ -1273,9 +1273,6 @@ fn encode_and_send_wht(
             let submitted = {
                 let mut queue_slot = data.video_q[pipe_i].lock();
                 if queue_slot.is_none() {
-                    if *crate::module_parameters::video_clear_halt.value() != 0 {
-                        let _ = dev.clear_video_halt(head_i);
-                    }
                     match dev.video_queue(head_i, 8, XFER) {
                         Ok(q) => {
                             *queue_slot = Some(q);
@@ -1351,9 +1348,6 @@ fn encode_and_send_wht(
                                 wire_off,
                                 wire_len
                             );
-                            if *crate::module_parameters::video_clear_halt.value() != 0 {
-                                let _ = dev.clear_video_halt(head_i);
-                            }
                             return Err(e);
                         }
                         wire_off += data_len;

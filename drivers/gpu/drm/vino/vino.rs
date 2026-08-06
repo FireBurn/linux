@@ -116,8 +116,6 @@ mod crypto;
 mod hdcp;
 mod proto;
 mod rng;
-#[cfg(target_arch = "x86_64")]
-mod simd;
 mod video;
 mod video_arm;
 
@@ -644,12 +642,8 @@ impl WorkItem for BringUp {
             // on, starting the run if this is its first answer.
             //
             // Both the removal path and the EDID-recovery stand-down need this and for the same
-            // reason, so they share one notion of it. `flap_repair=0` restores the old immediate
-            // verdict, as that parameter promises.
+            // reason, so they share one notion of it.
             let sustained_absent = |run: &mut Option<Instant<Monotonic>>| -> bool {
-                if *crate::module_parameters::flap_repair.value() == 0 {
-                    return true;
-                }
                 let since = *run.get_or_insert_with(Instant::<Monotonic>::now);
                 (Instant::<Monotonic>::now() - since).as_millis() >= PRESENCE_REMOVE_MS
             };
@@ -887,22 +881,16 @@ impl WorkItem for BringUp {
                             if head_debounce[h] < 2 {
                                 continue;
                             }
-                        } else if *crate::module_parameters::flap_repair.value() != 0 {
+                        } else {
                             // A removal must be sustained: the dock reports a lit sink absent for
-                            // seconds at a time.
-                            let since = *head_absent_since[h]
-                                .get_or_insert_with(Instant::<Monotonic>::now);
-                            if (Instant::<Monotonic>::now() - since).as_millis()
-                                < PRESENCE_REMOVE_MS
-                            {
+                            // seconds at a time. Counting probes instead of time does not work --
+                            // every `id=0x44` reply sets the downstream-event flag, and a probe's
+                            // own reply is one, so the watcher pulls itself forward and "two
+                            // contrary reads" fires 132 ms after the first negative.
+                            if !sustained_absent(&mut head_absent_since[h]) {
                                 continue;
                             }
                             head_absent_since[h] = None;
-                        } else {
-                            head_debounce[h] = head_debounce[h].saturating_add(1);
-                            if head_debounce[h] < 2 {
-                                continue;
-                            }
                         }
                         head_debounce[h] = 0;
                         if present {
@@ -989,25 +977,6 @@ impl usb::Driver for VinoDriver {
         io: Arc<usb::IoWindow>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let cdev: &device::Device<Core<'_>> = intf.as_ref();
-        // The SIMD experiment needs no hardware, but this is the driver's only entry point after
-        // the module parameters are readable. Once per load, not once per interface.
-        #[cfg(target_arch = "x86_64")]
-        {
-            static LATCHED: core::sync::atomic::AtomicBool =
-                core::sync::atomic::AtomicBool::new(false);
-            if !LATCHED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                simd::set_encoder_simd(*crate::module_parameters::simd_transform.value() != 0);
-            }
-        }
-        #[cfg(target_arch = "x86_64")]
-        if *crate::module_parameters::simd_bench.value() != 0 {
-            static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-            if !RAN.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                if let Err(e) = simd::bench() {
-                    pr_warn!("vino-simd: benchmark failed ({e:?})\n");
-                }
-            }
-        }
         // The D6000 exposes several interfaces (0/1/5/6 match us; 2-4 are audio).
         // The control endpoints (0x02/0x84) and the whole HDCP session live on
         // interface 0 -- drive bring-up only there so we don't run the preamble and
@@ -1175,14 +1144,6 @@ kernel::module_usb_driver! {
             default: 0,
             description: "Enable verbose Vino protocol and scanout diagnostics",
         },
-        simd_transform: u8 {
-            default: 0,
-            description: "Experiment: use the AVX2 within-block Haar transform in the encoder instead of the scalar one. Byte-exact; the scalar path remains the fallback and the oracle",
-        },
-        simd_bench: u8 {
-            default: 0,
-            description: "Experiment: at load, time the scalar Haar transform against the optional AVX2/AVX-512 ones and report the kernel_fpu_begin/end cost they have to earn back",
-        },
         trace_crypto: u8 {
             default: 0,
             description: "Diagnostic: disclose ephemeral control/video keys and nonces for one decryptable usbmon capture",
@@ -1194,62 +1155,6 @@ kernel::module_usb_driver! {
         edid_override: u8 {
             default: 0,
             description: "Bitmask of heads whose sink is described by DRM's EDID override (drm_kms_helper.edid_firmware=<connector>:<path>, or a debugfs edid_override write) because the dock cannot read its EDID -- typically a DP-to-HDMI converter that mangles DDC",
-        },
-        navarro_mode_offset_ms: u32 {
-            default: 0,
-            description: "Milliseconds from the Navarro cold-activation anchor to the first real mode set (0 = the captured 2978). The captured prelude ends at 2016 ms, so the remainder is unexplained wait; this settles how much of it the dock needs",
-        },
-        hdr_dma_format: u8 {
-            default: 0,
-            description: "Offset-23 DMA buffer format for a 10-bit head (0 = NM30, the value DLM names for 30 bpp). Kept overridable because a wrong four-byte format mis-sizes nothing and would fail far from here",
-        },
-        hdr_advertise: u8 {
-            default: 0,
-            description: "Attach the Colorspace and HDR_OUTPUT_METADATA connector properties (0 = no). Vino now carries the transfer function to the dock (offset-42 bit 6) and the depth with it, but no panel has yet been seen lit in PQ, so this stays off until one has been",
-        },
-        flap_repair: u8 {
-            default: 1,
-            description: "Absorb the dock's transient sink drops instead of dropping the DRM connector the moment one is reported (0 = off, tear down on two contrary probes as before). A drop that outlasts the window is still a removal",
-        },
-        cursor_enabled: u8 {
-            default: 1,
-            description: "Publish a cursor plane and send hardware-cursor messages (1 = yes). Set 0 to withdraw the plane entirely, which puts the pointer back in the compositor's hands -- the state this dock was in while its head selector was out of range",
-        },
-        dock_wide_modeset: u8 {
-            default: 1,
-            description: "Re-activate every lit DL-7400 head when any head is mode-set (0 = off). It stops the re-enumeration a live mode change otherwise causes, but it replays the cold activation choreography on a dock that is already driving its sinks, and the dock accepting video is not evidence that it is driving the panels. Confirm the panels by eye before turning this on",
-        },
-        idle_opens: u8 {
-            default: 0,
-            description: "Send the short sealed open on connectors with no monitor, as DLM does",
-        },
-        video_key_raw: u8 {
-            default: 0,
-            description: "Diagnostic: seal per-head video with the raw SKE key instead of the whitened one",
-        },
-        break_mac: u8 {
-            default: 0,
-            description: "Diagnostic: corrupt the sealed prologue's Dl3Cmac to test whether the dock authenticates it",
-        },
-        video_clear_halt: u8 {
-            default: 0,
-            description: "Diagnostic: additionally clear a video endpoint when its queue opens (Navarro's required pre-commit EP08/EP0a clear is always sent at the captured point)",
-        },
-        video_clear_each: u8 {
-            default: 0,
-            description: "Diagnostic: clear the video endpoint halt before every transfer, to test whether the dock halts it after each one",
-        },
-        video_xfer: u32 {
-            default: 0,
-            description: "Diagnostic: video transfer size in bytes (0 = 65536). Distinguishes a dock that stops after one TRANSFER from one that stops after a fixed BYTE COUNT",
-        },
-        video_sync: u8 {
-            default: 0,
-            description: "Diagnostic: send every video transfer synchronously instead of using DLM's mixed first-chunk/pipelined transport",
-        },
-        video_records: u32 {
-            default: 0,
-            description: "Diagnostic: send only this many 4048-byte image records per frame (0 = all)",
         },
     },
 }

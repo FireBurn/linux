@@ -1830,23 +1830,10 @@ impl VinoDrmData {
             return Err(kernel::error::code::EINVAL);
         }
         let geom = self.geometry();
-        // Diagnostic: shrink the transfer so a dock that stops after one *transfer* can be told
-        // apart from one that stops after a fixed *byte count*. Both look identical at the default
-        // 65536, because exactly one transfer and exactly 65536 bytes are the same event.
-        let xfer: usize = match *crate::module_parameters::video_xfer.value() {
-            0 => VIDEO_XFER,
-            n => (n as usize).clamp(1024, VIDEO_XFER) & !1023,
-        };
+        let xfer: usize = VIDEO_XFER;
         let head_i = head as usize;
         let pipe_i = dev.video_pipe_index(head_i)?;
         let head_bit = 1u32 << head;
-        // Diagnostic cap: send only the first N whole image records of a frame, so a bring-up
-        // failure can be bisected between the stream's opening records and its pixels. Records
-        // are a uniform 4048-byte stride until a frame's short last one, so this stays aligned.
-        let image_cap = match *crate::module_parameters::video_records.value() {
-            0 => usize::MAX,
-            n => (n as usize).saturating_mul(4048),
-        };
         // The DL7400's per-strip parameter map, ahead of the pixels it describes. This path --
         // the startup/prompt-training submit -- is the one the dock's first frames go out on, so
         // wiring the map only into the steady-state scanout left it absent from every frame that
@@ -1934,15 +1921,8 @@ impl VinoDrmData {
             } else {
                 frames
             };
-            let mut image_len: usize = 0;
-            let mut image_parts = 0usize;
-            for f in frame_parts.iter() {
-                if image_len >= image_cap {
-                    break;
-                }
-                image_len += f.len().min(image_cap - image_len);
-                image_parts += 1;
-            }
+            let image_len: usize = frame_parts.iter().map(|f| f.len()).sum();
+            let image_parts = frame_parts.len();
             let wire_len = arm_slice.len()
                 + opener_slice.len()
                 + report_slice.len()
@@ -1962,12 +1942,9 @@ impl VinoDrmData {
                 let mut queue_slot = self.video_q[pipe_i].lock();
                 if queue_slot.is_none() {
                     // Navarro's required EP08/EP0a clears are sent together at their captured
-                    // pre-commit point in `send_cp_setup`. Repeating a clear here, after stream
-                    // setup has begun, is intentionally diagnostic-only: it changes SuperSpeed
-                    // endpoint sequence state at a point DLM does not.
-                    if *crate::module_parameters::video_clear_halt.value() != 0 {
-                        let _ = dev.clear_video_halt(head_i);
-                    }
+                    // pre-commit point in `send_cp_setup`. Nothing clears here: doing so after
+                    // stream setup has begun changes SuperSpeed endpoint sequence state at a
+                    // point DLM does not.
                     *queue_slot = Some(dev.video_queue(head_i, 8, xfer)?);
                     vino_debug!(
                         "vino: head={} endpoint={:#04x} persistent video queue opened by prompt training\n",
@@ -2081,10 +2058,8 @@ impl VinoDrmData {
                 // producer boundary only for the one-shot, full-size prologue; ordinary frames
                 // use the normal eight-deep queue, just as DLM does.
                 const NAVARRO_PROLOGUE_SUBMIT_US: [i64; 4] = [0, 806, 851, 873];
-                let pace_prologue = !arm_slice.is_empty()
-                    && xfer == VIDEO_XFER
-                    && geom.head_sub_shift != 0
-                    && *crate::module_parameters::video_sync.value() == 0;
+                let pace_prologue =
+                    !arm_slice.is_empty() && xfer == VIDEO_XFER && geom.head_sub_shift != 0;
                 let mut prologue_anchor: Option<Instant<Monotonic>> = None;
                 while wire_off < wire_len {
                     let data_len = (wire_len - wire_off).min(xfer);
@@ -2101,15 +2076,6 @@ impl VinoDrmData {
                             part_off = 0;
                         }
                     }
-                    // Diagnostic: the dock accepts exactly one transfer and then takes no more
-                    // -- 16384 bytes when the transfer is 16384, 65536 when it is 65536, so it is
-                    // one *transfer*, not a byte count. Clearing the halt before each one tests
-                    // whether the dock is halting the endpoint after every transfer.
-                    if *crate::module_parameters::video_clear_each.value() != 0 {
-                        if *crate::module_parameters::video_clear_halt.value() != 0 {
-                            let _ = dev.clear_video_halt(head_i);
-                        }
-                    }
                     if pace_prologue {
                         let chunk = wire_off / xfer;
                         if let Some(anchor) = prologue_anchor {
@@ -2118,21 +2084,9 @@ impl VinoDrmData {
                             }
                         }
                     }
-                    // `video_sync` is an all-synchronous diagnostic. The normal queue path uses
                     // DLM's mixed transport: prologue chunk zero is reaped below, then the rest
                     // and all ordinary frames are pipelined.
-                    let sent = if *crate::module_parameters::video_sync.value() != 0 {
-                        dev.video_send(head_i, dst, super::timeout(), GFP_KERNEL)
-                            .map(|_| ())
-                    } else {
-                        queue.send(dev.io(), dst, super::timeout())
-                    };
-                    if let Err(e) = sent {
-                        if *crate::module_parameters::video_clear_halt.value() != 0 {
-                            let _ = dev.clear_video_halt(head_i);
-                        }
-                        return Err(e);
-                    }
+                    queue.send(dev.io(), dst, super::timeout())?;
                     if pace_prologue && wire_off == 0 {
                         let anchor = Instant::<Monotonic>::now();
                         prologue_anchor = Some(anchor);
@@ -2361,15 +2315,12 @@ impl VinoDrmData {
                     Self::wait_mode_offset(activation_started, at);
                     self.navarro_cold_op(dev, op.remap_head(&remap))?;
                 }
-                // The captured offset is where DLM put its first real mode, not a measured
-                // requirement -- and its own prelude finishes at 2016 ms, so nearly a second of
-                // it is dead air. `navarro_mode_offset_ms` exists to settle that on hardware
-                // rather than by argument; 0 keeps the transcript's value.
-                let offset = match *crate::module_parameters::navarro_mode_offset_ms.value() {
-                    0 => NAVARRO_REAL_MODE_H0_MS,
-                    ms => i64::from(ms),
-                };
-                Self::wait_mode_offset(activation_started, offset);
+                // Where DLM put its first real mode. ⚠ It is the captured offset, not a measured
+                // requirement: DLM's own prelude finishes at 2016 ms, so nearly a second of this
+                // is dead air and plug-to-pixels should come down by about that much if the dock
+                // does not need it. Shortening it is a hardware experiment, so change the
+                // constant rather than guessing.
+                Self::wait_mode_offset(activation_started, NAVARRO_REAL_MODE_H0_MS);
                 anchor = Instant::<Monotonic>::now();
             }
 
@@ -2499,18 +2450,13 @@ impl VinoDrmData {
             // Bracket, status polls and the mid-bracket EDID re-read, up to the first video.
             cp_until!(timeline.video[0].1 - 1);
 
-            // Name the streams vino will not drive, before any head sends pixels. DLM does this
-            // for every connector without a monitor and only then starts a frame; the connectors
-            // that are about to stream open with their pipe descriptor instead.
-            if !self.uses_arm_burst() && *crate::module_parameters::idle_opens.value() != 0 {
-                let idle = !sent & ((1u32 << HEADS) - 1);
-                self.stream_open_pending.fetch_or(idle, Ordering::Release);
-                for head in 0..HEADS {
-                    if idle & (1u32 << head) != 0 {
-                        self.send_stream_open(dev, head)?;
-                    }
-                }
-            }
+            // ⛔ DLM names the streams it will not drive here -- a short sealed open on every
+            // connector without a monitor, before any head sends pixels -- and vino deliberately
+            // does not. It sat behind `idle_opens`, which defaulted off, so it has never once run
+            // on this hardware; every stable bring-up ever measured was without it. Turning it on
+            // is a hardware experiment and not a free one: this dock re-enumerates when a stream
+            // is driven at an empty head, and an empty socket's index is not stable across
+            // bring-ups. Restore it deliberately, with eyes on the panels, or not at all.
 
             for &(head, at) in timeline.video {
                 cp_until!(at - 1);
@@ -2689,9 +2635,6 @@ impl VinoDrmData {
         let pipe_i = dev.video_pipe_index(head)?;
         let mut queue_slot = self.video_q[pipe_i].lock();
         if queue_slot.is_none() {
-            if *crate::module_parameters::video_clear_halt.value() != 0 {
-                let _ = dev.clear_video_halt(head);
-            }
             *queue_slot = Some(dev.video_queue(head, 8, VIDEO_XFER)?);
         }
         let queue = queue_slot
@@ -2873,15 +2816,8 @@ impl VinoDrmData {
 
         let descriptor = super::cp::navarro_pipe_descriptor(connector)?;
         let seal_seq = self.take_seal_seq(head, descriptor.len().div_ceil(16) as u32);
-        let mut sealed =
+        let sealed =
             super::cp::seal_video_arm(&vkey, &vnonce, stream, 0x0000, seal_seq, &descriptor)?;
-        // Diagnostic: a dock that authenticates this record must behave differently when its tag
-        // is wrong. Identical behaviour means the record is already being dropped.
-        if *crate::module_parameters::break_mac.value() != 0 {
-            if let Some(last) = sealed.last_mut() {
-                *last ^= 0xff;
-            }
-        }
         buf.extend_from_slice(&sealed, GFP_KERNEL)?;
 
         let mut body = [0u8; 16];
@@ -3655,26 +3591,6 @@ impl VinoDrmData {
     /// Each operation class has one fixed slot, so updates cannot fail allocation and obsolete
     /// cursor positions or stream states do not build a backlog.
     fn queue_cmd(&self, dev: &VinoDrmDevice, cmd: KmsCmd) {
-        // ⛔ The hardware cursor is not working on the DL-7400 and is off by default.
-        //
-        // Its head selector came from a two-entry table, so on a four-head dock with monitors in
-        // sockets 3 and 4 every cursor message returned `EINVAL` and was dropped. That failure was
-        // load-bearing: the cursor plane's commit failed, so the compositor fell back to
-        // compositing the pointer into the primary plane. Making the selector `head + 1` gets the
-        // messages onto the wire -- confirmed, 16448-byte control writes -- and the dock accepts
-        // them and shows nothing, while the now-successful plane commit stops the compositor
-        // drawing its own. The visible result is a pointer that disappears.
-        //
-        // So the fix to the selector is necessary but not sufficient, and until the rest of the
-        // cursor protocol is understood the safe state is the one that leaves userspace drawing
-        // the pointer itself.
-        if matches!(
-            cmd,
-            KmsCmd::CursorCreate { .. } | KmsCmd::CursorImage { .. } | KmsCmd::CursorMove { .. }
-        ) && *crate::module_parameters::cursor_enabled.value() == 0
-        {
-            return;
-        }
         let mut pending = self.pending_kms.lock();
         if self.shutting_down.load(Ordering::Acquire) {
             return;
@@ -4245,10 +4161,11 @@ impl WorkItem for VinoDrmData {
             // command, and it must not drag every lit head through a re-activation.
             // Folding the lit heads in makes `activate_dual_wake` name every head at once, which
             // is the only shape of mode set this dock accepts while more than one head is lit.
-            // Kept behind a switch because it also replays the cold choreography -- a dock-wide
-            // sink reset and pipe clears -- on a dock that is already driving its sinks, and that
-            // is worth being able to take back out without a rebuild.
-            if cmd_heads != 0 && data.is_navarro() && *crate::module_parameters::dock_wide_modeset.value() != 0 {
+            // ⚠ This replays the cold choreography -- a dock-wide sink reset and pipe clears --
+            // on a dock that is already driving its sinks. That is the cost of the only mode set
+            // this dock will take; reconfiguring one connector while another is lit re-enumerates
+            // it about 100 ms later, measured five ways.
+            if cmd_heads != 0 && data.is_navarro() {
                 // Gather the whole dock's desired state first, and only commit to it if at least
                 // two heads end up in it. Below two there is nothing for the dual path to do and
                 // the per-head schedule is the proven one, so nothing is disturbed.
@@ -4551,36 +4468,30 @@ impl KmsDriver for VinoDrmDriver {
                     | plane::Rotation::REFLECT_X
                     | plane::Rotation::REFLECT_Y,
             )?;
-            // The cursor plane is withdrawn entirely when the hardware cursor is off, not merely
-            // starved of messages: its atomic commit would still succeed, so the compositor would
-            // go on handing the pointer to hardware and stop drawing its own, and the pointer
-            // would simply vanish. A CRTC with no cursor plane is how a driver says "draw it
-            // yourself" -- and it is the state this dock was in for its whole life so far, because
-            // every cursor message was rejected for an out-of-range head selector.
-            let cursor = if *crate::module_parameters::cursor_enabled.value() != 0 {
-                let cursor = plane::UnregisteredPlane::<VinoPlane>::new(
-                    dev,
-                    crtc_mask,
-                    &CURSOR_FORMATS,
-                    None,
-                    plane::Type::Cursor,
-                    None,
-                    PlaneArgs {
-                        head: head as u8,
-                        is_cursor: true,
-                    },
-                )?;
-                // An alpha framebuffer requires a blend-mode property. The dock composites the
-                // cursor from a premultiplied bitmap, so premultiplied is the only supported mode.
-                cursor.create_blend_mode_property(plane::BlendModes::PREMULTIPLIED)?;
-                Some(cursor)
-            } else {
-                None
-            };
+            // ⚠ If the hardware cursor ever has to go back to software, withdraw this PLANE --
+            // do not merely stop sending the messages. A cursor plane whose atomic commit
+            // succeeds makes the compositor hand the pointer to hardware and stop drawing its
+            // own, so starving it of messages loses the pointer entirely rather than falling
+            // back. A CRTC with no cursor plane is how a driver says "draw it yourself".
+            let cursor = plane::UnregisteredPlane::<VinoPlane>::new(
+                dev,
+                crtc_mask,
+                &CURSOR_FORMATS,
+                None,
+                plane::Type::Cursor,
+                None,
+                PlaneArgs {
+                    head: head as u8,
+                    is_cursor: true,
+                },
+            )?;
+            // An alpha framebuffer requires a blend-mode property. The dock composites the cursor
+            // from a premultiplied bitmap, so premultiplied is the only supported mode.
+            cursor.create_blend_mode_property(plane::BlendModes::PREMULTIPLIED)?;
             let crtc_obj = crtc::UnregisteredCrtc::<VinoCrtc>::new(
                 dev,
                 primary,
-                cursor.as_deref(),
+                Some(&*cursor),
                 None,
                 head as u8,
             )?;
@@ -4606,22 +4517,19 @@ impl KmsDriver for VinoDrmDriver {
             )?;
             conn.attach_encoder(&*enc)?;
             // HDR is a property of the dock's pipeline, not of the monitor: a sink that declares
-            // ST 2084 is useless if the dock cannot be told to carry ten bits. Attaching these
-            // only where the profile says so keeps a Ridge connector from advertising an output
-            // it has no set-mode encoding for.
+            // ST 2084 is useless if the dock cannot be told to carry ten bits. `hdr_capable`
+            // keeps a Ridge connector from advertising an output it has no set-mode encoding for.
             //
-            // ⛔ STILL OFF BY DEFAULT, but no longer because the protocol is unknown. The
-            // transfer function has been found -- offset-42 bit 6, `ST2084 colorspace used (HDR)`
-            // in DLM's own `setupVideo` log decode -- and `atomic_enable` now reads the
-            // connector's HDR_OUTPUT_METADATA EOTF and sends it, with the depth (offset 68) and
-            // the DMA format (offset 23, `NM30`) alongside it.
+            // The whole path exists now: the transfer function is offset-42 bit 6
+            // (`ST2084 colorspace used (HDR)`, read out of DLM's own `setupVideo` decode),
+            // `atomic_enable` takes it from this connector's HDR_OUTPUT_METADATA EOTF, and the
+            // depth (offset 69) and DMA format (offset 23, `NM30`) go with it.
             //
-            // What has not happened is a person looking at a panel in PQ. Turning these on is what
-            // makes a compositor re-encode the whole desktop, and the last time that happened
-            // while the dock was in SDR the result was hours of grey. That failure mode is exactly
-            // the one the wire cannot detect, so this waits for eyes rather than for a capture.
-            // See `docs/hdr.md`.
-            if data.hdr_capable() && *crate::module_parameters::hdr_advertise.value() != 0 {
+            // ⚠ Attaching these is what makes a compositor re-encode the desktop in PQ/BT.2020.
+            // If the sink does not follow, the failure is a washed-out grey desktop, and it is
+            // invisible on the wire -- correct PQ code words is exactly what a wire capture shows
+            // in both the working and the broken case. It is an eyes question. See `docs/hdr.md`.
+            if data.hdr_capable() {
                 conn.attach_max_bpc_property(8, 10)?;
                 conn.attach_colorspace_property()?;
                 conn.attach_hdr_output_metadata_property();
