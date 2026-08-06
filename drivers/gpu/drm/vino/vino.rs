@@ -640,6 +640,19 @@ impl WorkItem for BringUp {
             const PRESENCE_REMOVE_MS: i64 = 5000;
             let mut head_absent_since: [Option<Instant<Monotonic>>; VinoDriver::CP_SETUP_HEADS] =
                 [None; VinoDriver::CP_SETUP_HEADS];
+            // Whether a head's current run of negative probes has lasted long enough to be acted
+            // on, starting the run if this is its first answer.
+            //
+            // Both the removal path and the EDID-recovery stand-down need this and for the same
+            // reason, so they share one notion of it. `flap_repair=0` restores the old immediate
+            // verdict, as that parameter promises.
+            let sustained_absent = |run: &mut Option<Instant<Monotonic>>| -> bool {
+                if *crate::module_parameters::flap_repair.value() == 0 {
+                    return true;
+                }
+                let since = *run.get_or_insert_with(Instant::<Monotonic>::now);
+                (Instant::<Monotonic>::now() - since).as_millis() >= PRESENCE_REMOVE_MS
+            };
             // A recovered sink need not emit a uniquely identifiable event, so a head whose
             // discovery was deferred is retried at a bounded cadence until the probe answers.
             const REENGAGE_RETRY: Delta = Delta::from_millis(4000);
@@ -743,9 +756,24 @@ impl WorkItem for BringUp {
                         // ~575 ms of engage traffic into a mode-set transaction on another head,
                         // which is measurable as delayed activation, not merely as noise.
                         if data.probe_head_present(dev, h as u8) == Some(false) {
-                            head_probed[h] = Some(false);
+                            // ⛔ But do NOT stand down on the first negative. A *recovered EDID* is
+                            // this dock's presence signal; the probe is a weaker one that reports a
+                            // lit sink absent for up to 2.5 s at a time. Latching here lost a head
+                            // across a module reload, twice in a row: the monitor slow to answer at
+                            // bring-up was latched out for the life of the session, its EDID never
+                            // asked for again, while its sibling flapped absent and back four times
+                            // a minute. Re-enumerating the dock recovered it -- through this exact
+                            // path, and with no positive probe anywhere in between.
+                            //
+                            // So hold a negative to the same evidence a removal needs. An empty
+                            // socket still stands down, just `PRESENCE_REMOVE_MS` later, having
+                            // cost one probe message per `REENGAGE_RETRY` in the meantime.
+                            if sustained_absent(&mut head_absent_since[h]) {
+                                head_probed[h] = Some(false);
+                            }
                             continue;
                         }
+                        head_absent_since[h] = None;
                         vino_dev_debug!(
                             cdev,
                             "vino: head {h} absent -- retrying the sink re-engage\n"
@@ -808,8 +836,20 @@ impl WorkItem for BringUp {
                             continue;
                         }
                         // The probe has spoken for this connector, so the blind re-engage retry
-                        // above stands down for it.
-                        head_probed[h] = Some(present);
+                        // above stands down for it -- but only a *positive* answer is authoritative
+                        // straight away. A negative one has to outlast `PRESENCE_REMOVE_MS` for the
+                        // same reason it does above: this probe reports a lit sink absent routinely,
+                        // and standing the EDID recovery down on one of those blips is what left a
+                        // head dark for a whole session.
+                        if present {
+                            head_probed[h] = Some(true);
+                            // The absent run is cleared below, not here: the "flap healed on its
+                            // own" line reads it with `take()` and would never fire again.
+                        } else {
+                            if sustained_absent(&mut head_absent_since[h]) {
+                                head_probed[h] = Some(false);
+                            }
+                        }
                         if present == head_known[h] {
                             head_debounce[h] = 0;
                             // The sink came back before the removal deadline, so the connector was
