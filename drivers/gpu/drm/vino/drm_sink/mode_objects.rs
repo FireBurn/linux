@@ -7,6 +7,9 @@
 //! dock is queued for [`super::VinoDrmData`]'s workers rather than done here.
 
 use super::*;
+// `hdr_output_eotf` reads the connector's HDR metadata from the CRTC enable path; the trait is
+// implemented for every connector state but has to be in scope to be called on an opaque one.
+use kernel::drm::kms::connector::RawConnectorState;
 
 /// A software vblank source: an hrtimer that fires once per frame and drives
 /// `drm_crtc_handle_vblank()`. It stops when vblank is disabled and is also cancelled
@@ -206,7 +209,18 @@ impl crtc::DriverCrtc for VinoCrtc {
         let head = crtc.head;
         let dev: &VinoDrmDevice = crtc.drm_dev();
         let data: &VinoDrmData = dev;
-        let new = commit.take_new_state();
+        let (state, new) = commit.take_state_new_state();
+        // The transfer function is a connector property, but the mode set that carries it to the
+        // dock is built here, so read it across from the connector routed to this CRTC. Only PQ
+        // is distinguished: the dock's flags word has exactly one HDR bit, and every other EOTF
+        // (including HLG, which it cannot express) is carried as SDR rather than mislabelled.
+        let st2084 = state
+            .new_connector_state_for_crtc(crtc)
+            .and_then(|conn| conn.hdr_output_eotf())
+            .is_some_and(|eotf| {
+                u32::from(eotf) == kernel::bindings::hdmi_eotf_HDMI_EOTF_SMPTE_ST2084
+            });
+        data.set_head_st2084(head, st2084);
         // Cache this head's colour transform for the scanout to apply.
         data.update_color(head as usize, new.gamma_lut(), new.ctm());
         // Whatever this head's sink state was, the enable path re-runs the full bracket and
@@ -218,6 +232,9 @@ impl crtc::DriverCrtc for VinoCrtc {
                 // `head_ten_bit` is set from the committed framebuffer's fourcc, so a head that
                 // never gets a 10-bit buffer is never announced as 30 bpp.
                 timing.ten_bit = data.head_is_ten_bit(head as usize);
+                // Read back rather than reusing the local, so both halves of the colour
+                // description come from the same per-head state every other path consults.
+                timing.st2084 = data.head_is_st2084(head as usize);
                 timing
             }
             Err(e) => {

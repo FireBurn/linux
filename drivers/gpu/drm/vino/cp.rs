@@ -282,6 +282,14 @@ pub(super) struct Timing {
     /// buffer from the format's bytes-per-pixel and interprets the samples by the depth, so a
     /// mismatched pair mis-sizes the allocation.
     pub ten_bit: bool,
+    /// Whether the pixels this head carries are encoded with the SMPTE ST 2084 (PQ) transfer
+    /// function, which sets [`SYNC_FLAG_ST2084`] in the offset-42 flags word.
+    ///
+    /// Independent of [`Timing::ten_bit`]: the depth says how many bits a sample has, this says
+    /// what curve those bits are on. A compositor can drive a 10-bit SDR output, and PQ in 8 bits
+    /// is merely a bad idea rather than a contradiction, so the dock is told the two separately --
+    /// exactly as DLM tells it.
+    pub st2084: bool,
 }
 
 /// Pixel granularity the render stride is quantised to.
@@ -320,12 +328,42 @@ fn navarro_total_rows(hactive: u16, vactive: u16) -> Option<u16> {
     }
 }
 
+/// Offset 42 is not a polarity field but a flags word, and DLM decodes every bit of it in its own
+/// `setupVideo` log line. Read out of the bit tests around DLM 3.4.26 `0x576b26`, which select
+/// between an empty string and one of these:
+///
+/// | bit | mask | DLM's name |
+/// |---|---|---|
+/// | 0 | `0x0001` | `Interlace` |
+/// | 1 | `0x0002` | `Cross-head synchronized` |
+/// | 2 | `0x0004` | `Dual NIVO` |
+/// | 3 | `0x0008` | `Just-in-time decode` |
+/// | 5 | `0x0020` | `DSC On`/`DSC Off` |
+/// | 6 | `0x0040` | `ST2084 colorspace used (HDR)` |
+/// | 7 | `0x0080` | `SingleDisplayMode enabled` |
+/// | 8 | `0x0100` | `Horizontal Sync Inverted` |
+/// | 9 | `0x0200` | `Vertical Syncs Inverted` |
+/// | 12 | `0x1000` | `ReducedQuantizationRange On`/`Off` |
+/// | 14 | `0x4000` | `Enable Timing for Gamma` |
+/// | 15 | `0x8000` | `(Disabled)` |
+///
+/// Bits 8, 9 and 15 land exactly where the decrypted corpus had already put them, which is what
+/// makes the rest of the table trustworthy. Bits 4, 10, 11 and 13 are not logged; bit 10 is the
+/// base below, always set and still unexplained.
+///
 /// Base bit of the offset-42 flags word, set in every message the corpus contains.
 const SYNC_FLAGS_BASE: u16 = 0x0400;
 /// `hSyncInv`: horizontal sync is active low.
 const SYNC_FLAG_HSYNC_INV: u16 = 0x0100;
 /// `vSyncInv`: vertical sync is active low.
 const SYNC_FLAG_VSYNC_INV: u16 = 0x0200;
+/// `ST2084 colorspace used (HDR)`: the head's pixels are PQ-encoded rather than SDR.
+///
+/// This is the transfer-function selector that no capture could settle -- the Windows HDR A/B
+/// corpus has a sealed control plane, and DLM's Linux build never toggled HDR on this hardware --
+/// and it turns out not to need a capture at all. There is exactly one HDR flag: the colour
+/// primaries are not carried here, because the dock derives the downstream infoframe itself.
+const SYNC_FLAG_ST2084: u16 = 0x0040;
 /// The offset-42 word a teardown carries in place of any polarity.
 const SYNC_FLAGS_TEARDOWN: u16 = 0x8000;
 
@@ -343,6 +381,7 @@ const SYNC_FLAGS_TEARDOWN: u16 = 0x8000;
 ///
 /// The last row also fixes the assignment within the pair: 2560x1440 is `+h -v` and carries
 /// `0x0600`, so `0x0200` is the vertical flag and swapping the two would predict `0x0500`.
+/// DLM's own bit test confirms both independently; see [`SYNC_FLAGS_BASE`].
 fn sync_flags(mode: &kernel::drm::kms::modes::DisplayMode) -> u16 {
     // Named through the same path as the parameter type rather than a `use`: the chimera rig
     // compiles this file verbatim against a shim where a `use kernel::...` is ambiguous.
@@ -464,19 +503,38 @@ const COLOUR_DEPTH_30BPP: u16 = 0x0300;
 /// Offset-23 of the `0x48/0x22` message: the DMA buffer format the head scans out.
 ///
 /// The dock indexes a four-entry table with this, giving 2, 4, 3 and 4 bytes per pixel for formats
-/// 0 through 3, and rejects anything above 3. Vino scans out 24bpp, so it sends format 2. A
-/// teardown writes no timing at all and leaves the field zero.
-const DMA_FORMAT_RGB888: u8 = 2;
+/// 0 through 3, and rejects anything above 3. DLM names all four: the same value selects a string
+/// in the helper at 3.4.26 `0x62ecb0`, whose four arms point at the plaintext `NM16`, `NM32`,
+/// `NM24` and `NM30`, and the bytes-per-pixel table at `0x8dc320` reads `{2, 4, 3, 4}` in exactly
+/// that order.
+///
+/// | value | name | bytes/px |
+/// |---|---|---|
+/// | 0 | `NM16` | 2 |
+/// | 1 | `NM32` | 4 |
+/// | 2 | `NM24` | 3 |
+/// | 3 | `NM30` | 4 |
+///
+/// A teardown writes no timing at all and leaves the field zero.
+const DMA_FORMAT_NM24: u8 = 2;
 const DMA_FORMAT_NONE: u8 = 0;
-/// Offset-23 for a 10-bit head. The dock's table gives 2, 4, 3 and 4 bytes per pixel for formats 0
-/// through 3, so a 30 bpp sample -- four bytes packed as 2:10:10:10 -- must be one of the two
-/// four-byte entries. No capture distinguishes 1 from 3, so `hdr_dma_format` exists to settle it
-/// on hardware; 1 is the default only because it is the lower of the two.
-const DMA_FORMAT_RGB101010_DEFAULT: u8 = 1;
+/// Offset-23 for a 10-bit head: `NM30`, the second of the table's two four-byte formats.
+///
+/// The choice between the two used to be a coin flip -- both are four bytes, and no capture on
+/// either dock generation carries anything but `NM24` -- which is what `hdr_dma_format` was added
+/// to settle on hardware. The name settles it instead: 30 bits per pixel packed into four bytes is
+/// what a 2:10:10:10 sample is, and `NM32` is the 8-bit-with-padding format vino already has no
+/// use for.
+const DMA_FORMAT_NM30: u8 = 3;
 
+/// The offset-23 format for a 10-bit head, overridable by `hdr_dma_format`.
+///
+/// The override is kept now that the value is known, because it is the one field where being
+/// wrong is silent: the dock sizes its own allocation from the bytes-per-pixel this selects, so a
+/// wrong-but-same-width format mis-sizes nothing and would fail somewhere far away.
 fn dma_format_ten_bit() -> u8 {
     match *crate::module_parameters::hdr_dma_format.value() {
-        0 => DMA_FORMAT_RGB101010_DEFAULT,
+        0 => DMA_FORMAT_NM30,
         n => n,
     }
 }
@@ -515,11 +573,18 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
         if t.ten_bit {
             dma_format_ten_bit()
         } else {
-            DMA_FORMAT_RGB888
+            DMA_FORMAT_NM24
         },
         GFP_KERNEL,
     )?;
     pad_to(&mut b, 26)?; // off24..25 zero; timing begins at off26
+    // The transfer function rides in the same word as the sync polarity; see `SYNC_FLAG_ST2084`.
+    let flags = t.sync_flags
+        | if t.st2084 {
+            SYNC_FLAG_ST2084
+        } else {
+            0
+        };
     for v in [
         t.hactive,
         t.hblank,
@@ -529,7 +594,7 @@ pub(super) fn set_mode(counter: u16, head: u8, t: &Timing) -> Result<KVec<u8>> {
         t.vblank,
         t.vsync_front,
         t.vsync_width,
-        t.sync_flags,
+        flags,
         t.refresh_hz,
         t.stride,
         t.total_rows,
@@ -619,7 +684,11 @@ pub(super) fn timing_from_drm_mode(
         vic_word: profile.vic_word,
         // Filled by the caller, which knows the committed framebuffer's format; the mode alone
         // does not say what depth will be scanned out.
+        // Both describe the pixels a head will actually carry, which a DRM mode does not know.
+        // `atomic_enable` fills them in from the committed framebuffer and the connector's HDR
+        // properties.
         ten_bit: false,
+        st2084: false,
     })
 }
 /// Known CP `sub` identifiers used to validate a decrypted header.

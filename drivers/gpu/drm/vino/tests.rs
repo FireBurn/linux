@@ -1430,6 +1430,7 @@ mod protocol {
             total_rows: 0x6000,
             vic_word: 0x0800,
             ten_bit: false,
+            st2084: false,
         };
         let m = cp::set_mode(0x1234, 1, &timing)?;
         assert_eq!(m.len(), 80);
@@ -1440,6 +1441,105 @@ mod protocol {
         assert_eq!(u16::from_le_bytes([m[34], m[35]]), 2160);
         assert_eq!(u32::from_le_bytes([m[70], m[71], m[72], m[73]]), 0xd040);
         assert_eq!(u16::from_le_bytes([m[68], m[69]]), 0x0200);
+        Ok(())
+    }
+
+    /// The three fields that describe an HDR head, against the values read out of DLM 3.4.26.
+    ///
+    /// Offset 23 is the DMA buffer format, whose four values DLM names `NM16`/`NM32`/`NM24`/`NM30`
+    /// against a bytes-per-pixel table of `{2, 4, 3, 4}`; 30 bpp is `NM30` = 3. Offset 69 is the
+    /// colour-depth enum from DLM's own `depth` switch, where 24 -> 2 and 30 -> 3, and offset 68
+    /// is the byte below it, zero on every enable. Offset 42 bit 6 is
+    /// `ST2084 colorspace used (HDR)`, which rides over the sync polarity in the same word.
+    ///
+    /// The SDR half is here too: an 8-bit head must be byte-identical to what it sent before any
+    /// of this existed, which is what makes the HDR half safe to land.
+    #[test]
+    fn set_mode_carries_depth_and_transfer_function() -> Result {
+        let base = cp::Timing {
+            hactive: 2560,
+            hblank: 160,
+            hsync_front: 48,
+            hsync_width: 32,
+            vactive: 1440,
+            vblank: 85,
+            vsync_front: 3,
+            vsync_width: 8,
+            refresh_hz: 165,
+            pixel_clock_10khz: 0x1113d,
+            sync_flags: 0x0600,
+            stride: 0x0a80,
+            total_rows: 0x66db,
+            vic_word: 0x0800,
+            ten_bit: false,
+            st2084: false,
+        };
+
+        let sdr = cp::set_mode(0x1234, 1, &base)?;
+        // An 8-bit head still sends NM24.
+        assert_eq!(sdr[23], 2);
+        assert_eq!(u16::from_le_bytes([sdr[42], sdr[43]]), 0x0600);
+        assert_eq!(u16::from_le_bytes([sdr[68], sdr[69]]), 0x0200);
+
+        // Ten bits per channel on its own: a 10-bit SDR output is a thing a compositor can ask
+        // for, and it must not set the HDR bit.
+        let deep = cp::set_mode(
+            0x1234,
+            1,
+            &cp::Timing {
+                ten_bit: true,
+                ..base
+            },
+        )?;
+        assert_eq!(deep[23], 3); // NM30
+        assert_eq!(u16::from_le_bytes([deep[42], deep[43]]), 0x0600);
+        assert_eq!(u16::from_le_bytes([deep[68], deep[69]]), 0x0300);
+
+        // PQ on its own: the transfer function is independent of the depth.
+        let pq8 = cp::set_mode(
+            0x1234,
+            1,
+            &cp::Timing {
+                st2084: true,
+                ..base
+            },
+        )?;
+        assert_eq!(pq8[23], 2);
+        assert_eq!(u16::from_le_bytes([pq8[42], pq8[43]]), 0x0640);
+        assert_eq!(u16::from_le_bytes([pq8[68], pq8[69]]), 0x0200);
+
+        // What a compositor driving HDR actually produces.
+        let hdr = cp::set_mode(
+            0x1234,
+            1,
+            &cp::Timing {
+                ten_bit: true,
+                st2084: true,
+                ..base
+            },
+        )?;
+        assert_eq!(hdr[23], 3);
+        assert_eq!(u16::from_le_bytes([hdr[42], hdr[43]]), 0x0640);
+        assert_eq!(u16::from_le_bytes([hdr[68], hdr[69]]), 0x0300);
+        // The timing itself is untouched by either flag.
+        assert_eq!(&hdr[26..42], &sdr[26..42]);
+        assert_eq!(&hdr[44..68], &sdr[44..68]);
+        assert_eq!(&hdr[70..74], &sdr[70..74]);
+        Ok(())
+    }
+
+    /// A teardown carries no colour description at all, whatever the head was doing before it.
+    ///
+    /// Offset 42 bit 15 is `(Disabled)` in DLM's decode, and it is a real branch: the serializer
+    /// skips every timing write when it is set. Setting an HDR bit beside it would be describing
+    /// a signal that is being switched off.
+    #[test]
+    fn clear_mode_carries_no_colour_description() -> Result {
+        let m = cp::clear_mode(0x1234, 1)?;
+        // No DMA format on a teardown.
+        assert_eq!(m[23], 0);
+        assert_eq!(u16::from_le_bytes([m[42], m[43]]), 0x8000);
+        assert!(m[44..74].iter().all(|&x| x == 0));
         Ok(())
     }
 

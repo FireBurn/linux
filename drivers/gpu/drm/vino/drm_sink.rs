@@ -904,6 +904,12 @@ pub(super) struct VinoDrmData {
     /// is neither device-wide nor fixed: the DL7400 negotiates depth per connector, measured on
     /// Windows holding one head at 8 bits while the other ran at 10 (`docs/hdr.md` §0.4).
     head_ten_bit: core::sync::atomic::AtomicU32,
+    /// Bit `h` set when head `h`'s connector is being driven with the SMPTE ST 2084 (PQ) transfer
+    /// function, taken from the `HDR_OUTPUT_METADATA` blob userspace attached to it.
+    ///
+    /// Deliberately not folded into `head_ten_bit`: depth and transfer function are two fields of
+    /// the dock's set-mode message and two independent decisions by the compositor.
+    head_st2084: core::sync::atomic::AtomicU32,
     /// Which protocol generation this dock speaks; see `DockProfile::generation`. The two
     /// platforms differ in their initialisation, per-head HDCP framing, stream open and mode
     /// description, so one flag drives all of them rather than three that can disagree.
@@ -1134,6 +1140,7 @@ impl VinoDrmData {
             hdr_capable: AtomicBool::new(hdr_capable),
             codec_geometry: core::sync::atomic::AtomicU32::new(0),
             head_ten_bit: core::sync::atomic::AtomicU32::new(0),
+            head_st2084: core::sync::atomic::AtomicU32::new(0),
             connectors: core::sync::atomic::AtomicU8::new(HEADS as u8),
             is_navarro: core::sync::atomic::AtomicBool::new(false),
             video_keys <- new_mutex!(core::array::from_fn(
@@ -1379,6 +1386,25 @@ impl VinoDrmData {
     /// disagree.
     pub(super) fn head_is_ten_bit(&self, head: usize) -> bool {
         self.head_ten_bit.load(Ordering::Acquire) & (1u32 << head) != 0
+    }
+
+    /// Whether `head`'s connector is being driven in PQ; see [`Self::set_head_st2084`].
+    pub(super) fn head_is_st2084(&self, head: usize) -> bool {
+        self.head_st2084.load(Ordering::Acquire) & (1u32 << head) != 0
+    }
+
+    /// Record the transfer function userspace has asked for on `head`.
+    ///
+    /// Driven by the connector's `HDR_OUTPUT_METADATA` blob rather than by anything vino decides,
+    /// for the same reason [`Self::set_head_depth`] follows the framebuffer's fourcc: the dock
+    /// must be told what the pixels actually are, and any state of our own could drift from them.
+    pub(super) fn set_head_st2084(&self, head: u8, on: bool) {
+        let bit = 1u32 << u32::from(head);
+        if on {
+            self.head_st2084.fetch_or(bit, Ordering::Release);
+        } else {
+            self.head_st2084.fetch_and(!bit, Ordering::Release);
+        }
     }
 
     /// This device's codec geometry at one head's committed sample depth.
@@ -4584,19 +4610,17 @@ impl KmsDriver for VinoDrmDriver {
             // only where the profile says so keeps a Ridge connector from advertising an output
             // it has no set-mode encoding for.
             //
-            // ⛔ OFF BY DEFAULT, because advertising it is worse than not having it. `Colorspace`
-            // and HDR_OUTPUT_METADATA are what make a compositor switch its output encoding to
-            // PQ/BT.2020. Vino attaches them and reads neither: nothing carries the colorimetry or
-            // the mastering-display metadata to the dock, so the monitor stays in SDR while being
-            // fed PQ code words. User-visible result, measured by eye: the whole desktop goes
-            // grey. `max bpc` and the 10-bit plane format are harmless on their own -- they only
-            // describe what could be carried -- so they stay.
+            // ⛔ STILL OFF BY DEFAULT, but no longer because the protocol is unknown. The
+            // transfer function has been found -- offset-42 bit 6, `ST2084 colorspace used (HDR)`
+            // in DLM's own `setupVideo` log decode -- and `atomic_enable` now reads the
+            // connector's HDR_OUTPUT_METADATA EOTF and sends it, with the depth (offset 68) and
+            // the DMA format (offset 23, `NM30`) alongside it.
             //
-            // What is missing is the field in `id=0x48 sub=0x22` that selects the transfer
-            // function. The depth is settled (offset 68, with offset 23 following it) but the
-            // colorimetry is not, and the Windows HDR A/B capture cannot settle it: its control
-            // plane is sealed, and only Navarro's *video* is plaintext. It needs a keyed capture
-            // of DLM toggling HDR on this dock.
+            // What has not happened is a person looking at a panel in PQ. Turning these on is what
+            // makes a compositor re-encode the whole desktop, and the last time that happened
+            // while the dock was in SDR the result was hours of grey. That failure mode is exactly
+            // the one the wire cannot detect, so this waits for eyes rather than for a capture.
+            // See `docs/hdr.md`.
             if data.hdr_capable() && *crate::module_parameters::hdr_advertise.value() != 0 {
                 conn.attach_max_bpc_property(8, 10)?;
                 conn.attach_colorspace_property()?;

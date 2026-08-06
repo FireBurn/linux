@@ -1161,11 +1161,11 @@ kernel::module_usb_driver! {
         },
         hdr_dma_format: u8 {
             default: 0,
-            description: "Offset-23 DMA buffer format for a 10-bit head (0 = the default 1). The dock's bytes-per-pixel table has two four-byte entries, 1 and 3, and no capture distinguishes them; this settles it on hardware",
+            description: "Offset-23 DMA buffer format for a 10-bit head (0 = NM30, the value DLM names for 30 bpp). Kept overridable because a wrong four-byte format mis-sizes nothing and would fail far from here",
         },
         hdr_advertise: u8 {
             default: 0,
-            description: "Attach the Colorspace and HDR_OUTPUT_METADATA connector properties (0 = no). They are what make a compositor encode PQ/BT.2020, and nothing yet carries the colorimetry to the dock, so enabling HDR turns the desktop grey. Set 1 to work on it",
+            description: "Attach the Colorspace and HDR_OUTPUT_METADATA connector properties (0 = no). Vino now carries the transfer function to the dock (offset-42 bit 6) and the depth with it, but no panel has yet been seen lit in PQ, so this stays off until one has been",
         },
         flap_repair: u8 {
             default: 1,
