@@ -867,7 +867,8 @@ mod protocol {
             // Widths that are not multiples of 128: a plain `hactive + 128` would give 0x05d6 and
             // 0x0740, and quantising without the trailing unit would give 0x0580 and 0x06c0.
             (1366, 0x0600),
-            (1600, 0x0780),
+            // 1600 is 12.5 units, so it quantises to 13 and the trailing unit makes 14 x 128.
+            (1600, 0x0700),
             // The boundaries of one quantisation step.
             (129, 0x0180),
             (128, 0x0100),
@@ -989,9 +990,8 @@ mod protocol {
 
     #[test]
     fn unmeasured_mode_is_accepted_with_a_derived_profile() -> Result {
-        // 2560x1440@165: no decrypted message exists for it, but the profile is now derived rather
-        // than refused. `drm_sink::mode_valid` is what prunes it -- its 699.5 MHz clock is past
-        // `MAX_HEAD_CLOCK_KHZ`, and 165 Hz is past `DOCK_MAX_REFRESH_HZ`.
+        // 2560x1440@165: no decrypted message exists for it, but the profile is derived rather
+        // than refused, and the DL7400's ceilings admit it. This is the mode the dock really runs.
         let mode = DisplayMode::from_timings(ModeTimings {
             clock_khz: 699_500,
             hdisplay: 2560,
@@ -1005,8 +1005,10 @@ mod protocol {
             flags: ModeFlags::PHSYNC | ModeFlags::NVSYNC,
         })?;
         assert!(cp::mode_supported(&mode));
-        // Still out of the dock's envelope, so userspace never sees it.
-        assert!(mode.clock() as u32 > PROFILE_DL7400.max_head_clock_khz);
+        // Inside the DL7400's envelope, and exactly at its clock ceiling: the monitor's EDID DTD
+        // says 699.50 MHz where DLM's wire value rounds to its 10 kHz unit (699.49), so a ceiling
+        // taken from DLM's rounding would prune this mode by 10 kHz. It must not.
+        assert!(mode.clock() as u32 <= PROFILE_DL7400.max_head_clock_khz);
         // The clock field itself carries it fine: offsets 70..73 are a u32, as the DL7400's
         // 2560x1440p165 mode set proves (0x0001113d = 699.49 MHz). Admission is the refresh
         // limit's job, not a silent conversion failure.
@@ -1152,8 +1154,18 @@ mod protocol {
         assert_eq!(wht::colour(512, 512, 512), (512 * 64, 0, 0));
         assert_eq!(wht::colour(1023, 0, 0), (64 * (1023 >> 2), 64 * 1023, 0));
         // 10-bit white quantises to 4092 at DC, which is why the ceiling has to move.
+        //
+        // Through `quantize_dc_round`, which is what the encoder actually applies to coefficient
+        // zero. This assertion used to go through `quantize`, the *AC* quantiser, whose clamp to
+        // the 12-bit signed token range caps it at 2047 -- so the test could never pass, and it
+        // was measuring a function the DC never reaches. The AC clamp stays where it is
+        // deliberately: an over-range AC magnitude saturates in `esc` and only loses detail,
+        // whereas an over-sized ceiling desynchronises the dock's decoder outright.
         let (y, _, _) = wht::colour(1023, 1023, 1023);
-        assert_eq!(wht::quantize(wht::transform(&[y; wht::BLOCK])[0], 0), 4092);
+        assert_eq!(
+            wht::quantize_dc_round(0, wht::transform(&[y; wht::BLOCK])[0]),
+            4092
+        );
     }
 
     /// The same quantised blocks encode to different bytes at the two depths.
@@ -1525,9 +1537,13 @@ mod protocol {
         ] {
             let descriptor = cp::navarro_pipe_descriptor(connector)?;
             assert_eq!(descriptor.len(), 304);
+            // The marker is present TWICE before the slot records; 14 + 14 + 6 * 46 = 304. This
+            // test checked only the first copy and then read the slot records from offset 14, so
+            // it was decoding the second marker as a record header.
             assert_eq!(&descriptor[..14], &cp::NAVARRO_STREAM_MARKER);
+            assert_eq!(&descriptor[14..28], &cp::NAVARRO_STREAM_MARKER);
             for (index, &(slot, ring, plane0, plane1)) in slots.iter().enumerate() {
-                let at = 14 + index * 46;
+                let at = 28 + index * 46;
                 assert_eq!(&descriptor[at..at + 4], &[0x2c, 0x00, 0x0e, 0x00]);
                 assert_eq!(
                     u16::from_le_bytes([descriptor[at + 4], descriptor[at + 5]]),

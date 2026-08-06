@@ -714,7 +714,7 @@ pub(crate) mod wht {
 
     /// Per-plane DC quantizer, round-half-up on the SIGNED value (toward +inf): luma (plane 0)
     /// step 16, chroma step 64. `+224/64 = 3.5 -> 4`; `-8416/64 = -131.5 -> -131`.
-    fn quantize_dc_round(plane: usize, v: i32) -> i32 {
+    pub(crate) fn quantize_dc_round(plane: usize, v: i32) -> i32 {
         let shift: u32 = if plane == 0 { 4 } else { 6 };
         (v + (1 << (shift - 1))) >> shift
     }
