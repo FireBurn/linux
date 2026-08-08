@@ -1024,6 +1024,31 @@ impl usb::Driver for VinoDriver {
                 info.hdr_capable
             );
         }
+        // ⛔ Writing firmware the dock does not need is a deliberate act: its DFU interface does
+        // not support upload, so there is no way to read the running image back and nothing to
+        // restore from if the write goes wrong.
+        let force = *crate::module_parameters::force_flash.value() != 0;
+        if ifnum == firmware::DFU_INTERFACE {
+            // The dock's DFU interface, which is also the one every DFU request is addressed to.
+            // Reading the identity here costs one standard control transfer and is what says
+            // whether an update is due at all; a failure is not fatal, because a dock runs
+            // perfectly well on the firmware it shipped with.
+            match io.enter().and_then(|link| {
+                let id = firmware::read_identity(&link)?;
+                dev_info!(
+                    cdev,
+                    "vino: dock platform {} running firmware {}.{}.{}\n",
+                    core::str::from_utf8(id.platform()).unwrap_or("?"),
+                    id.version.0,
+                    id.version.1,
+                    id.version.2
+                );
+                firmware::update_if_newer(&link, cdev, &id, u16::from(ifnum), force)
+            }) {
+                Ok(()) => {}
+                Err(e) => dev_info!(cdev, "vino: dock firmware check skipped ({e:?})\n"),
+            }
+        }
         if ifnum != 0 {
             // Keep the app-specific interface paired with the display function. Let the audio
             // (2-4) and Ethernet (5-6) interfaces fall through to their class drivers. Returning
@@ -1178,6 +1203,10 @@ kernel::module_usb_driver! {
         rtc_utc_offset_minutes: i32 {
             default: 0,
             description: "Local UTC offset used by Navarro RTC synchronization (minutes east of UTC)",
+        },
+        force_flash: u8 {
+            default: 0,
+            description: "Write the packaged dock firmware even when the dock already runs that version or newer. ⛔ The dock's DFU interface does not support upload, so the running image cannot be read back and there is no host-side restore path; an interrupted write leaves a partial image. Intended for recovering a dock whose firmware is damaged, not for normal use",
         },
         edid_override: u8 {
             default: 0,

@@ -13,6 +13,10 @@ use kernel::prelude::*;
 use kernel::time::Delta;
 use kernel::usb;
 
+/// The dock's DFU interface: `bInterfaceClass 0xfe`, `bInterfaceSubClass 1`, and the interface
+/// number every DFU class request is addressed to.
+pub(crate) const DFU_INTERFACE: u8 = 1;
+
 /// Vendor descriptor carrying the platform name and running firmware version.
 ///
 /// `bcdDevice` does **not** change when a dock is updated, so it cannot answer "is an update due".
@@ -315,7 +319,9 @@ pub(crate) fn update_if_newer(
             dev,
             "vino: no {} available; leaving the dock on {}.{}.{}\n",
             name,
-            identity.version.0, identity.version.1, identity.version.2.0, identity.version.1, identity.version.2
+            identity.version.0,
+            identity.version.1,
+            identity.version.2
         );
         return Ok(());
     };
