@@ -6,10 +6,12 @@
 //! theirs in a tagged table. Comparing the two says whether an update is due; the transfer itself
 //! is textbook USB DFU 1.1 on the dock's DFU interface.
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel::device::Device;
 #[cfg(CONFIG_RUST_FW_LOADER_ABSTRACTIONS)]
 use kernel::firmware::Firmware;
 use kernel::prelude::*;
+use kernel::sync::{Arc, ArcBorrow};
 use kernel::time::Delta;
 use kernel::usb;
 
@@ -154,6 +156,25 @@ impl Family {
             Self::Firefly => c"vino/firefly-monitor-release.spkg",
         }
     }
+
+    /// From a package's `RD` tag.
+    pub(crate) fn from_package(rd: &[u8]) -> Option<Self> {
+        Self::from_identity(rd)
+    }
+}
+
+/// The dock family a package targets, from its `RD` tag.
+///
+/// This is what stops a Ridge image being written to a Navarro dock: the package says who it is
+/// for, so an image pushed in by hand can be checked without trusting the filename.
+pub(crate) fn package_family(image: &[u8]) -> Option<Family> {
+    const TAG: [u8; 4] = [b'R', b'D', 8, 0];
+    let w = image
+        .windows(TAG.len() + 8)
+        .find(|w| w[..TAG.len()] == TAG)?;
+    let name = &w[4..12];
+    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    Family::from_package(&name[..end])
 }
 
 /// Standard `GET_DESCRIPTOR` for the configuration descriptor, which the identity blob rides in.
@@ -399,4 +420,96 @@ pub(crate) fn update_if_newer(
         if force { " (forced)" } else { "" }
     );
     flash(io, iface, fw.data())
+}
+
+/// The `/sys/class/firmware/vino-<dock>/` upload interface.
+///
+/// This is the deliberate path: userspace hands vino an image and it is written, whatever version
+/// it is. That is what makes a re-flash of the running version, or an attempted downgrade,
+/// possible at all -- [`update_if_newer`] refuses both by design.
+///
+/// The checks below are the only thing between a mistyped `cat` and a dock that no longer works:
+/// the DFU interface does not support upload, so the running image cannot be read back and there
+/// is nothing to restore from.
+pub(crate) struct Upload;
+
+/// What an upload needs to reach the dock, and the cancel flag userspace can set.
+pub(crate) struct UploadCtx {
+    /// The window the dock's I/O is issued through, so a write can be refused once it closes.
+    pub(crate) window: Arc<usb::IoWindow>,
+    /// Set by `cancel`, observed between blocks.
+    pub(crate) cancelled: AtomicBool,
+    /// The family this dock is, which an image must match.
+    pub(crate) family: Family,
+}
+
+impl kernel::firmware::upload::Upload for Upload {
+    type Data = Arc<UploadCtx>;
+
+    fn prepare(
+        ctx: ArcBorrow<'_, UploadCtx>,
+        image: &[u8],
+    ) -> core::result::Result<(), kernel::firmware::upload::Error> {
+        use kernel::firmware::upload::Error as UErr;
+        ctx.cancelled.store(false, Ordering::Release);
+        if !is_package(image) {
+            pr_err!("vino: refusing upload: not a DisplayLink firmware package\n");
+            return Err(UErr::InvalidFirmware);
+        }
+        // The package says which dock it is for. Writing another family's image is the one
+        // mistake here that cannot be undone, so it is refused before the dock is touched.
+        match package_family(image) {
+            Some(f) if f == ctx.family => {}
+            _ => {
+                pr_err!("vino: refusing upload: image is not for this dock family\n");
+                return Err(UErr::InvalidFirmware);
+            }
+        }
+        if let Some(v) = package_version(image) {
+            pr_info!("vino: upload accepted: firmware {v}\n");
+        }
+        Ok(())
+    }
+
+    fn write(
+        ctx: ArcBorrow<'_, UploadCtx>,
+        image: &[u8],
+        offset: u32,
+        _chunk: &[u8],
+    ) -> core::result::Result<u32, kernel::firmware::upload::Error> {
+        use kernel::firmware::upload::Error as UErr;
+        // The dock takes the package as a whole -- block numbers are an index into the image, and
+        // the transfer ends with a manifest -- so it is written in one pass on the first call
+        // rather than chunk by chunk as the core offers it.
+        if offset != 0 {
+            return Ok(image.len() as u32 - offset);
+        }
+        if ctx.cancelled.load(Ordering::Acquire) {
+            return Err(UErr::Canceled);
+        }
+        let Ok(io) = ctx.window.enter() else {
+            return Err(UErr::Hardware);
+        };
+        match flash(&io, u16::from(DFU_INTERFACE), image) {
+            Ok(()) => Ok(image.len() as u32),
+            Err(e) => {
+                pr_err!("vino: firmware upload failed ({e:?})\n");
+                Err(UErr::ReadWrite)
+            }
+        }
+    }
+
+    fn poll_complete(
+        _ctx: ArcBorrow<'_, UploadCtx>,
+    ) -> core::result::Result<(), kernel::firmware::upload::Error> {
+        // `flash()` is synchronous and has already polled the dock's own DFU status to completion.
+        Ok(())
+    }
+
+    fn cancel(ctx: ArcBorrow<'_, UploadCtx>) {
+        // Runs on another thread. The write loop reads this between blocks; a transfer already in
+        // flight still completes, because abandoning one mid-image is what leaves a dock unusable.
+        ctx.cancelled.store(true, Ordering::Release);
+        pr_info!("vino: firmware upload cancellation requested\n");
+    }
 }
