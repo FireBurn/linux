@@ -922,7 +922,84 @@ pub trait RawConnectorState: AsRawConnectorState {
         // `self.state.connector` points to a valid instance of a `Connector<T>`
         unsafe { Self::Connector::from_raw((*self.as_raw()).connector) }
     }
+
+    /// The colorimetry userspace has requested through the `Colorspace` property, as a
+    /// [`enum drm_colorspace`] value.
+    ///
+    /// Meaningful only on a connector that
+    /// [`UnregisteredConnector::attach_colorspace_property`] was called for; everything else
+    /// leaves it at `DRM_MODE_COLORIMETRY_DEFAULT`.
+    ///
+    /// [`enum drm_colorspace`]: srctree/include/drm/drm_connector.h
+    fn colorspace(&self) -> u32 {
+        self.as_raw().colorspace
+    }
+
+    /// The electro-optical transfer function from the `HDR_OUTPUT_METADATA` blob, or [`None`] if
+    /// userspace has not set one.
+    ///
+    /// This is deliberately just the curve: the rest of the infoframe is mastering-display
+    /// metadata for the sink, and a driver that only needs to know *which curve the pixels are
+    /// encoded in* should not have to reason about the union's other members or their versioning.
+    ///
+    /// [`struct hdr_output_metadata`]: srctree/include/uapi/drm/drm_mode.h
+    fn hdr_output_eotf(&self) -> Option<Eotf> {
+        let blob = self.as_raw().hdr_output_metadata;
+        if blob.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null `hdr_output_metadata` blob is valid for the state's lifetime.
+        let (data, length) = unsafe { ((*blob).data, (*blob).length) };
+        // DRM validates the blob length when the property is set, but this is the boundary where
+        // a short blob would become an out-of-bounds read.
+        if data.is_null() || length < core::mem::size_of::<bindings::hdr_output_metadata>() {
+            return None;
+        }
+        // SAFETY: the blob is at least a whole `hdr_output_metadata` and lives as long as the
+        // state. `eotf` is the first byte of the only union member DRM defines.
+        let eotf = unsafe {
+            (*data.cast::<bindings::hdr_output_metadata>())
+                .__bindgen_anon_1
+                .hdmi_metadata_type1
+                .eotf
+        };
+        Some(Eotf::from_raw(eotf))
+    }
 }
+/// An electro-optical transfer function named by a `HDR_OUTPUT_METADATA` blob.
+///
+/// Mirrors the `HDMI_EOTF_*` values in [`enum hdmi_eotf`]. A driver matches on this rather than
+/// comparing against the raw constants, so the one place that has to agree with the C enum is
+/// [`Eotf::from_raw`].
+///
+/// [`enum hdmi_eotf`]: srctree/include/linux/hdmi.h
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Eotf {
+    /// Ordinary SDR gamma.
+    TraditionalGammaSdr,
+    /// The traditional HDR gamma curve.
+    TraditionalGammaHdr,
+    /// SMPTE ST 2084, i.e. PQ. What a compositor sets to drive an output in HDR10.
+    SmpteSt2084,
+    /// BT.2100 hybrid log-gamma.
+    Bt2100Hlg,
+    /// A value this kernel does not name, carried through rather than discarded.
+    Other(u8),
+}
+
+impl Eotf {
+    /// Classify the raw `eotf` byte from an infoframe.
+    fn from_raw(eotf: u8) -> Self {
+        match u32::from(eotf) {
+            bindings::hdmi_eotf_HDMI_EOTF_TRADITIONAL_GAMMA_SDR => Self::TraditionalGammaSdr,
+            bindings::hdmi_eotf_HDMI_EOTF_TRADITIONAL_GAMMA_HDR => Self::TraditionalGammaHdr,
+            bindings::hdmi_eotf_HDMI_EOTF_SMPTE_ST2084 => Self::SmpteSt2084,
+            bindings::hdmi_eotf_HDMI_EOTF_BT_2100_HLG => Self::Bt2100Hlg,
+            _ => Self::Other(eotf),
+        }
+    }
+}
+
 impl<T: AsRawConnectorState> RawConnectorState for T {}
 
 /// The main interface for a [`struct drm_connector_state`].
