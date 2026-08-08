@@ -117,6 +117,7 @@ mod hdcp;
 mod proto;
 mod rng;
 mod video;
+mod firmware;
 mod video_arm;
 
 /// The state a completed HDCP 2.2 AKE leaves for control-plane setup.
