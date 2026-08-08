@@ -13,6 +13,8 @@ config DRM_VINO
 	select RUST_CRYPTO_AKCIPHER
 	select RUST_CRYPTO_LIB_AES
 	select RUST_CRYPTO_LIB_SHA256
+	select FW_LOADER
+	select RUST_FW_LOADER_ABSTRACTIONS
 	help
 	  Open in-kernel Rust driver for DisplayLink DL3 docks: the Dell
 	  Universal Dock D6000 (USB ID 17e9:6006, DL-6xxx silicon) and the

@@ -29,9 +29,16 @@ impl VinoDriver {
             timeout(),
             GFP_KERNEL,
         ) {
-            // Info, not debug: on unfamiliar hardware this blob is what places the device, and
-            // needing a debug build to see it costs a whole test round trip.
-            Ok(()) => pr_info!("device identity = {dock_id:02x?}\n"),
+            // The raw blob is printed only when it cannot be read as an identity, which is the
+            // case where someone has to decode it by hand. Info, not debug: on unfamiliar
+            // hardware this is what places the device, and needing a debug build to see it costs
+            // a whole test round trip.
+            Ok(()) => match firmware::Identity::parse(&dock_id) {
+                // The DFU interface names the dock at info level, so one that parses is already
+                // reported once.
+                Some(id) => vino_debug!("{id} running firmware {}\n", id.version),
+                None => pr_info!("unrecognised device identity = {dock_id:02x?}\n"),
+            },
             Err(e) => pr_info!("device identity unavailable ({e:?})\n"),
         }
         // A composite driver may only change its own interface.
