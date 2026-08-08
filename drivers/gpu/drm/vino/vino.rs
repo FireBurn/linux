@@ -310,6 +310,11 @@ struct VinoBoundData {
     /// the option under the mutex before synchronously cancelling the work and unplugging DRM.
     /// The mutex itself is heap-pinned because kernel locks must not move after initialization.
     bringup: Pin<KBox<Mutex<Option<Arc<BringUp>>>>>,
+    /// The `/sys/class/firmware/` upload interface, on the DFU interface only.
+    ///
+    /// Held here so it is unregistered when the interface unbinds: the upload callbacks reach the
+    /// dock through the I/O window, which closes at the same time.
+    _fw_upload: Option<kernel::firmware::upload::Registration<firmware::Upload>>,
 }
 
 /// Deferred bring-up work item.
@@ -1028,6 +1033,7 @@ impl usb::Driver for VinoDriver {
         // not support upload, so there is no way to read the running image back and nothing to
         // restore from if the write goes wrong.
         let force = *crate::module_parameters::force_flash.value() != 0;
+        let mut identity_family = None;
         if ifnum == firmware::DFU_INTERFACE {
             // The dock's DFU interface, which is also the one every DFU request is addressed to.
             // Reading the identity here costs one standard control transfer and is what says
@@ -1035,6 +1041,7 @@ impl usb::Driver for VinoDriver {
             // perfectly well on the firmware it shipped with.
             match io.enter().and_then(|link| {
                 let id = firmware::read_identity(&link)?;
+                identity_family = id.family();
                 dev_info!(
                     cdev,
                     "vino: dock platform {} running firmware {}.{}.{}\n",
@@ -1049,6 +1056,45 @@ impl usb::Driver for VinoDriver {
                 Err(e) => dev_info!(cdev, "vino: dock firmware check skipped ({e:?})\n"),
             }
         }
+        // The manual path: userspace writes an image and vino flashes it, whatever version it is.
+        // This is how a re-flash of the running version or a downgrade is done at all, since the
+        // automatic check refuses both. Published only on the DFU interface, and only for a dock
+        // whose family is recognised -- an image for another family is refused in `prepare`.
+        let fw_upload = if ifnum == firmware::DFU_INTERFACE {
+            match identity_family {
+                Some(family) => {
+                    let ctx = Arc::new(
+                        firmware::UploadCtx {
+                            window: io.clone(),
+                            cancelled: core::sync::atomic::AtomicBool::new(false),
+                            family,
+                        },
+                        GFP_KERNEL,
+                    )?;
+                    match kernel::firmware::upload::Registration::new(
+                        &THIS_MODULE,
+                        cdev,
+                        c"vino-dock",
+                        ctx,
+                    ) {
+                        Ok(reg) => {
+                            dev_info!(
+                                cdev,
+                                "vino: firmware upload available at /sys/class/firmware/vino-dock\n"
+                            );
+                            Some(reg)
+                        }
+                        Err(e) => {
+                            dev_info!(cdev, "vino: no firmware upload interface ({e:?})\n");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         if ifnum != 0 {
             // Keep the app-specific interface paired with the display function. Let the audio
             // (2-4) and Ethernet (5-6) interfaces fall through to their class drivers. Returning
@@ -1068,6 +1114,7 @@ impl usb::Driver for VinoDriver {
                 _intf: intf.into(),
                 registration: None,
                 bringup: KBox::pin_init(new_mutex!(None), GFP_KERNEL)?,
+                _fw_upload: fw_upload,
             });
         }
         dev_info!(cdev, "vino: bound DisplayLink control interface\n");
@@ -1139,6 +1186,8 @@ impl usb::Driver for VinoDriver {
             _intf: intf_ref,
             registration: Some(registration),
             bringup: bringup_slot,
+            // The upload interface lives on the DFU interface, not the control one.
+            _fw_upload: None,
         })
     }
 
