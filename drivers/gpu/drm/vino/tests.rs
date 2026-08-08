@@ -14,6 +14,7 @@ use kernel::error::code::EINVAL;
 #[kunit_tests(vino_protocol)]
 mod protocol {
     use super::*;
+    use crate::firmware;
 
     /// S31.32 sign-magnitude constants: 1.0, +0.5, and -0.5 as sign bit + magnitude.
     const CTM_ONE: u64 = 1 << 32;
@@ -615,6 +616,48 @@ mod protocol {
         let frame = cp::seal_interactive(&[0x5au8; 16], &[0x11u8; 8], 0x16, 0, &req)?;
         assert_eq!(frame.len(), 16 + 32 + 16);
         assert_eq!(u16::from_le_bytes([frame[10], frame[11]]), 0x08); // cp::aux_for_id(0x16, ..)
+        Ok(())
+    }
+
+    #[test]
+    fn firmware_identity_and_package_versions_parse() -> Result {
+        // The dock's identity descriptor, as read from a DL-7400: 16 bytes, type 0x40, the running
+        // version at offsets 2..5, and the platform name at 8..16.
+        let raw = [
+            0x09u8, 0x02, 0x20, 0x00, 0x01, 0x01, 0x00, 0x80,
+            0x32, // a config descriptor first
+            0x10, 0x40, 0x0c, 0x02, 0x1a, 0x0b, 0x03, 0x22, b'N', b'a', b'v', b'a', b'D', b'o',
+            b'c', b'k',
+        ];
+        let id = firmware::Identity::parse(&raw).ok_or(EINVAL)?;
+        assert_eq!(id.version, firmware::Version(12, 2, 26));
+        assert_eq!(id.platform(), b"NavaDock");
+        assert_eq!(
+            id.firmware_name().ok_or(EINVAL)?,
+            c"vino/navarro-dock-release.spkg"
+        );
+
+        // A package's version is a `VE` tag with a three-byte value, at no fixed offset -- the
+        // shipped images carry it at 100 and at 24574.
+        let mut pkg = KVec::new();
+        pkg.extend_from_slice(b"ELLA\0\0\0\0", GFP_KERNEL)?;
+        pkg.extend_from_slice(&[0u8; 64], GFP_KERNEL)?;
+        pkg.extend_from_slice(b"VE\x03\0", GFP_KERNEL)?;
+        pkg.extend_from_slice(&[12, 2, 27], GFP_KERNEL)?;
+        assert!(firmware::is_package(&pkg));
+        assert_eq!(
+            firmware::package_version(&pkg).ok_or(EINVAL)?,
+            firmware::Version(12, 2, 27)
+        );
+
+        // Ordering is major-minor-patch, which is what decides whether an update is due.
+        assert!(firmware::Version(12, 2, 27) > firmware::Version(12, 2, 26));
+        assert!(firmware::Version(12, 3, 0) > firmware::Version(12, 2, 99));
+        assert!(firmware::Version(13, 0, 0) > firmware::Version(12, 9, 9));
+        assert!(!(firmware::Version(12, 2, 26) > firmware::Version(12, 2, 26)));
+
+        // Anything that is not a package must be refused before a byte reaches the dock.
+        assert!(!firmware::is_package(b"not a firmware image"));
         Ok(())
     }
 
