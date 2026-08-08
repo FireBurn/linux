@@ -18,6 +18,7 @@ GPU Driver Documentation
    v3d
    vc4
    vkms
+   vino
    bridge/dw-hdmi
    xen-front
    xe/index
