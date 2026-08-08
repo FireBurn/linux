@@ -1047,6 +1047,19 @@ impl<'a, T: FromRawCrtcState> CrtcStateMutator<'a, T> {
     }
 }
 
+impl<'a, T: FromRawCrtcState> CrtcStateMutator<'a, T> {
+    /// Require a full mode set for this CRTC.
+    ///
+    /// Called from [`DriverCrtc::atomic_check`] when something the core does not track has changed
+    /// in a way the hardware can only adopt by being reprogrammed, such as a connector property
+    /// that forms part of the signal description the driver sends to its device.
+    pub fn set_mode_changed(&mut self, changed: bool) {
+        // SAFETY: `as_raw()` is a valid `drm_crtc_state`, and holding this mutator is proof that
+        // no other reference to it exists.
+        unsafe { (*self.as_raw()).set_mode_changed(changed) };
+    }
+}
+
 impl<'a, T: DriverCrtcState> CrtcStateMutator<'a, CrtcState<T>> {
     super::impl_from_opaque_mode_obj! {
         fn <D, C>(CrtcStateMutator<'a, OpaqueCrtcState<D>>) -> Self
