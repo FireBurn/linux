@@ -307,6 +307,29 @@ impl DeviceId {
         })
     }
 
+    /// Equivalent to C's `USB_VENDOR_AND_INTERFACE_INFO` macro.
+    ///
+    /// Matches every device from one vendor that exposes an interface of the given class,
+    /// subclass and protocol, whatever its product ID. This is how a driver binds to a *function*
+    /// rather than to a list of the products someone happened to test.
+    pub const fn from_vendor_and_interface_info(
+        vendor: u16,
+        class: u8,
+        subclass: u8,
+        protocol: u8,
+    ) -> Self {
+        Self(bindings::usb_device_id {
+            match_flags: (bindings::USB_DEVICE_ID_MATCH_VENDOR
+                | bindings::USB_DEVICE_ID_MATCH_INT_INFO) as u16,
+            idVendor: vendor,
+            bInterfaceClass: class,
+            bInterfaceSubClass: subclass,
+            bInterfaceProtocol: protocol,
+            // SAFETY: It is safe to use all zeroes for the other fields of `usb_device_id`.
+            ..unsafe { MaybeUninit::zeroed().assume_init() }
+        })
+    }
+
     /// Equivalent to C's `USB_DEVICE_INTERFACE_CLASS` macro.
     pub const fn from_device_interface_class(vendor: u16, product: u16, class: u8) -> Self {
         Self(bindings::usb_device_id {
