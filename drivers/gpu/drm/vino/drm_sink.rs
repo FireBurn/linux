@@ -2040,7 +2040,7 @@ impl VinoDrmData {
                         == 0
                     {
                         match dev.video_endpoint_status(head_i) {
-                            Ok(status) => pr_info!(
+                            Ok(status) => vino_debug!(
                                 "vino: head={} endpoint={:#04x} stopped accepting video: GET_STATUS={:#06x} halt={}\n",
                                 head,
                                 dev.eps.video[head_i].address(),
@@ -2611,10 +2611,7 @@ impl VinoDrmData {
                     PROMPT_TRAINING_OPEN_MS,
                     first_for_head,
                 )?;
-                // The timeline collapses right after this call: head 1's video slipped from its
-                // scheduled +150 ms to +1321 ms, so the markers DLM sends inside the stream never
-                // go out. Report the cost unconditionally until that is understood.
-                pr_info!(
+                vino_debug!(
                     "vino: head {} video submit took {} ms (timeline offset {} ms, {} ms since anchor)\n",
                     head,
                     (Instant::<Monotonic>::now() - t_sub).as_millis(),
@@ -3149,7 +3146,7 @@ impl VinoDrmData {
             // Name the *inner* sub as well as the wire id. "id=0x16 went unanswered" covers the
             // EDID engage, the readiness kick and both stream/display markers, and which one the
             // dock ignored is the whole diagnosis.
-            pr_info!(
+            vino_debug!(
                 "vino: unanswered id={id:#06x} sub={inner_sub:#06x} ctr={request_counter}: reaped {reaped} reply/replies, {undecodable} undecodable, last decoded id={seen_id:#06x} sub={seen_sub:#06x} ctr={seen_counter}\n"
             );
         }
@@ -3514,10 +3511,9 @@ impl VinoDrmData {
             // presence flap can only be read as "monitor disconnected", which says nothing about
             // whether the dock changed its mind or vino changed the question. It is one line per
             // *changed* reply per head, so a steady link prints nothing at all.
-            // Tagged with the dock's connector count -- Navarro exposes four, Ridge two -- because
-            // an untagged line cannot be attributed when both docks are bound, and reading these
-            // as the wrong dock's is exactly how this session lost time.
-            pr_info!(
+            // Tagged with the dock's connector count so the line can be attributed when two
+            // docks are bound.
+            vino_debug!(
                 "vino: [{}conn] socket {socket} presence reply id={id:#06x} status={status:#010x} \
                  -> present={present} ready={ready} (was id={:#06x} status={:#06x})\n",
                 self.connector_count(),

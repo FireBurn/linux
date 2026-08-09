@@ -1906,7 +1906,7 @@ impl VinoDriver {
                                                 &buf[..len],
                                             ) {
                                                 if let Some(line) = cp::dock_trace_line(&inner) {
-                                                    pr_info!(
+                                                    vino_debug!(
                                                         "vino: dock: {}\n",
                                                         core::str::from_utf8(&line).unwrap_or("?")
                                                     );
@@ -1926,7 +1926,7 @@ impl VinoDriver {
                                         Some(inner) => {
                                             out.acks += 1;
                                             if let Some(line) = cp::dock_trace_line(&inner) {
-                                                pr_info!(
+                                                vino_debug!(
                                                     "vino: dock: {}\n",
                                                     core::str::from_utf8(&line).unwrap_or("?")
                                                 );
