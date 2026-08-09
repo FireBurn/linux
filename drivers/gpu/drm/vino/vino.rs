@@ -83,7 +83,7 @@ mod profile;
 /// USB endpoint resolution and the I/O handle transfers go through.
 mod usb_link;
 
-pub(crate) use profile::{DockProfile, EP_CTRL_IN, EP_CTRL_OUT, PROFILE_D6000, PROFILE_DL7400};
+pub(crate) use profile::{DockProfile, EP_CTRL_IN, EP_CTRL_OUT};
 pub(crate) use usb_link::{Endpoints, UsbLink, EP84_BUF};
 
 /// USB transfer timeout used during session setup.
@@ -424,6 +424,9 @@ impl WorkItem for BringUp {
                     profile.ep84_queue_depth,
                 );
                 data.set_video_keys(video_keys);
+                // The silence watchdog cannot live on this thread: this is the thread it exists
+                // to notice has stopped running.
+                data.start_cp_watchdog(drm_dev);
 
                 // One line naming what setup found on every physical socket, including the ones
                 // this dock does not drive as distinct streams. Which socket a monitor is in is
@@ -699,18 +702,7 @@ impl WorkItem for BringUp {
                 // windows off a connector that has disappeared, but not off one that is merely
                 // frozen. Recovery is a replug, which rebinds and starts a fresh session.
                 if !data.cp_link_alive() {
-                    for h in 0..data.connector_count() {
-                        if data.runtime_connector(h) && head_known[h] {
-                            head_known[h] = false;
-                            data.set_disconnected(h);
-                            dev_info!(
-                                cdev,
-                                "vino: socket {socket} dropped with the control session\n",
-                                socket = h + 1
-                            );
-                        }
-                    }
-                    drm_dev.hotplug_event();
+                    data.drop_connectors_with_session(drm_dev);
                     break;
                 }
                 if data.initial_modeset_quiet() {
@@ -1011,24 +1003,59 @@ impl WorkItem for BringUp {
 /// Control-session bring-up: plaintext init, link AKE, and the sealed per-connector setup.
 mod session;
 
+/// Which DisplayLink function an interface exposes, i.e. why this driver was offered it.
+///
+/// This is what the ID table carries. A table of product IDs cannot say anything useful about
+/// hardware nobody has tested, but the interface descriptor says what a function *is*, and that
+/// is stable across every dock in the family.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Function {
+    /// The DL3 display function: the control endpoints and every video endpoint.
+    Display,
+    /// The DFU interface, which carries the identity descriptor and firmware updates.
+    Dfu,
+}
+
+/// Vendor-specific class, which every DisplayLink display function uses.
+const CLASS_VENDOR: u8 = 0xff;
+/// Interface protocol of a DL3 display function. `0x00` is the old `udl` hardware, which is a
+/// different driver's problem, so keying on this excludes it for free.
+const PROTOCOL_DL3: u8 = 0x03;
+/// Application-specific class, subclass and protocol of a USB DFU runtime interface.
+const CLASS_DFU: (u8, u8, u8) = (0xfe, 0x01, 0x01);
+
+// DisplayLink's own udev rules match `17e9/*` and then trigger on the interface, with no product
+// test anywhere. Reverse engineering found the same split independently. Binding the *function*
+// rather than a list of tested products is what lets a dock nobody here owns come up; the
+// identity descriptor read in `probe` is the safety valve that keeps that honest.
 kernel::usb_device_table!(
     USB_TABLE,
     MODULE_USB_TABLE,
     <VinoDriver as usb::Driver>::IdInfo,
     [
         (
-            usb::DeviceId::from_id(VID_DISPLAYLINK, PID_D6000),
-            &PROFILE_D6000
+            usb::DeviceId::from_vendor_and_interface_info(
+                VID_DISPLAYLINK,
+                CLASS_VENDOR,
+                0x00,
+                PROTOCOL_DL3
+            ),
+            Function::Display
         ),
         (
-            usb::DeviceId::from_id(VID_DISPLAYLINK, PID_DL7400),
-            &PROFILE_DL7400
+            usb::DeviceId::from_vendor_and_interface_info(
+                VID_DISPLAYLINK,
+                CLASS_DFU.0,
+                CLASS_DFU.1,
+                CLASS_DFU.2
+            ),
+            Function::Dfu
         ),
     ]
 );
 
 impl usb::Driver for VinoDriver {
-    type IdInfo = &'static DockProfile;
+    type IdInfo = Function;
     type Data<'bound> = VinoBoundData;
     const ID_TABLE: usb::IdTable<Self::IdInfo> = &USB_TABLE;
 
@@ -1039,42 +1066,34 @@ impl usb::Driver for VinoDriver {
         io: Arc<usb::IoWindow>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let cdev: &device::Device<Core<'_>> = intf.as_ref();
-        // The D6000 exposes several interfaces (0/1/5/6 match us; 2-4 are audio).
-        // The control endpoints (0x02/0x84) and the whole HDCP session live on
-        // interface 0 -- drive bring-up only there so we don't run the preamble and
-        // AKE four times and pollute the dock's state machine. Other interfaces
-        // bind (so usbcore doesn't hand them to another driver) but stay idle.
-        // An interface with no active alternate setting has no endpoints to drive.
+        // The control endpoints (0x02/0x84) and the whole HDCP session live on the display
+        // function -- drive bring-up only there so the preamble and AKE do not run once per
+        // interface and pollute the dock's state machine. An interface with no active alternate
+        // setting has no endpoints to drive.
+        let function = *info;
         let ifnum = intf.number().ok_or(ENODEV)?;
         log_device_identity(cdev, intf, ifnum);
-        if ifnum == 0 {
-            // One line per bind, naming the hardware the driver decided it is holding. On
-            // unfamiliar hardware this is what says whether the dock was recognised or fell back
-            // to a stranger's profile, so it stays out of the debug gate. The endpoint map that
-            // follows from it is a debug detail.
-            dev_info!(cdev, "{}\n", info.name);
-            vino_dev_debug!(
-                cdev,
-                "video endpoints {}, 10-bit capable {}\n",
-                HexList(&info.video_eps),
-                info.hdr_capable
-            );
-        }
+
+        // What this hardware *is*, asked of the hardware. `read_identity` walks the ordinary
+        // configuration descriptor: one standard control transfer, no session and no crypto, so
+        // it works at probe on either interface and long before the dock will talk to anyone.
+        let identity = io
+            .enter()
+            .and_then(|link| firmware::read_identity(&link))
+            .ok();
+        let identity_family = identity.as_ref().and_then(firmware::Identity::family);
+
         // Writing firmware the dock does not need is a deliberate act: its DFU interface does
         // not support upload, so there is no way to read the running image back and nothing to
         // restore from if the write goes wrong.
         let force = *crate::module_parameters::force_flash.value() != 0;
-        let mut identity_family = None;
-        if ifnum == firmware::DFU_INTERFACE {
-            // The dock's DFU interface, which is also the one every DFU request is addressed to.
-            // Reading the identity here costs one standard control transfer and is what says
-            // whether an update is due at all; a failure is not fatal, because a dock runs
-            // perfectly well on the firmware it shipped with.
-            match io.enter().and_then(|link| {
-                let id = firmware::read_identity(&link)?;
-                identity_family = id.family();
+        if function == Function::Dfu {
+            // Every DFU request is addressed to this interface. A failed check is not fatal: a
+            // dock runs perfectly well on the firmware it shipped with.
+            match (identity.as_ref().ok_or(ENODEV)).and_then(|id| {
+                let link = io.enter()?;
                 dev_info!(cdev, "{id} running firmware {}\n", id.version);
-                firmware::update_if_newer(&link, cdev, &id, u16::from(ifnum), force)
+                firmware::update_if_newer(&link, cdev, id, u16::from(ifnum), force)
             }) {
                 Ok(()) => {}
                 Err(e) => dev_info!(cdev, "dock firmware check skipped ({e:?})\n"),
@@ -1084,7 +1103,7 @@ impl usb::Driver for VinoDriver {
         // This is how a re-flash of the running version or a downgrade is done at all, since the
         // automatic check refuses both. Published only on the DFU interface, and only for a dock
         // whose family is recognised -- an image for another family is refused in `prepare`.
-        let fw_upload = if ifnum == firmware::DFU_INTERFACE {
+        let fw_upload = if function == Function::Dfu {
             match identity_family {
                 Some(family) => {
                     let ctx = Arc::new(
@@ -1119,15 +1138,11 @@ impl usb::Driver for VinoDriver {
         } else {
             None
         };
-        if ifnum != 0 {
-            // Keep the app-specific interface paired with the display function. Let the audio
-            // (2-4) and Ethernet (5-6) interfaces fall through to their class drivers. Returning
-            // ENODEV tells usbcore that this driver does not handle the interface.
-            if ifnum != 1 {
-                vino_dev_debug!(cdev, "declining interface {ifnum} (left to its class driver)\n");
-                return Err(ENODEV);
-            }
-            vino_dev_debug!(cdev, "bound interface {ifnum} (idle -- control is iface 0)\n");
+        if function == Function::Dfu {
+            vino_dev_debug!(
+                cdev,
+                "bound interface {ifnum} (idle -- control is the display function)\n"
+            );
             return Ok(VinoBoundData {
                 _intf: intf.into(),
                 registration: None,
@@ -1135,14 +1150,75 @@ impl usb::Driver for VinoDriver {
                 _fw_upload: fw_upload,
             });
         }
-        vino_dev_debug!(cdev, "bound DisplayLink control interface\n");
+
+        // The safety valve for matching on the interface rather than on a product ID. A dock that
+        // answers with a family nobody here has driven is declined by name, so its owner gets a
+        // log line and a report to send instead of a driver guessing at its wire format -- and
+        // the way a dock rejects a guess is to reset itself. A dock that could not be *asked*
+        // falls back to the product-ID quirk table, because a transient descriptor read must not
+        // cost a working device its display.
+        let profile = match identity_family {
+            Some(family) => match profile::for_family(family) {
+                Some(profile) => profile,
+                None => {
+                    let id = identity.as_ref().ok_or(ENODEV)?;
+                    dev_info!(
+                        cdev,
+                        "{id} is not a family this driver drives yet; declining. \
+                         A report makes it supportable: Documentation/gpu/vino.rst\n"
+                    );
+                    return Err(ENODEV);
+                }
+            },
+            None => {
+                let usbdev: &usb::Device<Core<'_>> = intf.as_ref();
+                match profile::for_product(usbdev.product_id()) {
+                    Some(profile) => {
+                        dev_warn!(
+                            cdev,
+                            "identity descriptor unreadable; using the quirk entry for \
+                             {:04x}\n",
+                            usbdev.product_id()
+                        );
+                        profile
+                    }
+                    None => {
+                        dev_info!(
+                            cdev,
+                            "no identity descriptor and no quirk entry; declining. \
+                             A report makes it supportable: Documentation/gpu/vino.rst\n"
+                        );
+                        return Err(ENODEV);
+                    }
+                }
+            }
+        };
+        // One line per bind, naming the hardware the driver decided it is holding. On unfamiliar
+        // hardware this is what says whether the dock was recognised or fell back to a stranger's
+        // profile, so it stays out of the debug gate. The endpoint map that follows from it is a
+        // debug detail.
+        dev_info!(cdev, "{}\n", profile.name);
+        vino_dev_debug!(
+            cdev,
+            "video endpoints {}, 10-bit capable {}\n",
+            HexList(&profile.video_eps),
+            profile.hdr_capable
+        );
         // Register the DRM/KMS device on the control interface. Keep a refcounted interface handle
         // in the bound data while the DRM device retains the I/O window used by its workers.
         let intf_ref: ARef<usb::Interface> = intf.into();
 
-        // Resolve the dock's endpoints against interface 0's descriptor once, so every later
-        // transfer names a direction/type-checked endpoint instead of a bare address.
-        let eps = Endpoints::resolve(intf, info)?;
+        // Resolve the dock's endpoints against the display function's descriptor once, so every
+        // later transfer names a direction/type-checked endpoint instead of a bare address.
+        let (eps, connectors) = Endpoints::resolve(intf, profile)?;
+        if connectors != profile.connectors {
+            dev_warn!(
+                cdev,
+                "{connectors} connector(s) backed by video endpoints, not the {} this \
+                 profile describes; driving what the device exposes\n",
+                profile.connectors
+            );
+        }
 
         // DRM device lifecycle: allocate an `UnregisteredDevice`, wire up the KMS pipeline on it
         // while still unregistered, then register it. The `Registration` is stored in the bound
@@ -1153,7 +1229,7 @@ impl usb::Driver for VinoDriver {
             // The ten-bit flag has to arrive here, not in the profile block below: the KMS objects
             // are built during this call, and they decide then whether to offer a 10-bit format
             // and the HDR connector properties.
-            drm_sink::VinoDrmData::new(io.clone(), eps, info.hdr_capable),
+            drm_sink::VinoDrmData::new(io.clone(), eps, profile.hdr_capable),
             &THIS_MODULE,
         )?;
         // `Core` derefs to `Bound`; name the context explicitly so `as_ref()`
@@ -1179,22 +1255,22 @@ impl usb::Driver for VinoDriver {
             // It is per device because two docks of different generations lay a strip's sixteen
             // blocks over different pixels; see `video::wht::Geometry`.
             d.set_codec_geometry(
-                info.strip_blocks_x,
-                info.interlaced_bands,
-                info.band_parity_bit,
-                info.head_sub_shift,
-                info.stream_id_mask,
-                info.dock_buffers,
+                profile.strip_blocks_x,
+                profile.interlaced_bands,
+                profile.band_parity_bit,
+                profile.head_sub_shift,
+                profile.stream_id_mask,
+                profile.dock_buffers,
             );
             d.set_mode_limits(
-                info.pixel_budget,
-                info.max_refresh_hz,
-                info.max_head_clock_khz,
+                profile.pixel_budget,
+                profile.max_refresh_hz,
+                profile.max_head_clock_khz,
             );
-            d.set_navarro(info.is_navarro());
-            d.set_connectors(info.connectors);
+            d.set_navarro(profile.is_navarro());
+            d.set_connectors(connectors);
         }
-        let bringup = BringUp::new(ddev.clone(), info)?;
+        let bringup = BringUp::new(ddev.clone(), profile)?;
         let bringup_slot = KBox::pin_init(new_mutex!(Some(bringup.clone())), GFP_KERNEL)?;
 
         let data: &drm_sink::VinoDrmData = &ddev;
@@ -1273,11 +1349,11 @@ kernel::module_usb_driver! {
         },
         force_flash: u8 {
             default: 0,
-            description: "Write the packaged dock firmware even when the dock already runs that version or newer. The DFU interface does not support upload, so there is no host-side restore path and an interrupted write leaves a partial image. For recovering a damaged dock, not for normal use",
+            description: "Write the packaged dock firmware even when the dock already runs that version or newer. For recovering a damaged dock: DFU upload is unsupported, so there is no restore path",
         },
         edid_override: u8 {
             default: 0,
-            description: "Bitmask of heads whose sink is described by DRM's EDID override (drm_kms_helper.edid_firmware=<connector>:<path>, or a debugfs edid_override write) because the dock cannot read its EDID -- typically a DP-to-HDMI converter that mangles DDC",
+            description: "Bitmask of heads whose EDID the dock cannot read, typically behind a DP-to-HDMI converter that mangles DDC, and which are described by DRM's EDID override instead",
         },
     },
 }

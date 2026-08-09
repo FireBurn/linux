@@ -231,7 +231,7 @@ mod protocol {
         //         = 2 x 2 macro-tiles, each 4 strips wide x 4 bands = 16 strips.
         let (w, h) = (512usize, 128usize);
         const STRIPS_PER_MACRO: usize = 16;
-        let geom = PROFILE_D6000.geometry();
+        let geom = profile::PROFILE_RIDGE.geometry();
         let (full, _) = video::wht::colour_frame_ep08(geom, w, h, 0, 0, g)?;
 
         // A damage clip covering the WHOLE surface selects every strip in the same raster order as
@@ -275,7 +275,7 @@ mod protocol {
     fn black_training_frame_matches_captured_1440p_size() -> Result {
         // Captured first writes are 205,696 bytes:
         // 2,560-byte arm prefix + 203,040-byte black image + 96-byte frame trailer.
-        let geom = PROFILE_D6000.geometry();
+        let geom = profile::PROFILE_RIDGE.geometry();
         let frame = video::wht::black_frame_ep08(geom, 2560, 1440, 0)?;
         let image_len = frame.iter().map(|part| part.len()).sum::<usize>();
         assert_eq!(image_len, 203_040);
@@ -413,11 +413,11 @@ mod protocol {
     #[test]
     fn stream_ids_follow_the_dock_profile() {
         // Each dock's ids come from its own geometry value, so two bound docks cannot interfere.
-        let ridge = PROFILE_D6000.geometry();
+        let ridge = profile::PROFILE_RIDGE.geometry();
         assert_eq!(ridge.stream_id(0), 0x0008);
         assert_eq!(ridge.stream_id(1), 0x0009);
 
-        let navarro = PROFILE_DL7400.geometry();
+        let navarro = profile::PROFILE_NAVARRO.geometry();
         assert_eq!(navarro.stream_id(0), 0x0007);
         assert_eq!(navarro.stream_id(1), 0x000f);
         assert_eq!(navarro.stream_id(2), 0x0017);
@@ -869,6 +869,40 @@ mod protocol {
         assert!(drm_sink::NAVARRO_REAL_MODE_H0_MS - last <= 100);
     }
 
+    /// cannot be asked.
+    ///
+    /// The failure this pins is silent and total: swap two arms and every dock of both families
+    /// gets the other's codec geometry, which the hardware answers with a reset. The unsupported
+    /// families must stay unsupported for the same reason -- a guessed profile is worse than a
+    /// declined bind, because a declined bind produces a report.
+    #[test]
+    fn a_dock_is_placed_by_family_and_product_ids_are_only_quirks() {
+        use crate::firmware::Family;
+
+        assert!(core::ptr::eq(
+            profile::for_family(Family::Navarro).unwrap(),
+            &profile::PROFILE_NAVARRO
+        ));
+        assert!(core::ptr::eq(
+            profile::for_family(Family::Ridge).unwrap(),
+            &profile::PROFILE_RIDGE
+        ));
+        assert!(profile::for_family(Family::Ella).is_none());
+        assert!(profile::for_family(Family::Firefly).is_none());
+
+        // The quirk table agrees with the families it stands in for, and knows nothing else. A
+        // product missing here is still driven if its identity descriptor can be read.
+        assert!(core::ptr::eq(
+            profile::for_product(0x6006).unwrap(),
+            &profile::PROFILE_RIDGE
+        ));
+        assert!(core::ptr::eq(
+            profile::for_product(0x7000).unwrap(),
+            &profile::PROFILE_NAVARRO
+        ));
+        assert!(profile::for_product(0x6015).is_none());
+    }
+
     /// The boundary cases matter most: each must pass by equality. A `<` would prune a dock's
     /// working configuration and dark its panels.
     #[test]
@@ -878,29 +912,45 @@ mod protocol {
 
         // Ridge is clamped by refresh regardless of resolution: DLM puts 119.998 Hz on the wire
         // for a 180 Hz request and the 59.95 Hz CVT-RB timing for an 85 Hz one.
-        assert_eq!(PROFILE_D6000.max_refresh_hz, 120);
-        assert!(refresh_ok(&PROFILE_D6000, 120) && !refresh_ok(&PROFILE_D6000, 165));
+        assert_eq!(profile::PROFILE_RIDGE.max_refresh_hz, 120);
+        assert!(
+            refresh_ok(&profile::PROFILE_RIDGE, 120) && !refresh_ok(&profile::PROFILE_RIDGE, 165)
+        );
 
         // The DL7400 has no such clamp -- DLM drives it at 2560x1440@164.96 -- so its modes are
         // bounded by link rate alone.
-        assert!(refresh_ok(&PROFILE_DL7400, 180) && refresh_ok(&PROFILE_DL7400, 240));
+        assert!(
+            refresh_ok(&profile::PROFILE_NAVARRO, 180)
+                && refresh_ok(&profile::PROFILE_NAVARRO, 240)
+        );
 
         // 2560x1440: p165 is 699.50 MHz and carried; p180 is 714.81 MHz and is the mode the dock
         // accepts and then fails to deliver.
-        assert!(clock_ok(&PROFILE_DL7400, 699_500));
-        assert!(!clock_ok(&PROFILE_DL7400, 714_810));
+        assert!(clock_ok(&profile::PROFILE_NAVARRO, 699_500));
+        assert!(!clock_ok(&profile::PROFILE_NAVARRO, 714_810));
         // Ridge cannot express the high half of the offset-70 u32 in any capture taken.
-        assert!(clock_ok(&PROFILE_D6000, 655_350) && !clock_ok(&PROFILE_D6000, 699_500));
+        assert!(
+            clock_ok(&profile::PROFILE_RIDGE, 655_350)
+                && !clock_ok(&profile::PROFILE_RIDGE, 699_500)
+        );
 
         // A degenerate mode reports 0 Hz and carries no rate information; a signed refresh must
         // never be read as a huge unsigned one.
-        assert!(refresh_ok(&PROFILE_DL7400, 0) && refresh_ok(&PROFILE_DL7400, -1));
+        assert!(
+            refresh_ok(&profile::PROFILE_NAVARRO, 0) && refresh_ok(&profile::PROFILE_NAVARRO, -1)
+        );
 
         // Each budget admits its own dual-head configuration and nothing beyond it.
         let rate = drm_sink::active_pixel_rate;
         assert_eq!(rate(2560, 1440, 120), 442_368_000);
-        assert_eq!(PROFILE_D6000.pixel_budget, 2 * rate(2560, 1440, 120));
-        assert_eq!(PROFILE_DL7400.pixel_budget, 2 * rate(2560, 1440, 165));
+        assert_eq!(
+            profile::PROFILE_RIDGE.pixel_budget,
+            2 * rate(2560, 1440, 120)
+        );
+        assert_eq!(
+            profile::PROFILE_NAVARRO.pixel_budget,
+            2 * rate(2560, 1440, 165)
+        );
         assert_eq!(rate(65535, 65535, 65535), u32::MAX); // saturates, never wraps small
         assert_eq!(rate(2560, 1440, -1), 0);
     }
@@ -1147,7 +1197,7 @@ mod protocol {
         // Inside the DL7400's envelope, and exactly at its clock ceiling: the monitor's EDID DTD
         // says 699.50 MHz where DLM's wire value rounds to its 10 kHz unit (699.49), so a ceiling
         // taken from DLM's rounding would prune this mode by 10 kHz. It must not.
-        assert!(mode.clock() as u32 <= PROFILE_DL7400.max_head_clock_khz);
+        assert!(mode.clock() as u32 <= profile::PROFILE_NAVARRO.max_head_clock_khz);
         // The clock field itself carries it fine: offsets 70..73 are a u32, as the DL7400's
         // 2560x1440p165 mode set proves (0x0001113d = 699.49 MHz). Admission is the refresh
         // limit's job, not a silent conversion failure.
@@ -1696,7 +1746,7 @@ mod protocol {
 
     #[test]
     fn video_frame_trailer_matches_dlm_cycle_and_head() {
-        let geom = PROFILE_D6000.geometry();
+        let geom = profile::PROFILE_RIDGE.geometry();
         let t0 = video::wht::frame_trailer(geom, 0, 0);
         assert_eq!(
             &t0[..32],
