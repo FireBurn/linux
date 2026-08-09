@@ -655,6 +655,13 @@ impl WorkItem for BringUp {
             /// Settling period after re-engagement during which a negative probe is ignored.
             const PRESENCE_GRACE: Delta = Delta::from_millis(10_000);
             let mut presence_grace = [Instant::<Monotonic>::now(); VinoDriver::CP_SETUP_HEADS];
+            /// Quiet window a runtime arrival waits out before userspace is told.
+            ///
+            /// A mode set is dock-wide, so two heads announced separately make the compositor
+            /// reconfigure the dock twice and it re-enumerates. Each arrival restarts the window
+            /// and one event covers the burst. A removal is announced immediately.
+            const HOTPLUG_COALESCE: Delta = Delta::from_millis(1500);
+            let mut hotplug_due: Option<Instant<Monotonic>> = None;
             // When the current run of silent probes started; only read while `head_silent > 0`.
             for h in 0..data.connector_count() {
                 if !data.runtime_connector(h) {
@@ -792,7 +799,7 @@ impl WorkItem for BringUp {
                                     cdev,
                                     "vino: socket {socket} monitor connected after sink re-engagement\n"
                                 );
-                                drm_dev.hotplug_event();
+                                hotplug_due = Some(Instant::<Monotonic>::now() + HOTPLUG_COALESCE);
                             }
                             Ok(false) => {}
                             Err(e) => {
@@ -940,15 +947,26 @@ impl WorkItem for BringUp {
                                     .send_cp(dev, 0x14, 0, |ctr| cp::device_query_req(ctr, 0x000c));
                                 fsleep(Delta::from_millis(15));
                             }
+                            hotplug_due =
+                                Some(Instant::<Monotonic>::now() + HOTPLUG_COALESCE);
                         } else {
                             head_known[h] = false;
                             next_reengage[h] = Instant::<Monotonic>::now() + REENGAGE_RETRY;
                             data.set_disconnected(h);
                             dev_info!(cdev, "vino: socket {socket} monitor disconnected\n");
+                            // This event also covers any arrival still waiting out its window.
+                            hotplug_due = None;
+                            drm_dev.hotplug_event();
                         }
-                        drm_dev.hotplug_event();
                         // Re-baseline the heartbeat/presence deadlines skipped during the wait.
                         next_presence = Instant::<Monotonic>::now() + PRESENCE_PERIOD;
+                    }
+                }
+                // Announce a settled burst of arrivals as one topology change.
+                if let Some(due) = hotplug_due {
+                    if (Instant::<Monotonic>::now() - due).as_millis() >= 0 {
+                        hotplug_due = None;
+                        drm_dev.hotplug_event();
                     }
                 }
                 // A dock that tears the link down over a silent video endpoint needs feeding even
