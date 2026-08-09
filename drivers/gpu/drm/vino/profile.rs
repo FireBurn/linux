@@ -143,7 +143,7 @@ impl DockProfile {
 }
 
 /// Dell D6000 and other Ridge-platform docks. HW-verified.
-pub(crate) static PROFILE_D6000: DockProfile = DockProfile {
+pub(crate) static PROFILE_RIDGE: DockProfile = DockProfile {
     name: "Dell D6000 (Ridge, DL-6xxx)",
     video_eps: [0x08, 0x0b, 0x08, 0x0b],
     generation: Generation::Ridge,
@@ -166,7 +166,7 @@ pub(crate) static PROFILE_D6000: DockProfile = DockProfile {
 ///
 /// Four independent physical connectors multiplexed over two video endpoints. This is not tiling:
 /// the Windows capture has a distinct stream-open and record `sub` for each socket.
-pub(crate) static PROFILE_DL7400: DockProfile = DockProfile {
+pub(crate) static PROFILE_NAVARRO: DockProfile = DockProfile {
     name: "DL-7400 quad dock (Navarro, DL-7000)",
     video_eps: [0x08, 0x0a, 0x08, 0x0a],
     generation: Generation::Navarro,
@@ -189,6 +189,36 @@ pub(crate) static PROFILE_DL7400: DockProfile = DockProfile {
     hdr_capable: true,
     ep84_queue_depth: 1,
 };
+
+/// The profile for a dock family, or `None` for a family this driver cannot drive yet.
+///
+/// The family comes from the device's own identity descriptor, so this is what a dock *is*, not
+/// what product ID it happens to ship under. A product-ID table can only ever describe the
+/// hardware someone tested; see `Documentation/gpu/vino.rst` and `docs/adding-a-device.md`.
+///
+/// ⚠ Ella and Firefly are named by the vendor's firmware packages and have never been seen here.
+/// Declining them is deliberate: an unrecognised device that says what it is produces a usable
+/// report, and a guessed profile produces a dock reset.
+pub(crate) fn for_family(family: firmware::Family) -> Option<&'static DockProfile> {
+    match family {
+        firmware::Family::Navarro => Some(&PROFILE_NAVARRO),
+        firmware::Family::Ridge => Some(&PROFILE_RIDGE),
+        firmware::Family::Ella | firmware::Family::Firefly => None,
+    }
+}
+
+/// The profile for a device whose identity descriptor could not be read.
+///
+/// This is the quirk table, and the only thing product IDs are still good for: a dock that will
+/// not answer `GET_DESCRIPTOR` for its identity is one this driver has no other way to place. It
+/// is not the gate -- a device missing from it is still driven if it names its family.
+pub(crate) fn for_product(product: u16) -> Option<&'static DockProfile> {
+    match product {
+        PID_D6000 => Some(&PROFILE_RIDGE),
+        PID_DL7400 => Some(&PROFILE_NAVARRO),
+        _ => None,
+    }
+}
 
 /// Control and per-head bulk endpoints.
 pub(crate) const EP_CTRL_OUT: u8 = 0x02;
