@@ -27,24 +27,39 @@ pub(crate) struct Endpoints {
 }
 
 impl Endpoints {
-    /// Resolves every endpoint the driver uses against `intf`'s active alternate setting.
+    /// Resolves every endpoint the driver uses against `intf`'s active alternate setting, and
+    /// returns how many connectors the device actually backs.
     ///
-    /// The control endpoints and the video endpoints are required; the interrupt status endpoint
-    /// is optional because only the bring-up probe reads it.
+    /// The control endpoints and the first video endpoint are required. The rest are not: a dock
+    /// in a known family with fewer outputs simply does not expose the later ones, and the count
+    /// that does resolve is the connector count. Taking it from the device is the difference
+    /// between supporting such a dock and refusing to bind to it, because a profile can only
+    /// describe the variants someone has tested. Navarro repeats addresses across connectors
+    /// (0/2 share `0x08`, 1/3 share `0x0a`), so this counts entries rather than distinct
+    /// endpoints, and the profile's own count remains the upper bound -- four resolvable entries
+    /// on a two-connector Ridge dock still means two connectors.
     pub(crate) fn resolve<Ctx: device::DeviceContext>(
         intf: &usb::Interface<Ctx>,
         profile: &DockProfile,
-    ) -> Result<Self> {
+    ) -> Result<(Self, u8)> {
         let mut video = [intf.endpoint::<usb::BulkOut>(profile.video_eps[0])?; drm_sink::HEADS];
+        let mut connectors = 1u8;
         for (slot, addr) in video.iter_mut().zip(profile.video_eps).skip(1) {
-            *slot = intf.endpoint::<usb::BulkOut>(addr)?;
+            let Ok(ep) = intf.endpoint::<usb::BulkOut>(addr) else {
+                break;
+            };
+            *slot = ep;
+            connectors += 1;
         }
 
-        Ok(Self {
-            ctrl_out: intf.endpoint::<usb::BulkOut>(EP_CTRL_OUT)?,
-            ctrl_in: intf.endpoint::<usb::BulkIn>(EP_CTRL_IN)?,
-            video,
-        })
+        Ok((
+            Self {
+                ctrl_out: intf.endpoint::<usb::BulkOut>(EP_CTRL_OUT)?,
+                ctrl_in: intf.endpoint::<usb::BulkIn>(EP_CTRL_IN)?,
+                video,
+            },
+            connectors.min(profile.connectors),
+        ))
     }
 }
 

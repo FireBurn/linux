@@ -5,11 +5,38 @@ Vino DisplayLink DL3 driver
 ==========================
 
 Vino is a Rust DRM/KMS driver for DisplayLink DL3 USB display devices. Two
-device profiles are supported: the Dell Universal Dock D6000 (``17e9:6006``,
-DL-6xxx silicon) and the DL-7400 quad-display docks (``17e9:7000``, DL-7000
-silicon). Each profile carries the endpoints, strip geometry, connector count
-and link limits of its hardware; the rest of the driver reads those values
-rather than branching on the model.
+hardware families are supported: Ridge (DL-6xxx silicon, e.g. the Dell
+Universal Dock D6000) and Navarro (DL-7000 silicon, e.g. the DL-7400
+quad-display docks). Each family has a profile carrying the endpoints, strip
+geometry, connector count and link limits of its hardware; the rest of the
+driver reads those values rather than branching on the model.
+
+Device identification
+=====================
+
+The driver binds to a DisplayLink *function*, not to a list of product IDs: any
+device with vendor ``17e9`` exposing an interface of class ``0xff``, subclass
+``0``, protocol ``0x03`` (a DL3 display function; ``0x00`` is the older ``udl``
+hardware), plus that device's USB DFU interface. This matches what the vendor's
+own udev rules key on, and means a dock nobody has tested is offered to the
+driver rather than ignored.
+
+Which family a device belongs to is then read from the device itself. Every
+DisplayLink dock carries a sixteen-byte vendor descriptor, type ``0x40``, in
+its ordinary configuration descriptor, holding the running firmware version and
+an eight-character platform name -- ``NavaDock``, ``RidgeDoc`` and so on. It is
+read with a standard ``GET_DESCRIPTOR``, needing no session and no crypto, so
+identification happens at probe.
+
+A device whose identity names a family the driver cannot drive is declined by
+name, so its owner gets a log line and something worth reporting instead of a
+driver guessing at an unknown wire format. A device whose identity cannot be
+*read* falls back to a small product-ID quirk table, so a transient descriptor
+failure does not cost a known dock its displays.
+
+The number of connectors comes from how many of the family's video endpoints
+the device actually exposes, bounded by the profile. A dock in a known family
+with fewer outputs is therefore driven with the outputs it has.
 
 The driver owns the USB device and implements the dock's initialization,
 HDCP 2.2 authentication, encrypted control protocol, downstream monitor
