@@ -131,7 +131,22 @@ impl crtc::DriverCrtc for VinoCrtc {
         let head = crtc.head as usize;
         let data: &VinoDrmData = crtc.drm_dev();
         let budget = data.dock_budget();
-        let (old, new) = check.take_old_new_state();
+        let (state, old, mut new) = check.take_all();
+        // The colour description reaches the dock in the mode-set message, which is only sent from
+        // `atomic_enable`. Toggling HDR on a live output changes nothing the core considers a mode
+        // change, so ask for one: otherwise the compositor starts encoding PQ into a sink that was
+        // never told, and the picture washes out.
+        let colour_changed = {
+            let eotf = |c: Option<&_>| -> (u32, Option<u8>) {
+                c.map_or((0, None), |c: &kernel::drm::kms::connector::OpaqueConnectorState<
+                    VinoDrmDriver,
+                >| (c.colorspace(), c.hdr_output_eotf()))
+            };
+            eotf(state.old_connector_state_for_crtc(crtc)) != eotf(state.new_connector_state_for_crtc(crtc))
+        };
+        if colour_changed {
+            new.set_mode_changed(true);
+        }
         let old_rate = if old.active() {
             let m = old.mode();
             active_pixel_rate(m.hdisplay(), m.vdisplay(), m.vrefresh())

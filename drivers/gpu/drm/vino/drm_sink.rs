@@ -440,10 +440,14 @@ type BoundInterface<'a> = super::UsbLink<'a>;
 
 /// Generation key for a complete timing, including refresh and pixel clock.
 fn timing_key(t: &super::cp::Timing) -> u64 {
+    // Sample depth and transfer function are fields of the dock's set-mode message, so a change to
+    // either has to re-send it even though the timing is unchanged.
     ((t.hactive as u64) << 48)
         | ((t.vactive as u64) << 32)
         | (((t.refresh_hz & 0xff) as u64) << 24)
-        | t.pixel_clock_10khz as u64
+        | ((t.st2084 as u64) << 23)
+        | ((t.ten_bit as u64) << 22)
+        | (t.pixel_clock_10khz as u64 & 0x3f_ffff)
 }
 
 /// Content of the last frame successfully submitted for one head, represented in the dock's native
