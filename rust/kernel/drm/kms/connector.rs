@@ -932,8 +932,7 @@ pub trait RawConnectorState: AsRawConnectorState {
     ///
     /// [`enum drm_colorspace`]: srctree/include/drm/drm_connector.h
     fn colorspace(&self) -> u32 {
-        // SAFETY: `as_raw()` is a valid `drm_connector_state`.
-        unsafe { (*self.as_raw()).colorspace }
+        self.as_raw().colorspace
     }
 
     /// The electro-optical transfer function from the `HDR_OUTPUT_METADATA` blob, or [`None`] if
@@ -947,8 +946,7 @@ pub trait RawConnectorState: AsRawConnectorState {
     ///
     /// [`struct hdr_output_metadata`]: srctree/include/uapi/drm/drm_mode.h
     fn hdr_output_eotf(&self) -> Option<u8> {
-        // SAFETY: `as_raw()` is a valid `drm_connector_state`.
-        let blob = unsafe { (*self.as_raw()).hdr_output_metadata };
+        let blob = self.as_raw().hdr_output_metadata;
         if blob.is_null() {
             return None;
         }

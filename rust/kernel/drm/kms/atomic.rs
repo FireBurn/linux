@@ -141,6 +141,43 @@ impl<T: KmsDriver> AtomicState<T> {
         }
         None
     }
+
+    /// Return the old state of the first connector routed to `crtc` in this [`AtomicState`], if
+    /// any.
+    ///
+    /// The counterpart to [`Self::new_connector_state_for_crtc`], for a driver comparing the two
+    /// to decide whether a connector property it consumes has changed.
+    pub fn old_connector_state_for_crtc<C>(&self, crtc: &C) -> Option<&OpaqueConnectorState<T>>
+    where
+        C: ModesettableCrtc + ModeObject<Driver = T>,
+    {
+        let crtc_raw = crtc.as_raw();
+        // SAFETY: `state` is initialized via our type invariants, and `connectors` /
+        // `num_connector` are invariant for as long as we hold a reference to it.
+        let (connectors, num) = unsafe {
+            let raw = self.as_raw();
+            ((*raw).connectors, (*raw).num_connector)
+        };
+        if connectors.is_null() || num <= 0 {
+            return None;
+        }
+        for i in 0..num as usize {
+            // SAFETY: `connectors` points to `num_connector` initialized entries.
+            let old_state = unsafe { (*connectors.add(i)).old_state };
+            if old_state.is_null() {
+                continue;
+            }
+            // SAFETY: a non-null `old_state` is a valid `drm_connector_state` for the lifetime of
+            // the atomic state.
+            if unsafe { (*old_state).crtc } != crtc_raw {
+                continue;
+            }
+            // SAFETY: as above, and the returned reference borrows from `self`, so it cannot
+            // outlive the atomic state that owns the connector state.
+            return Some(unsafe { OpaqueConnectorState::<T>::from_raw(old_state) });
+        }
+        None
+    }
 }
 
 // SAFETY: DRM atomic state objects are always reference counted and the get/put functions satisfy
@@ -243,6 +280,16 @@ impl<T: KmsDriver> AtomicStateMutator<T> {
         C: ModesettableCrtc + ModeObject<Driver = T>,
     {
         self.state.new_connector_state_for_crtc(crtc)
+    }
+
+    /// Return the old state of the first connector routed to `crtc`, if any.
+    ///
+    /// See [`AtomicState::old_connector_state_for_crtc`].
+    pub fn old_connector_state_for_crtc<C>(&self, crtc: &C) -> Option<&OpaqueConnectorState<T>>
+    where
+        C: ModesettableCrtc + ModeObject<Driver = T>,
+    {
+        self.state.old_connector_state_for_crtc(crtc)
     }
 
     /// Retrieve the last committed atomic state for `plane` if `plane` has already been added to
