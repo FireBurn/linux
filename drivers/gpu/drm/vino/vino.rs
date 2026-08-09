@@ -482,89 +482,72 @@ impl WorkItem for BringUp {
                     }
                 }
 
-                // Navarro's compact discovery normally receives each EDID on the fetch drain,
-                // exactly as DLM does. After a dock re-enumeration one response can arrive late;
-                // publishing that partial topology lets userspace run a single-head mode set
-                // before the second head's runtime recovery, contaminating the shared cold-link
-                // state and leaving stale video URBs behind. Finish only those already-deferred,
-                // distinct physical streams before the one initial hotplug. A normal setup sends
-                // no additional control messages and remains byte-identical to the reference.
+                // Navarro normally receives each EDID on the fetch drain, exactly as DLM does, but
+                // after a dock re-enumeration a response can arrive seconds late. Publishing that
+                // partial topology lets userspace mode-set one head while its sibling is still
+                // arriving, which resets this dock, so retry the deferred heads before the single
+                // initial hotplug. They are interleaved: a head that never answers must not hold
+                // up one that would. A normal setup sends no additional control messages.
                 if profile.perhead_onehot() {
-                    for head in 0..usize::from(profile.connectors) {
-                        if !discovery_deferred[head]
-                            || !data.runtime_connector(head)
-                            || data.head_present(head)
-                        {
-                            continue;
+                    /// How long the deferred heads are retried before the topology is published.
+                    const INITIAL_RECOVERY_MS: i64 = 6000;
+                    /// Extra time granted after a head answers, for a sibling close behind it.
+                    const SIBLING_GRACE_MS: i64 = 1500;
+
+                    let mut pending: [bool; VinoDriver::CP_SETUP_HEADS] =
+                        core::array::from_fn(|head| {
+                            head < usize::from(profile.connectors)
+                                && discovery_deferred[head]
+                                && data.runtime_connector(head)
+                                && !data.head_present(head)
+                        });
+                    // One probe answers "is this socket empty?"; a re-engage is seven messages
+                    // carrying ~575 ms of mandated delay. A probe that cannot answer is not
+                    // evidence of absence, so only a definite negative stands a head down.
+                    for head in 0..VinoDriver::CP_SETUP_HEADS {
+                        if pending[head] && data.probe_head_present(dev, head as u8) == Some(false) {
+                            pending[head] = false;
                         }
-                        // Ask before engaging. A re-engage is seven control messages carrying
-                        // ~575 ms of mandated inter-step delay; the presence probe is one message
-                        // with a 64 ms deadline and answers the same question for an empty
-                        // socket. On a four-connector dock with two panels that is over a second
-                        // of pure latency in the critical path, ahead of the heads that do have a
-                        // monitor. A probe that cannot answer (`None`) is not evidence of
-                        // absence, so it still falls through to the re-engage.
-                        if data.probe_head_present(dev, head as u8) == Some(false) {
-                            vino_dev_debug!(
-                                cdev,
-                                "vino: socket {socket} probe says empty -- skipping its re-engage\n"
-                            , socket = head + 1);
-                            continue;
-                        }
-                        // Keep asking until the deadline. On a cold plug this dock can answer a
-                        // head's EDID fetch about four seconds after the session comes up, and a
-                        // single re-engage gives up in well under one -- its `id=0x15` steps just
-                        // go unanswered. One attempt therefore publishes a partial topology: the
-                        // compositor sees one monitor, mode-sets that head alone, and a mode set
-                        // naming one head while a sibling is still arriving is exactly what this
-                        // dock will not take. The whole point of the single initial hotplug is
-                        // that userspace configures the dock once, so it is worth waiting for.
-                        //
-                        // Only heads the probe has not called empty get here, so an unoccupied
-                        // socket still costs one message rather than this deadline.
-                        const INITIAL_RECOVERY_MS: i64 = 6000;
-                        let give_up =
-                            Instant::<Monotonic>::now() + Delta::from_millis(INITIAL_RECOVERY_MS);
-                        let mut tries = 0u32;
-                        loop {
-                            tries += 1;
-                            match data.reengage_head(dev, head as u8) {
-                                Ok(true) => {
-                                    data.set_connected(head);
-                                    dev_info!(
-                                        cdev,
-                                        "vino: socket {socket} monitor connected during initial \
-                                         recovery (attempt {tries})\n",
-                                        socket = head + 1
-                                    );
-                                    break;
-                                }
-                                Ok(false) => vino_dev_debug!(
-                                    cdev,
-                                    "vino: socket {socket} initial recovery found no monitor \
-                                     (attempt {tries})\n",
-                                    socket = head + 1
-                                ),
-                                Err(e) => vino_dev_debug!(
-                                    cdev,
-                                    "vino: socket {socket} initial recovery failed ({e:?}) \
-                                     (attempt {tries})\n",
-                                    socket = head + 1
-                                ),
+                    }
+
+                    let mut give_up =
+                        Instant::<Monotonic>::now() + Delta::from_millis(INITIAL_RECOVERY_MS);
+                    let mut pass = 0u32;
+                    while pending.iter().any(|p| *p) && !data.is_shutting_down() {
+                        pass += 1;
+                        for head in 0..VinoDriver::CP_SETUP_HEADS {
+                            if !pending[head] {
+                                continue;
                             }
-                            if (Instant::<Monotonic>::now() - give_up).as_millis() >= 0
-                                || data.is_shutting_down()
-                            {
+                            if let Ok(true) = data.reengage_head(dev, head as u8) {
+                                data.set_connected(head);
+                                pending[head] = false;
                                 dev_info!(
                                     cdev,
-                                    "vino: socket {socket} never answered its EDID fetch in \
-                                     {INITIAL_RECOVERY_MS} ms ({tries} attempts); publishing \
-                                     without it\n",
+                                    "vino: socket {socket} monitor connected during initial \
+                                     recovery (pass {pass})\n",
                                     socket = head + 1
                                 );
-                                break;
+                                let grace = Instant::<Monotonic>::now()
+                                    + Delta::from_millis(SIBLING_GRACE_MS);
+                                if (grace - give_up).as_millis() > 0 {
+                                    give_up = grace;
+                                }
                             }
-                            fsleep(Delta::from_millis(250));
+                        }
+                        if (Instant::<Monotonic>::now() - give_up).as_millis() >= 0 {
+                            break;
+                        }
+                        fsleep(Delta::from_millis(250));
+                    }
+                    for head in 0..VinoDriver::CP_SETUP_HEADS {
+                        if pending[head] {
+                            dev_info!(
+                                cdev,
+                                "vino: socket {socket} never answered its EDID fetch \
+                                 ({pass} passes); publishing without it\n",
+                                socket = head + 1
+                            );
                         }
                     }
                 }
