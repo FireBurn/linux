@@ -107,6 +107,7 @@ unsafe impl<T: Driver> driver::RegistrationOps for Adapter<T> {
             (*udrv.get()).pre_reset = Some(Self::pre_reset_callback);
             (*udrv.get()).post_reset = Some(Self::post_reset_callback);
             (*udrv.get()).id_table = T::ID_TABLE.as_ptr();
+            (*udrv.get()).set_soft_unbind(T::SOFT_UNBIND as core::ffi::c_uint);
         }
 
         // SAFETY: `udrv` is guaranteed to be a valid `DriverType`.
@@ -473,6 +474,19 @@ pub trait Driver {
 
     /// The table of device ids supported by the driver.
     const ID_TABLE: IdTable<Self::IdInfo>;
+
+    /// Whether the USB core must leave this interface usable until the driver has let go of it.
+    ///
+    /// By default the core kills every outstanding URB and disables the interface's endpoints
+    /// *before* it calls any driver callback, so a driver that has something to say to the device
+    /// on the way out cannot say it: the transfer is refused with [`ENOENT`] because the endpoint
+    /// it names no longer exists. Setting this defers that teardown until after the callbacks
+    /// return, which makes cancelling outstanding transfers the driver's own responsibility.
+    ///
+    /// Only useful to a driver that leaves the device in a state a user can see -- a display that
+    /// otherwise goes on scanning out its last frame, an interface that must be told to power
+    /// down.
+    const SOFT_UNBIND: bool = false;
 
     /// USB driver probe.
     ///
