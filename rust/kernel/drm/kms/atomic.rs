@@ -142,6 +142,48 @@ impl<T: KmsDriver> AtomicState<T> {
         None
     }
 
+    /// Invoke `f` for every CRTC this [`AtomicState`] carries a new state for, passing the CRTC
+    /// and that state.
+    ///
+    /// This is the Rust spelling of walking `for_each_new_crtc_in_state()`.
+    ///
+    /// A driver enforcing a constraint its heads share -- a bandwidth budget, a clock source, a
+    /// fixed pool of scanout engines -- has to weigh what every head will be once the commit
+    /// lands. A per-CRTC callback that consults committed state instead sees each sibling at its
+    /// old value, so two heads that both rise in one commit each find the other still low, pass
+    /// individually, and break the shared limit together.
+    pub fn for_each_new_crtc_state<F>(&self, mut f: F)
+    where
+        F: FnMut(&Crtc<T::Crtc>, &OpaqueCrtcState<T>),
+    {
+        // SAFETY: `state` is initialized via our type invariants, and `crtcs` together with the
+        // device's `num_crtc` are invariant for as long as we hold a reference to it.
+        let (crtcs, num) = unsafe {
+            let raw = self.as_raw();
+            ((*raw).crtcs, (*(*raw).dev).mode_config.num_crtc)
+        };
+        if crtcs.is_null() || num <= 0 {
+            return;
+        }
+        for i in 0..num as usize {
+            // SAFETY: `crtcs` points to `num_crtc` initialized entries.
+            let (ptr, new_state) = unsafe { ((*crtcs.add(i)).ptr, (*crtcs.add(i)).new_state) };
+            if ptr.is_null() || new_state.is_null() {
+                continue;
+            }
+            // SAFETY: every CRTC of a `KmsDriver` device is a `Crtc<T::Crtc>`, and a non-null
+            // `new_state` is a valid `drm_crtc_state`. Both borrow from `self`, so neither can
+            // outlive the atomic state owning them.
+            let (crtc, state) = unsafe {
+                (
+                    Crtc::<T::Crtc>::from_raw(ptr),
+                    OpaqueCrtcState::<T>::from_raw(new_state),
+                )
+            };
+            f(crtc, state);
+        }
+    }
+
     /// Return the old state of the first connector routed to `crtc` in this [`AtomicState`], if
     /// any.
     ///
@@ -280,6 +322,16 @@ impl<T: KmsDriver> AtomicStateMutator<T> {
         C: ModesettableCrtc + ModeObject<Driver = T>,
     {
         self.state.new_connector_state_for_crtc(crtc)
+    }
+
+    /// Invoke `f` for every CRTC this state carries a new state for.
+    ///
+    /// See [`AtomicState::for_each_new_crtc_state`].
+    pub fn for_each_new_crtc_state<F>(&self, f: F)
+    where
+        F: FnMut(&Crtc<T::Crtc>, &OpaqueCrtcState<T>),
+    {
+        self.state.for_each_new_crtc_state(f)
     }
 
     /// Return the old state of the first connector routed to `crtc`, if any.
