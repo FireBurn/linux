@@ -17,6 +17,7 @@ GPU Driver Documentation
    tve200
    v3d
    vc4
+   vino
    vkms
    bridge/dw-hdmi
    xen-front
