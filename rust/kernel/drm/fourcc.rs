@@ -13,7 +13,10 @@ const fn fourcc_code(a: u8, b: u8, c: u8, d: u8) -> u32 {
 // function-like macros in bindgen yet.
 pub(crate) const FORMAT_MOD_INVALID: u64 = 0xffffffffffffff;
 /// Linear framebuffer layout (`DRM_FORMAT_MOD_LINEAR`).
-pub(crate) const FORMAT_MOD_LINEAR: u64 = 0;
+///
+/// A driver that accepts only linear scanout has to say so through the plane's format-modifier
+/// list, or userspace sees no `IN_FORMATS` property and has to guess what the plane will take.
+pub const FORMAT_MOD_LINEAR: u64 = 0;
 
 /// 32 bpp RGB with unused alpha.
 pub const XRGB8888: u32 = fourcc_code(b'X', b'R', b'2', b'4');
