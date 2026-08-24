@@ -248,7 +248,12 @@ impl VinoDrmData {
         //
         // Best effort: a connector whose monitor genuinely went away while it was blanked belongs
         // to the presence watcher, and the mode set below is what reports a wake that failed.
-        if self.reengage_connector(dev, connector).is_err() {
+        //
+        // Not on a dock whose video shares the control pipe, for the same reason `sustain_window`
+        // is withheld there: the seven paced messages are taken directly from the pipe the wake is
+        // also driving pixels down, and this dock answers by going silent rather than by dropping
+        // a frame.
+        if !self.video_on_ctrl_pipe() && self.reengage_connector(dev, connector).is_err() {
             vino_debug!("vino: socket {socket} wake re-engage failed; the mode set will retry\n");
         }
         // A wake is still not a cold plug: the re-engage above restores the sink, so the
