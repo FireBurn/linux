@@ -935,6 +935,22 @@ pub trait RawConnectorState: AsRawConnectorState {
         self.as_raw().colorspace
     }
 
+    /// The bits per colour channel userspace has asked the link to carry, through the `max bpc`
+    /// property.
+    ///
+    /// This is a property of the *link*, not of the framebuffer: userspace routinely scans out an
+    /// eight-bit surface over a ten-bit link, and a driver that derives its output depth from the
+    /// framebuffer format alone silently ignores what was asked for.
+    ///
+    /// Meaningful only on a connector that
+    /// [`UnregisteredConnector::attach_max_bpc_property`] was called for; everything else leaves
+    /// it at zero.
+    fn max_requested_bpc(&self) -> u32 {
+        // `max_requested_bpc` is an `unsigned int` clamped by DRM to the range the driver gave
+        // `drm_connector_attach_max_bpc_property()`, so it needs no validation here.
+        self.as_raw().max_requested_bpc as u32
+    }
+
     /// The electro-optical transfer function from the `HDR_OUTPUT_METADATA` blob, or [`None`] if
     /// userspace has not set one.
     ///
