@@ -186,6 +186,7 @@ obj-$(CONFIG_DRM_VMWGFX)+= vmwgfx/
 obj-$(CONFIG_DRM_VGEM)	+= vgem/
 obj-$(CONFIG_DRM_VKMS)	+= vkms/
 obj-$(CONFIG_DRM_VINO)	+= vino/
+obj-$(CONFIG_DRM_EVDI)	+= evdi/
 obj-$(CONFIG_DRM_NOUVEAU) +=nouveau/
 # nova-drm is built from drivers/gpu/Makefile together with nova-core.
 obj-$(CONFIG_DRM_EXYNOS) +=exynos/
