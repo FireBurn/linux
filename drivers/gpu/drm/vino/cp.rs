@@ -1492,8 +1492,8 @@ mod tests {
 
         // The decoder configuration is the same message Ridge sends, with the DL7400's layout word.
         let tail = [0x5a; 14];
-        let header = video_arm::mode_header(2560, 1440, 0x2100);
-        let config = video_arm::build_config(video_arm::CodeTables::Wide, &header, &tail)?;
+        let header = video_arm::mode_header(2560, 1440, 0x2100, false);
+        let config = video_arm::build_config(video_arm::CodeTables::Wide, &header, &tail, false)?;
         assert_eq!(config.len(), 1104);
         assert_eq!(
             &config[..26],
@@ -1545,8 +1545,8 @@ mod tests {
 
         // The decoder configuration, in full. 1920x1080 is stated as 1088 lines: the surface the
         // dock is told about is the padded one the codec actually produces.
-        let header = video_arm::mode_header(1920, 1088, 0x1800);
-        let config = video_arm::build_config(video_arm::CodeTables::Narrow, &header, &[])?;
+        let header = video_arm::mode_header(1920, 1088, 0x1800, false);
+        let config = video_arm::build_config(video_arm::CodeTables::Narrow, &header, &[], false)?;
         assert_eq!(config.len(), 304);
         assert_eq!(
             &config[..26],
