@@ -188,7 +188,7 @@ impl VinoDrmData {
     /// offers `XRGB8888` means this never sees one.
     pub(super) fn set_connector_depth(&self, connector: u8, depth: crate::video::haar::Depth) {
         let bit = 1u32 << u32::from(connector);
-        match depth {
+        let previous = match depth {
             crate::video::haar::Depth::Ten => {
                 self.connector_ten_bit.fetch_or(bit, Ordering::Release)
             }
@@ -196,6 +196,17 @@ impl VinoDrmData {
                 self.connector_ten_bit.fetch_and(!bit, Ordering::Release)
             }
         };
+        // Report the change, because this is the only place the sample depth is decided and
+        // nothing else on the wire says what was chosen. A connector that advertises ten bits and
+        // is driven in ST2084 still goes out at eight if the compositor never hands over a
+        // ten-bit framebuffer, and that difference is otherwise visible only on the panel.
+        let was_ten = previous & bit != 0;
+        let now_ten = matches!(depth, crate::video::haar::Depth::Ten);
+        if was_ten != now_ten {
+            let socket = connector + 1;
+            let bits = if now_ten { 10 } else { 8 };
+            vino_debug!("vino: socket {socket} scanout depth is now {bits} bits per channel\n");
+        }
     }
 
     /// Record the mode-programming and blanking behaviour this dock wants.
