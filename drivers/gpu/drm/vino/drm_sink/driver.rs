@@ -104,7 +104,10 @@ impl KmsDriver for VinoDrmDriver {
                 } else {
                     &PRIMARY_FORMATS[..]
                 },
-                None,
+                // Scanout is linear and nothing else is accepted: `Framebuffer` rejects any other
+                // modifier outright. Saying so publishes IN_FORMATS, so a compositor picks a format
+                // knowing what the plane takes rather than inferring it from the bare format list.
+                Some(&LINEAR_MODIFIER[..]),
                 plane::Type::Primary,
                 None,
                 PlaneArgs {
@@ -141,7 +144,7 @@ impl KmsDriver for VinoDrmDriver {
                     dev,
                     crtc_mask,
                     &CURSOR_FORMATS,
-                    None,
+                    Some(&LINEAR_MODIFIER[..]),
                     plane::Type::Cursor,
                     None,
                     PlaneArgs {
