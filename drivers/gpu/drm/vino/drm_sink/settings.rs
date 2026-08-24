@@ -144,7 +144,7 @@ impl VinoDrmData {
     /// plane will actually send: the dock sizes its buffer from the pair and mis-sizes it if they
     /// disagree.
     pub(super) fn connector_is_ten_bit(&self, connector: usize) -> bool {
-        self.connector_ten_bit.load(Ordering::Acquire) & (1u32 << connector) != 0
+        self.connector_wire_ten_bit(connector as u8)
     }
 
     /// Whether `connector`'s connector is being driven in PQ; see [`Self::set_connector_st2084`].
@@ -166,13 +166,64 @@ impl VinoDrmData {
         }
     }
 
+    /// Record the link depth userspace asked this connector to carry.
+    ///
+    /// Four bits per connector is enough for every value `max bpc` takes, and keeping them in one
+    /// word means the scanout path reads the whole set with a single load.
+    pub(super) fn set_connector_max_bpc(&self, connector: u8, bpc: u32) {
+        let shift = u32::from(connector) * 4;
+        let field = bpc.min(15) << shift;
+        let mask = !(0xfu32 << shift);
+        let mut current = self.connector_max_bpc.load(Ordering::Acquire);
+        loop {
+            let next = (current & mask) | field;
+            match self.connector_max_bpc.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(seen) => current = seen,
+            }
+        }
+    }
+
+    /// The sample depth of the framebuffer this connector is scanning out.
+    ///
+    /// This is how a pixel must be *decoded*; [`Self::geometry_for_connector`] says what the dock
+    /// is told to carry, and the two differ whenever userspace asks for a deeper link than the
+    /// surface it hands over.
+    pub(super) fn connector_buffer_depth(&self, connector: u8) -> crate::video::haar::Depth {
+        if self.connector_ten_bit.load(Ordering::Acquire) & (1u32 << u32::from(connector)) != 0 {
+            crate::video::haar::Depth::Ten
+        } else {
+            crate::video::haar::Depth::Eight
+        }
+    }
+
+    /// Whether this connector's link is driven at ten bits per channel.
+    ///
+    /// True when the framebuffer is already ten-bit, and also when userspace asked for a ten-bit
+    /// link through `max bpc` on a dock that can carry one. An eight-bit surface over a ten-bit
+    /// link is the ordinary case on every other driver, and refusing it here is what left a
+    /// connector driven in PQ at eight bits with nothing reporting why.
+    fn connector_wire_ten_bit(&self, connector: u8) -> bool {
+        if self.connector_ten_bit.load(Ordering::Acquire) & (1u32 << u32::from(connector)) != 0 {
+            return true;
+        }
+        let shift = u32::from(connector) * 4;
+        let requested = (self.connector_max_bpc.load(Ordering::Acquire) >> shift) & 0xf;
+        self.hdr_capable() && requested >= 10
+    }
+
     /// This device's codec geometry at one connector's committed sample depth.
     ///
     /// Every path that touches pixels wants this rather than [`Self::geometry`]: the depth decides
     /// the entropy coder's escape ceiling, and getting it wrong desynchronises the dock's decoder
     /// rather than merely degrading the picture. See [`crate::video::haar::Depth`].
     pub(super) fn geometry_for_connector(&self, connector: u8) -> crate::video::haar::Geometry {
-        let ten = self.connector_ten_bit.load(Ordering::Acquire) & (1 << u32::from(connector)) != 0;
+        let ten = self.connector_wire_ten_bit(connector);
         self.geometry().with_depth(if ten {
             crate::video::haar::Depth::Ten
         } else {

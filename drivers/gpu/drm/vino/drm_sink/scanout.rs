@@ -106,6 +106,7 @@ pub(super) fn run_pending_scanout(
             direct,
             hashes,
             depth: data.geometry_for_connector(frame.connector).depth(),
+            source_depth: data.connector_buffer_depth(frame.connector),
         },
         GFP_KERNEL,
     ) {
@@ -530,6 +531,12 @@ pub(super) struct PixelSource {
     /// depth-agnostic and only the unpack here differs: `XRGB8888` is three bytes in the low 24
     /// bits, `XRGB2101010` three 10-bit fields in the low 30.
     depth: crate::video::haar::Depth,
+    /// Bits per channel of the framebuffer itself, which decides how a pixel is decoded.
+    ///
+    /// Equal to `depth` except when userspace asked for a deeper link than the surface it handed
+    /// over, which is the ordinary way a compositor drives a ten-bit link from an eight-bit
+    /// desktop. Samples are widened after decoding so the codec always sees `depth`.
+    source_depth: crate::video::haar::Depth,
 }
 
 /// Whether the encoder can read output pixels straight out of the snapshot. See
@@ -545,11 +552,39 @@ fn direct_pixel_map(
     color.is_none() && rotation == plane::Rotation::ROTATE_0 && output_w == w && output_h == h
 }
 
+/// Widen an eight-bit sample to ten bits.
+///
+/// Replicating the top two bits into the low ones keeps both endpoints exact: black stays zero and
+/// full white stays full white, where a plain shift would land three codes short of it and tint
+/// every highlight.
+#[inline]
+fn widen_8_to_10(v: u16) -> u16 {
+    (v << 2) | (v >> 6)
+}
+
 impl PixelSource {
     /// Split one packed 32-bit pixel into channels at this source's depth.
     #[inline]
     fn unpack(&self, p: u32) -> (u16, u16, u16) {
-        match self.depth {
+        let (r, g, b) = self.unpack_source(p);
+        self.widen(r, g, b)
+    }
+
+    /// Widen a decoded sample from the framebuffer's depth to the link's.
+    #[inline]
+    fn widen(&self, r: u16, g: u16, b: u16) -> (u16, u16, u16) {
+        match (self.source_depth, self.depth) {
+            (crate::video::haar::Depth::Eight, crate::video::haar::Depth::Ten) => {
+                (widen_8_to_10(r), widen_8_to_10(g), widen_8_to_10(b))
+            }
+            _ => (r, g, b),
+        }
+    }
+
+    /// Split one packed 32-bit pixel into channels at the framebuffer's own depth.
+    #[inline]
+    fn unpack_source(&self, p: u32) -> (u16, u16, u16) {
+        match self.source_depth {
             // Little-endian XRGB8888.
             crate::video::haar::Depth::Eight => (
                 ((p >> 16) & 0xff) as u16,
@@ -622,9 +657,9 @@ impl PixelSource {
             let Some(chunk) = self.pixels.get(off..off + 4) else {
                 return (0, 0, 0);
             };
-            if let crate::video::haar::Depth::Eight = self.depth {
+            if let crate::video::haar::Depth::Eight = self.source_depth {
                 // Little-endian XRGB8888: byte 0 is blue, 1 green, 2 red.
-                return (chunk[2] as u16, chunk[1] as u16, chunk[0] as u16);
+                return self.widen(chunk[2] as u16, chunk[1] as u16, chunk[0] as u16);
             }
             let Ok(bytes) = <[u8; 4]>::try_from(chunk) else {
                 return (0, 0, 0);
@@ -865,6 +900,7 @@ pub(crate) fn parallel_rotation_matches_serial(rotation: plane::Rotation) -> Res
             direct: direct_pixel_map(rotation, &None, w, h, output_w, output_h),
             hashes: KVVec::new(),
             depth: crate::video::haar::Depth::Eight,
+            source_depth: crate::video::haar::Depth::Eight,
         },
         GFP_KERNEL,
     )?;
@@ -1787,6 +1823,26 @@ pub(super) fn encode_and_send(
 mod tests {
     use super::*;
     use crate::*;
+
+    /// An eight-bit desktop driven over a ten-bit link must keep both endpoints exact.
+    ///
+    /// A plain shift leaves full white at 1020 of 1023, which tints every highlight and is the
+    /// kind of error that looks like a panel problem rather than an encoder one.
+    #[test]
+    fn widening_an_eight_bit_sample_keeps_the_endpoints() {
+        assert_eq!(widen_8_to_10(0), 0);
+        assert_eq!(widen_8_to_10(255), 1023);
+        // Mid grey stays mid grey rather than drifting low.
+        assert_eq!(widen_8_to_10(128), 514);
+        // Monotonic, and never outside the ten-bit range.
+        let mut previous = 0;
+        for v in 0..=255u16 {
+            let w = widen_8_to_10(v);
+            assert!(w <= 1023);
+            assert!(v == 0 || w > previous);
+            previous = w;
+        }
+    }
 
     /// Scattered damage must cost the strips it touches, not the surface.
     ///
