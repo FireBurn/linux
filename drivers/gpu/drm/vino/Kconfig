@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: GPL-2.0
+config DRM_VINO
+	tristate "DisplayLink DL3 (Vino) open driver"
+	depends on USB
+	depends on DRM
+	depends on RUST
+	# RUST_DRM_GEM_SHMEM_HELPER depends on MMU; inherit that dependency here so the
+	# select below cannot generate an unmet-direct-dependency warning on nommu.
+	depends on MMU
+	select DRM_KMS_HELPER
+	select RUST_DRM_GEM_SHMEM_HELPER
+	select CRYPTO_RSA
+	select RUST_CRYPTO_AKCIPHER
+	select RUST_CRYPTO_LIB_AES
+	select RUST_CRYPTO_LIB_SHA256
+	select FW_LOADER
+	select RUST_FW_LOADER_ABSTRACTIONS
+	select FW_UPLOAD
+	help
+	  Open in-kernel Rust driver for DisplayLink DL3 docks: the Dell
+	  Universal Dock D6000 (USB ID 17e9:6006, DL-6xxx silicon) and the
+	  DL-7400 quad-display docks (USB ID 17e9:7000, DL-7000 silicon).
+
+	  It binds the dock over USB, runs the HDCP 2.2 control plane, mode-set
+	  and the Vino codec, and registers a DRM/KMS sink that scans out to the
+	  dock's video endpoints.
+
+	  To compile this as a module, choose M here: the module is called vino.
+
+	  If unsure, say N.
+
+config DRM_VINO_KUNIT_TEST
+	bool "KUnit tests for the Vino driver"
+	depends on DRM_VINO && KUNIT
+	help
+	  Build Vino's protocol, crypto and codec unit tests into the driver.
+	  The tests run when the driver is loaded, so this option is intended
+	  for driver development and test kernels rather than normal use.
+
+	  If in doubt, say N.
