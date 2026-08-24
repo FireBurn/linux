@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-2.0
+config DRM_EVDI
+	tristate "Extensible Virtual Display Interface (Rust)"
+	depends on DRM
+	depends on RUST
+	select DRM_KMS_HELPER
+	select RUST_DRM_GEM_SHMEM_HELPER
+	help
+	  Rust reimplementation of DisplayLink's EVDI: a virtual DRM/KMS display
+	  whose framebuffer is pulled by a userspace client (DisplayLinkManager
+	  via libevdi) rather than scanned out to local hardware. Cards are
+	  created on demand through /sys/devices/evdi and can be bound to a USB
+	  dock so they appear/disappear with it.
+
+	  The module identifies itself to userspace as "evdi" for compatibility
+	  with the existing libevdi / DisplayLinkManager stack.
+
+	  To compile this as a module, choose M here: the module is called evdi.
+
+	  If unsure, say N.
+
+config DRM_EVDI_KUNIT_TEST
+	bool "KUnit tests for the evdi driver"
+	depends on DRM_EVDI && KUNIT
+	help
+	  Build evdi's colour-management unit tests into the driver. The tests
+	  run when the driver is loaded, so this option is intended for driver
+	  development and test kernels rather than normal use.
+
+	  If in doubt, say N.
