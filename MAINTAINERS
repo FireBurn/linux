@@ -8611,6 +8611,7 @@ DRM DRIVER FOR VINO DISPLAYLINK DL3 DEVICES
 M:	Mike Lothian <mike@fireburn.co.uk>
 L:	dri-devel@lists.freedesktop.org
 S:	Maintained
+F:	Documentation/gpu/vino.rst
 F:	drivers/gpu/drm/vino/
 
 DRM DRIVER FOR VIRTUAL KERNEL MODESETTING (VKMS)
