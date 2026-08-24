@@ -46,11 +46,18 @@ use kernel::{
     xxhash,
 };
 
+mod activation;
+mod bracket;
+mod cp_session;
 mod dispatch;
 mod driver;
 mod limits;
 mod mode_objects;
+mod presence;
+mod scanout;
 mod settings;
+mod stream;
+mod timeline;
 mod worker;
 
 pub(crate) use driver::VinoObject;
@@ -58,6 +65,10 @@ use limits::{active_pixel_rate, timing_key, DEFAULT_MAX_HEAD_CLOCK_KHZ, DEFAULT_
 pub(super) use mode_objects::{
     PlaneArgs, VblankTimer, VinoConnector, VinoCrtc, VinoEncoder, VinoPlane,
 };
+use scanout::{read_cursor_bgra, run_pending_scanout, snapshot_to_shadow, src_dims};
+// Almost every item in `timeline` is read by the activation path; naming them individually
+// would list the module.
+pub(crate) use timeline::*;
 
 /// Connector mode used until a downstream EDID is available.
 const FALLBACK_W: i32 = 2560;
