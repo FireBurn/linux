@@ -83,6 +83,12 @@ static PRIMARY_FORMATS: [u32; 1] = [drm::fourcc::XRGB8888];
 /// between them should not be pushed towards the deeper one by list order alone.
 static PRIMARY_FORMATS_HDR: [u32; 2] = [drm::fourcc::XRGB8888, drm::fourcc::XRGB2101010];
 
+/// The only framebuffer layout any of these planes accepts.
+///
+/// Publishing it gives userspace an `IN_FORMATS` property; without it the plane advertises formats
+/// with no modifier information at all.
+static LINEAR_MODIFIER: [u64; 1] = [drm::fourcc::FORMAT_MOD_LINEAR];
+
 /// Cursor-plane format list.
 static CURSOR_FORMATS: [u32; 1] = [drm::fourcc::ARGB8888];
 
@@ -850,6 +856,11 @@ pub(super) struct VinoDrmData {
     /// is neither device-wide nor fixed: the DL7400 negotiates depth per connector, measured on
     /// Windows holding one connector at 8 bits while the other ran at 10.
     connector_ten_bit: core::sync::atomic::AtomicU32,
+    /// Bits per channel userspace asked the link to carry, one byte per connector, from `max bpc`.
+    ///
+    /// Deliberately separate from `connector_ten_bit`: that one says what the framebuffer holds and
+    /// decides how a pixel is decoded, this one says what the dock is told to carry.
+    connector_max_bpc: core::sync::atomic::AtomicU32,
     /// Bit `h` set when connector `h`'s connector is being driven with the SMPTE ST 2084 (PQ)
     /// transfer function, taken from the `HDR_OUTPUT_METADATA` blob userspace attached to it.
     ///
@@ -1187,6 +1198,7 @@ impl VinoDrmData {
                 super::profile::ProbeBracket::Always as u8
             ),
             connector_ten_bit: core::sync::atomic::AtomicU32::new(0),
+            connector_max_bpc: core::sync::atomic::AtomicU32::new(0),
             head_st2084: core::sync::atomic::AtomicU32::new(0),
             // A dock that names no connector count still has to expose something, so fall back to
             // the maximum rather than building a card with no connectors at all.
