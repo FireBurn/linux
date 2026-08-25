@@ -102,6 +102,20 @@ impl crtc::DriverCrtcState for VinoCrtcState {
     type Crtc = VinoCrtc;
 }
 
+/// Whether a connector state asks for a ten-bit link.
+///
+/// A compositor sets `max bpc` to ten on every connector it can, so the request alone is not the
+/// condition: the vendor moves a link to ten bits when the connector is driven in PQ. A commit
+/// carrying no connector state, which is every page flip, asks for nothing.
+fn asks_for_ten_bits(
+    conn: Option<&kernel::drm::kms::connector::OpaqueConnectorState<VinoDrmDriver>>,
+) -> bool {
+    conn.is_some_and(|conn| {
+        conn.max_requested_bpc() >= 10
+            && conn.hdr_output_eotf() == Some(connector::Eotf::SmpteSt2084)
+    })
+}
+
 #[vtable]
 impl crtc::DriverCrtc for VinoCrtc {
     type Args = u8;
@@ -133,6 +147,8 @@ impl crtc::DriverCrtc for VinoCrtc {
         let data: &VinoDrmData = crtc.drm_dev();
         let budget = data.dock_budget();
         let (state, old, mut new) = check.take_all();
+        let wants_deep =
+            data.hdr_capable() && asks_for_ten_bits(state.new_connector_state_for_crtc(crtc));
         // The colour description reaches the dock in the mode-set message, which is only sent from
         // `atomic_enable`. Toggling HDR on a live output changes nothing the core considers a mode
         // change, so ask for one: otherwise the compositor starts encoding PQ into a sink that was
@@ -206,6 +222,15 @@ impl crtc::DriverCrtc for VinoCrtc {
         }
         let others = data.other_connectors_rate(&state, connector);
         let combined = new_rate.saturating_add(others);
+        // Price the dock at the depth this commit drives, and at what its other connectors already
+        // hold, because the bandwidth is shared. Nothing is recorded here: a check also runs for
+        // page flips and for `TEST_ONLY` commits that are never applied, so a depth recorded from
+        // one would move the codec with no mode set to re-state it to the dock.
+        let deep = wants_deep && data.ten_bit_fits(combined);
+        let budget = data.budget_at_depth(
+            budget,
+            deep || data.other_connector_programmed_ten_bit(crtc.connector),
+        );
         if combined > budget {
             pr_warn!(
                 "vino: socket {socket} combined rate {combined} exceeds {budget}\n",
@@ -253,6 +278,19 @@ impl crtc::DriverCrtc for VinoCrtc {
             .new_connector_state_for_crtc(crtc)
             .map_or(0, |conn| conn.max_requested_bpc());
         data.set_connector_max_bpc(connector, requested_bpc);
+        // Decide the depth rather than refuse the mode: a pair that fits at eight bits may not fit
+        // at ten, and a compositor answers a rejected mode by disabling the output. Recorded here
+        // and not in the check, so that the decision and the set-mode carrying it are one commit.
+        let combined = if new.active() {
+            let m = new.mode();
+            active_pixel_rate(m.hdisplay(), m.vdisplay(), m.vrefresh())
+        } else {
+            0
+        }
+        .saturating_add(data.other_connectors_rate(&state, connector as usize));
+        let wants_deep =
+            data.hdr_capable() && asks_for_ten_bits(state.new_connector_state_for_crtc(crtc));
+        data.set_connector_ten_bit_denied(connector, wants_deep && !data.ten_bit_fits(combined));
         // Cache this connector's colour transform for the scanout to apply.
         data.update_color(connector as usize, new.gamma_lut(), new.ctm());
         // Whatever this connector's sink state was, the enable path re-runs the full bracket and
@@ -867,6 +905,7 @@ impl connector::DriverConnector for VinoConnector {
         }
         // Reject a mode only when that connector exceeds the dock's whole pixel budget. The atomic
         // CRTC check enforces the combined rate of simultaneously active connectors.
+        //
         let budget = data.dock_budget();
         let connector_rate = active_pixel_rate(mode.hdisplay(), mode.vdisplay(), mode.vrefresh());
         if budget != 0 && connector_rate > budget {

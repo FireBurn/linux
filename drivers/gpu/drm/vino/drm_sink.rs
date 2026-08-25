@@ -861,6 +861,13 @@ pub(super) struct VinoDrmData {
     /// Deliberately separate from `connector_ten_bit`: that one says what the framebuffer holds and
     /// decides how a pixel is decoded, this one says what the dock is told to carry.
     connector_max_bpc: core::sync::atomic::AtomicU32,
+    /// Connectors whose requested ten-bit link does not fit the dock's shared bandwidth.
+    ///
+    /// Ten bits costs a third more per pixel, so a pair of modes that fits at eight may not fit at
+    /// ten. Refusing the mode is the wrong answer -- a compositor answers `EINVAL` by disabling the
+    /// output rather than choosing a shallower link -- so the depth gives way instead and both
+    /// connectors light at eight bits.
+    connector_deny_ten_bit: core::sync::atomic::AtomicU32,
     /// Bit `h` set when connector `h`'s connector is being driven with the SMPTE ST 2084 (PQ)
     /// transfer function, taken from the `HDR_OUTPUT_METADATA` blob userspace attached to it.
     ///
@@ -1199,6 +1206,7 @@ impl VinoDrmData {
             ),
             connector_ten_bit: core::sync::atomic::AtomicU32::new(0),
             connector_max_bpc: core::sync::atomic::AtomicU32::new(0),
+            connector_deny_ten_bit: core::sync::atomic::AtomicU32::new(0),
             head_st2084: core::sync::atomic::AtomicU32::new(0),
             // A dock that names no connector count still has to expose something, so fall back to
             // the maximum rather than building a card with no connectors at all.

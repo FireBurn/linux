@@ -205,8 +205,8 @@ impl VinoDrmData {
     /// Whether this connector's link is driven at ten bits per channel.
     ///
     /// True when the framebuffer is already ten-bit, and when userspace asks for a ten-bit link
-    /// through `max bpc` on a dock that can carry one. An eight-bit surface over a ten-bit link is
-    /// the ordinary case on every other driver.
+    /// through `max bpc` on a dock that can carry one and is driving the connector in PQ. An
+    /// eight-bit surface over a ten-bit link is the ordinary case on every other driver.
     ///
     /// This is the decision, not the depth in force. Read it only where a mode set carries the
     /// answer to the dock; everything else wants [`Self::connector_programmed_ten_bit`].
@@ -214,9 +214,32 @@ impl VinoDrmData {
         if self.connector_ten_bit.load(Ordering::Acquire) & (1u32 << u32::from(connector)) != 0 {
             return true;
         }
+        if self.connector_deny_ten_bit.load(Ordering::Acquire) & (1u32 << u32::from(connector)) != 0
+        {
+            return false;
+        }
         let shift = u32::from(connector) * 4;
         let requested = (self.connector_max_bpc.load(Ordering::Acquire) >> shift) & 0xf;
-        self.hdr_capable() && requested >= 10
+        self.hdr_capable() && requested >= 10 && self.connector_is_st2084(connector as usize)
+    }
+
+    /// Record whether this connector's ten-bit link fits the dock's shared bandwidth.
+    pub(super) fn set_connector_ten_bit_denied(&self, connector: u8, denied: bool) {
+        let bit = 1u32 << u32::from(connector);
+        if denied {
+            self.connector_deny_ten_bit.fetch_or(bit, Ordering::Release);
+        } else {
+            self.connector_deny_ten_bit
+                .fetch_and(!bit, Ordering::Release);
+        }
+    }
+
+    /// Whether any connector other than `connector` is programmed at ten bits per channel.
+    ///
+    /// The dock's bandwidth is shared, so a commit is priced at the dock's deepest connector.
+    pub(super) fn other_connector_programmed_ten_bit(&self, connector: u8) -> bool {
+        (0..self.connector_count())
+            .any(|c| c as u8 != connector && self.connector_programmed_ten_bit(c as u8))
     }
 
     /// Whether the mode this connector was last programmed with drives ten bits per channel.

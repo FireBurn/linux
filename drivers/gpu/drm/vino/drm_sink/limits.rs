@@ -129,12 +129,37 @@ impl VinoDrmData {
             .is_ok()
     }
 
-    /// The dock's total pixel-rate budget shared across all connectors.
+    /// The dock's total pixel-rate budget shared across all connectors, unpriced by depth.
     ///
     /// Zero means unknown and disables limiting.
     pub(super) fn dock_budget(&self) -> u32 {
         self.dock_pixel_budget
             .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether a commit totalling `combined` pixels per second can be driven at ten bits.
+    ///
+    /// The answer moves the depth rather than refusing the commit: a compositor handed `EINVAL`
+    /// disables the output instead of asking for a shallower link.
+    pub(super) fn ten_bit_fits(&self, combined: u32) -> bool {
+        let raw = self.dock_budget();
+        raw == 0 || combined <= self.budget_at_depth(raw, true)
+    }
+
+    /// A budget priced for a connector driven at ten bits per channel.
+    ///
+    /// The budget was measured with the dock storing three bytes per pixel; ten bits stores four,
+    /// so the same pixel costs a third more. The whole dock is priced at its deepest connector,
+    /// because the bandwidth is shared.
+    ///
+    /// `budget` must be the unpriced [`Self::dock_budget`]. Pricing an already-priced budget leaves
+    /// nine sixteenths of the dock, which no pair of ten-bit connectors fits inside.
+    pub(super) fn budget_at_depth(&self, budget: u32, ten_bit: bool) -> u32 {
+        if budget != 0 && ten_bit {
+            budget / 4 * 3
+        } else {
+            budget
+        }
     }
 
     /// Record this dock's pixel-rate budget, refresh ceiling and pixel-clock ceiling.
@@ -448,6 +473,16 @@ mod tests {
             profile::PROFILE_NAVARRO.capabilities.pixel_budget,
             2 * rate(2560, 1440, 165)
         );
+        // That pair is admitted at 24 bpp and refused at 30, which is what the hardware does: a
+        // budget large enough to admit it deep leaves both sinks powered off with nothing logged.
+        let price = |budget: u32| budget / 4 * 3;
+        let deep = price(profile::PROFILE_NAVARRO.capabilities.pixel_budget);
+        assert!(2 * rate(2560, 1440, 165) > deep);
+        assert!(2 * rate(2560, 1440, 120) <= deep);
+        // Two 1440p120 connectors fit deep, and stop fitting the moment the price is charged
+        // twice, so a budget priced at the depth being decided withdraws the ten bits that same
+        // pair was just admitted at.
+        assert!(2 * rate(2560, 1440, 120) > price(deep));
         assert_eq!(rate(65535, 65535, 65535), u32::MAX); // saturates, never wraps small
         assert_eq!(rate(2560, 1440, -1), 0);
     }
