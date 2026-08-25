@@ -201,6 +201,25 @@ impl crtc::DriverCrtc for VinoCrtc {
             );
             return Err(EINVAL);
         }
+        // Price the budget for the depth this commit will actually be driven at. The recorded
+        // depth is a commit behind -- it is written when a connector is enabled -- so asking for it
+        // here admits a pair on the eight-bit budget and then drives it at ten, which the dock
+        // answers by accepting every byte of the second stream and never lighting it.
+        // Decide the link depth here rather than refusing the mode. Ten bits costs a third more
+        // per pixel, so a pair that fits at eight may not fit at ten; a compositor answers a
+        // rejected mode by disabling the output, so the depth gives way and both connectors light.
+        if budget != 0 {
+            let wants_deep = state
+                .new_connector_state_for_crtc(crtc)
+                .is_some_and(|conn| {
+                    conn.max_requested_bpc() >= 10
+                        && conn.hdr_output_eotf() == Some(connector::Eotf::SmpteSt2084)
+                });
+            let combined_now =
+                new_rate.saturating_add(data.other_connectors_rate(&state, connector));
+            let fits_deep = combined_now <= data.budget_at_depth(budget, true);
+            data.set_connector_ten_bit_denied(connector as u8, wants_deep && !fits_deep);
+        }
         if budget == 0 || new_rate <= old_rate {
             return Ok(());
         }

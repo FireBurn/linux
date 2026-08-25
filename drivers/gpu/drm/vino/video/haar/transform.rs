@@ -281,10 +281,38 @@ impl Depth {
     /// under every candidate and keeping the one that stays monotonic
     /// (`tools/codec/depth-probe.py`).
     #[inline]
+    /// Maximum escape category for a luma AC coefficient.
+    ///
+    /// Unlike [`Self::dc_cmax`] this does **not** scale with the sample depth. Raising it two
+    /// categories to match the DC ceiling was tried against the hardware and desynchronises the
+    /// dock: at the maximum category the escape omits its unary terminator, so a ceiling above the
+    /// dock's makes every coefficient below it carry a terminator the dock reads as an offset bit,
+    /// and the picture breaks into horizontal bands.
+    ///
+    /// Saturating at the eight-bit ceiling clips the largest coefficients of ten-bit content
+    /// instead, which is the conservative failure. Settling the real value needs a capture of the
+    /// vendor driving AC-heavy HDR content, which has never been taken.
+    pub(crate) fn ac_cmax(self) -> u32 {
+        match self {
+            Depth::Eight => AC_CMAX,
+            // A coefficient is four times the sample, so every ceiling the depth moves gains two
+            // categories. The code table stating this one is raised with it.
+            Depth::Ten => AC_CMAX + 2,
+        }
+    }
+
+    /// Maximum escape category for a chroma AC coefficient at this depth; see [`Self::ac_cmax`].
+    pub(crate) fn chroma_ac_cmax(self) -> u32 {
+        match self {
+            Depth::Eight => CHROMA_AC_CMAX,
+            Depth::Ten => CHROMA_AC_CMAX + 2,
+        }
+    }
+
     pub(crate) fn dc_cmax(self) -> u32 {
         match self {
             Depth::Eight => SOLID_DC_CMAX,
-            Depth::Ten => 12,
+            Depth::Ten => SOLID_DC_CMAX + 2,
         }
     }
 
@@ -497,11 +525,12 @@ impl Bits {
         lcr: usize,
         lcb: usize,
         ly: usize,
+        depth: Depth,
     ) -> Result {
         for &(q, last, cmax) in &[
-            (qcr, lcr, CHROMA_AC_CMAX),
-            (qcb, lcb, CHROMA_AC_CMAX),
-            (qy, ly, AC_CMAX),
+            (qcr, lcr, depth.chroma_ac_cmax()),
+            (qcb, lcb, depth.chroma_ac_cmax()),
+            (qy, ly, depth.ac_cmax()),
         ] {
             for i in 1..=last {
                 if q[i] == 0 {
@@ -527,6 +556,33 @@ mod tests {
     /// of the same capture only at 10. Getting this wrong does not degrade the picture, it
     /// desynchronises the dock's decoder -- at the maximum category `esc` omits the unary
     /// 0-terminator, so the next value's first bit is read as an offset bit.
+    /// The AC ceilings scale with the sample depth, exactly as the DC ceiling does.
+    ///
+    /// A ten-bit sample makes every coefficient four times larger, which is two categories. Held
+    /// at their eight-bit values the escape saturates the bulk of the AC energy rather than just
+    /// the extremes, and the picture breaks up into blocks. The vendor's own stress content states
+    /// the same scaling: a two-pixel grating that is category 9 in SDR is category 11 in HDR.
+    #[test]
+    fn haar_depth_selects_the_ac_codebooks() {
+        use Depth;
+        assert_eq!(Depth::Eight.ac_cmax(), 9);
+        assert_eq!(Depth::Ten.ac_cmax(), 11);
+        assert_eq!(Depth::Eight.chroma_ac_cmax(), 10);
+        assert_eq!(Depth::Ten.chroma_ac_cmax(), 12);
+        // An AC ceiling left behind stays in step, because the category fixes the field width,
+        // and reconstructs every sharp edge from a truncated magnitude instead.
+        assert_eq!(Depth::Ten.ac_cmax(), Depth::Eight.ac_cmax() + 2);
+        assert_eq!(
+            Depth::Ten.chroma_ac_cmax(),
+            Depth::Eight.chroma_ac_cmax() + 2
+        );
+        assert_eq!(Depth::Ten.dc_cmax(), Depth::Eight.dc_cmax() + 2);
+        // Chroma stays one category above luma, so a coefficient at luma's ceiling still carries
+        // the unary terminator on the chroma planes.
+        assert_eq!(Depth::Eight.chroma_ac_cmax(), Depth::Eight.ac_cmax() + 1);
+        assert_eq!(Depth::Ten.chroma_ac_cmax(), Depth::Ten.ac_cmax() + 1);
+    }
+
     #[test]
     fn haar_depth_selects_the_dc_codebook() {
         use Depth;

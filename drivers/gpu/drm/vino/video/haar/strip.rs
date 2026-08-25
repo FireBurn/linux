@@ -321,11 +321,11 @@ pub(crate) fn colour_strip(
     }
     let mut row0 = Bits::new(coding);
     for b in &blocks[..STRIP_ROW_BLOCKS] {
-        row0.colour_block_ac(&b.qcr, &b.qcb, &b.qy, b.lcr, b.lcb, b.ly)?;
+        row0.colour_block_ac(&b.qcr, &b.qcb, &b.qy, b.lcr, b.lcb, b.ly, geometry.depth())?;
     }
     let mut row1 = Bits::new(coding);
     for b in &blocks[STRIP_ROW_BLOCKS..] {
-        row1.colour_block_ac(&b.qcr, &b.qcb, &b.qy, b.lcr, b.lcb, b.ly)?;
+        row1.colour_block_ac(&b.qcr, &b.qcb, &b.qy, b.lcr, b.lcb, b.ly, geometry.depth())?;
     }
 
     // `Bits` buffers into a word, so `out` is only complete once finished -- take all three

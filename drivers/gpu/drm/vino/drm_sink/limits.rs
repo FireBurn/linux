@@ -133,8 +133,31 @@ impl VinoDrmData {
     ///
     /// Zero means unknown and disables limiting.
     pub(super) fn dock_budget(&self) -> u32 {
-        self.dock_pixel_budget
-            .load(core::sync::atomic::Ordering::Relaxed)
+        let budget = self
+            .dock_pixel_budget
+            .load(core::sync::atomic::Ordering::Relaxed);
+        // The budget is a bandwidth limit expressed in pixels, and it was measured with the dock
+        // storing three bytes for each one. A connector driven at ten bits stores four, so the
+        // same pixel costs a third more and the dock has room for correspondingly fewer.
+        //
+        // Price the whole dock at its deepest connector, because the bandwidth is shared: a pair
+        // admitted on the eight-bit budget and then driven at ten leaves the dock accepting every
+        // byte of the second stream without ever starting its pixel clock, which looks like a dead
+        // sink rather than a mode that did not fit.
+        self.budget_at_depth(budget, self.any_connector_ten_bit())
+    }
+
+    /// The dock's budget priced for a commit that is about to drive ten bits per channel.
+    ///
+    /// `dock_budget` prices from recorded state, which an atomic check cannot use: the depth for
+    /// the commit being checked is not recorded until it is enabled. A check that asks at the old
+    /// depth admits a pair that only fits at eight bits and then drives it at ten.
+    pub(super) fn budget_at_depth(&self, budget: u32, ten_bit: bool) -> u32 {
+        if budget != 0 && ten_bit {
+            budget / 4 * 3
+        } else {
+            budget
+        }
     }
 
     /// Record this dock's pixel-rate budget, refresh ceiling and pixel-clock ceiling.
@@ -448,6 +471,11 @@ mod tests {
             profile::PROFILE_NAVARRO.capabilities.pixel_budget,
             2 * rate(2560, 1440, 165)
         );
+        // That pair is admitted at 24 bpp and refused at 30, which is what the hardware does: a
+        // budget large enough to admit it deep leaves both sinks powered off with nothing logged.
+        let deep = profile::PROFILE_NAVARRO.capabilities.pixel_budget / 4 * 3;
+        assert!(2 * rate(2560, 1440, 165) > deep);
+        assert!(2 * rate(2560, 1440, 120) <= deep);
         assert_eq!(rate(65535, 65535, 65535), u32::MAX); // saturates, never wraps small
         assert_eq!(rate(2560, 1440, -1), 0);
     }

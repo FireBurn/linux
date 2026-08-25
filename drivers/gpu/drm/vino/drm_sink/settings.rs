@@ -208,13 +208,40 @@ impl VinoDrmData {
     /// link through `max bpc` on a dock that can carry one. An eight-bit surface over a ten-bit
     /// link is the ordinary case on every other driver, and refusing it here is what left a
     /// connector driven in PQ at eight bits with nothing reporting why.
-    fn connector_wire_ten_bit(&self, connector: u8) -> bool {
+    pub(super) fn connector_wire_ten_bit(&self, connector: u8) -> bool {
         if self.connector_ten_bit.load(Ordering::Acquire) & (1u32 << u32::from(connector)) != 0 {
             return true;
         }
         let shift = u32::from(connector) * 4;
         let requested = (self.connector_max_bpc.load(Ordering::Acquire) >> shift) & 0xf;
-        self.hdr_capable() && requested >= 10
+        // A compositor sets `max bpc` to ten on every connector it can, whether or not that
+        // connector is showing HDR, so the request on its own is not the vendor's condition: the
+        // vendor moves a link to ten bits when the connector is driven in PQ and leaves it at
+        // eight otherwise. Follow that, or an ordinary SDR desktop is re-encoded at a depth
+        // nothing asked for.
+        if self.connector_deny_ten_bit.load(Ordering::Acquire) & (1u32 << u32::from(connector)) != 0
+        {
+            return false;
+        }
+        self.hdr_capable() && requested >= 10 && self.connector_is_st2084(connector as usize)
+    }
+
+    /// Record whether this connector's ten-bit link fits the dock's shared bandwidth.
+    pub(super) fn set_connector_ten_bit_denied(&self, connector: u8, denied: bool) {
+        let bit = 1u32 << u32::from(connector);
+        if denied {
+            self.connector_deny_ten_bit.fetch_or(bit, Ordering::Release);
+        } else {
+            self.connector_deny_ten_bit
+                .fetch_and(!bit, Ordering::Release);
+        }
+    }
+
+    /// Whether any connector on this dock is driven at ten bits per channel.
+    ///
+    /// The dock's bandwidth is shared, so its budget has to be priced at its deepest connector.
+    pub(super) fn any_connector_ten_bit(&self) -> bool {
+        (0..self.connector_count()).any(|c| self.connector_wire_ten_bit(c as u8))
     }
 
     /// This device's codec geometry at one connector's committed sample depth.
