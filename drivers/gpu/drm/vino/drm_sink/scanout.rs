@@ -1115,9 +1115,19 @@ fn encode_and_send_haar(
     // What the encoded bytes depend on besides the strip pixels themselves; see
     // `StripHashState::tag`. Identity rotation is a precondition of caching at all, so it needs no
     // representation here.
-    let gamma_tag = match &src.color {
-        Some(pipeline) => pipeline.tag(),
-        None => 0,
+    let gamma_tag = {
+        let gamma = match &src.color {
+            Some(pipeline) => pipeline.tag(),
+            None => 0,
+        };
+        // The sample depth belongs here for the same reason gamma does, and is the more dangerous
+        // of the two: changing it re-maps every sample on the way into the codec and moves the
+        // escape ceiling, while leaving the framebuffer byte for byte identical. A cache keyed on
+        // the raw pixels alone therefore serves bodies encoded at the old depth inside a stream
+        // declared at the new one, and the dock decodes half a frame correctly and the rest as
+        // noise.
+        let deep = matches!(src.depth, crate::video::haar::Depth::Ten);
+        gamma ^ (u64::from(deep) << 63) ^ (u64::from(deep) * 0x9e37_79b9_7f4a_7c15)
     };
     // Strips carried over verbatim from the previous frame's encode, and the strips actually
     // handed to the codec; kept for the post-send cache publish below.
