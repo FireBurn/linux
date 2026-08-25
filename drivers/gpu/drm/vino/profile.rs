@@ -244,10 +244,13 @@ pub(crate) struct Capabilities {
     pub(crate) max_connector_clock_khz: u32,
     /// Dock-wide pixel-rate budget in pixels per second, shared across all connectors.
     ///
-    /// The DL7400's is the dual-connector rate DLM was measured sustaining. Ridge's is the highest
-    /// combined rate measured driving cleanly, 2560x1440p144 beside 2560x1440p120. That is a floor
-    /// on the dock's real ceiling rather than the ceiling itself: no pair of sinks to hand can ask
-    /// for more, so what lies above it is untested.
+    /// The DL7400's is the dual-connector rate DLM was measured sustaining, and it is also what
+    /// bounds the depth: three quarters of it is what a 30 bpp connector is priced against, which
+    /// puts two connectors at 2560x1440p165 outside 30 bpp. Raising it to the dock's rated
+    /// four-connector 4K60 load admits that pair and the sinks then power off with nothing logged,
+    /// so the rated figure is not a bound this budget can borrow. Ridge's is the highest combined
+    /// rate measured driving cleanly, 2560x1440p144 beside 2560x1440p120. Both are floors on the
+    /// dock's real ceiling rather than the ceiling itself.
     ///
     /// Do not mistake DLM's declared per-connector `pixel_per_second_limit` for the bound. It
     /// clamps every Ridge connector to 120 Hz as policy, and the dock drives a single connector a
