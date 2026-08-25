@@ -246,6 +246,13 @@ impl crtc::DriverCrtc for VinoCrtc {
             .and_then(|conn| conn.hdr_output_eotf())
             == Some(connector::Eotf::SmpteSt2084);
         data.set_connector_st2084(connector, st2084);
+        // The link depth userspace asked for, which is a separate question from the framebuffer's
+        // format: an eight-bit surface over a ten-bit link is the ordinary case, and reading the
+        // format alone silently ignores the request.
+        let requested_bpc = state
+            .new_connector_state_for_crtc(crtc)
+            .map_or(0, |conn| conn.max_requested_bpc());
+        data.set_connector_max_bpc(connector, requested_bpc);
         // Cache this connector's colour transform for the scanout to apply.
         data.update_color(connector as usize, new.gamma_lut(), new.ctm());
         // Whatever this connector's sink state was, the enable path re-runs the full bracket and
@@ -278,11 +285,13 @@ impl crtc::DriverCrtc for VinoCrtc {
             }
         };
         vino_debug!(
-            "vino: KMS CRTC enable -- connector {} display ON, mode {}x{}@{} (scanout begins)\n",
+            "vino: KMS CRTC enable -- connector {} display ON, mode {}x{}@{} {} bpc{} (scanout begins)\n",
             connector,
             timing.hactive,
             timing.vactive,
-            timing.refresh_hz
+            timing.refresh_hz,
+            if timing.ten_bit { 10 } else { 8 },
+            if timing.st2084 { " PQ" } else { "" }
         );
         // Publish the desired timing; atomic callbacks must not block on USB.
         let mode_key = timing_key(&timing);

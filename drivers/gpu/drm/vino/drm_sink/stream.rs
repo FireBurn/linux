@@ -208,15 +208,10 @@ impl VinoDrmData {
     /// whose 1080-line modes are stated as 1088.
     /// Whether this connector is being driven at 30 bpp.
     ///
-    /// The decoder configuration and the set-mode both state the depth, and both read it here so
-    /// that they cannot disagree.
+    /// The decoder configuration, the set-mode and the codec all state the depth, and all read it
+    /// from [`Self::connector_programmed_ten_bit`] so that they cannot disagree.
     fn connector_ten_bit(&self, connector: usize) -> bool {
-        self.last_timing
-            .lock()
-            .get(connector)
-            .copied()
-            .flatten()
-            .is_some_and(|t| t.ten_bit)
+        u8::try_from(connector).is_ok_and(|c| self.connector_programmed_ten_bit(c))
     }
 
     fn stream_mode_header(&self, connector: usize) -> Result<[u8; 26]> {
