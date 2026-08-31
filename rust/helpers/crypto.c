@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <crypto/akcipher.h>
 #include <crypto/aes.h>
 #include <crypto/aes-cbc-macs.h>
 #include <linux/string.h>
@@ -8,6 +9,20 @@ __rust_helper void rust_helper_memzero_explicit(void *s, size_t count)
 {
 	memzero_explicit(s, count);
 }
+
+#ifdef CONFIG_RUST_CRYPTO_RSA
+__rust_helper void rust_helper_crypto_free_akcipher(struct crypto_akcipher *tfm)
+{
+	crypto_free_akcipher(tfm);
+}
+
+__rust_helper int
+rust_helper_crypto_akcipher_set_pub_key(struct crypto_akcipher *tfm,
+					const void *key, unsigned int key_len)
+{
+	return crypto_akcipher_set_pub_key(tfm, key, key_len);
+}
+#endif
 
 #ifdef CONFIG_RUST_CRYPTO_LIB_AES
 /*

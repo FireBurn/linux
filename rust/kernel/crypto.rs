@@ -9,13 +9,26 @@
 //! synchronously in the calling context with no allocation; the hashes and the
 //! MAC are infallible.
 //!
-//! C headers: [`include/crypto/aes.h`](srctree/include/crypto/aes.h),
+//! Public-key ciphers are available through [`akcipher`] when
+//! `CONFIG_RUST_CRYPTO_RSA` is enabled.
+//!
+//! C headers: [`include/crypto/akcipher.h`](srctree/include/crypto/akcipher.h),
+//! [`include/crypto/aes.h`](srctree/include/crypto/aes.h),
 //! [`include/crypto/aes-cbc-macs.h`](srctree/include/crypto/aes-cbc-macs.h),
 //! [`include/crypto/sha2.h`](srctree/include/crypto/sha2.h).
 
+use core::ops::{Deref, DerefMut};
+
 use crate::bindings;
-#[cfg(CONFIG_RUST_CRYPTO_LIB_AES)]
+#[cfg(any(
+    CONFIG_RUST_CRYPTO_RSA,
+    CONFIG_RUST_CRYPTO_LIB_AES,
+    CONFIG_RUST_CRYPTO_LIB_SHA256
+))]
 use crate::{error::to_result, prelude::*};
+
+#[cfg(CONFIG_RUST_CRYPTO_RSA)]
+pub mod rsa;
 
 /// Size of a SHA-256 / HMAC-SHA256 digest, in bytes.
 pub const SHA256_DIGEST_SIZE: usize = 32;
@@ -29,6 +42,48 @@ pub const AES128_BLOCK_SIZE: usize = 16;
 pub fn zeroize(bytes: &mut [u8]) {
     // SAFETY: `bytes` is valid for `bytes.len()` writes.
     unsafe { bindings::memzero_explicit(bytes.as_mut_ptr().cast(), bytes.len()) };
+}
+
+/// A fixed-size byte string which is wiped when dropped.
+///
+/// This is intended for cryptographic keys and other sensitive intermediate
+/// values. Borrowing the contained bytes can still create copies which this
+/// type cannot track; callers should avoid copying them unnecessarily.
+pub struct Secret<const N: usize>([u8; N]);
+
+impl<const N: usize> Secret<N> {
+    /// Wraps bytes which should be wiped when their owner is dropped.
+    #[inline]
+    pub const fn new(bytes: [u8; N]) -> Self {
+        Self(bytes)
+    }
+
+    /// Creates an all-zero byte string.
+    #[inline]
+    pub const fn zeroed() -> Self {
+        Self([0; N])
+    }
+}
+
+impl<const N: usize> Deref for Secret<N> {
+    type Target = [u8; N];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const N: usize> DerefMut for Secret<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<const N: usize> Drop for Secret<N> {
+    #[inline]
+    fn drop(&mut self) {
+        zeroize(&mut self.0);
+    }
 }
 
 /// Returns the SHA-256 digest of `data`.
