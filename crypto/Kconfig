@@ -116,6 +116,17 @@ config CRYPTO_AKCIPHER
 	select CRYPTO_AKCIPHER2
 	select CRYPTO_ALGAPI
 
+config RUST_CRYPTO_RSA
+	bool
+	depends on RUST
+	select CRYPTO_AKCIPHER
+	select CRYPTO_RSA
+	help
+	  Enable the Rust bindings for RSA public-key encryption. The crypto
+	  API core is built into the kernel because Rust abstractions are part
+	  of the built-in kernel crate; individual algorithms may remain
+	  modules.
+
 config CRYPTO_KPP2
 	tristate
 	select CRYPTO_ALGAPI2
