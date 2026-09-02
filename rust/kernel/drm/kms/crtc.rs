@@ -25,6 +25,27 @@ use core::{
 };
 use macros::vtable;
 
+/// One entry in a DRM gamma or degamma lookup table.
+#[repr(transparent)]
+pub struct ColorLut(bindings::drm_color_lut);
+
+impl ColorLut {
+    /// Red channel value.
+    pub fn red(&self) -> u16 {
+        self.0.red
+    }
+
+    /// Green channel value.
+    pub fn green(&self) -> u16 {
+        self.0.green
+    }
+
+    /// Blue channel value.
+    pub fn blue(&self) -> u16 {
+        self.0.blue
+    }
+}
+
 /// The main trait for implementing the [`struct drm_crtc`] API for [`Crtc`].
 ///
 /// Any KMS driver should have at least one implementation of this type, which allows them to create
@@ -691,6 +712,27 @@ pub trait RawCrtcState: AsRawCrtcState {
         // SAFETY: `mode` is embedded in the CRTC state and therefore has the same lifetime. The
         // atomic-state API serializes access while the mode can be changed.
         unsafe { DisplayMode::as_ref(core::ptr::addr_of!((*self.as_raw()).mode)) }
+    }
+
+    /// Returns the CRTC's gamma LUT for this state as an array of [`ColorLut`] entries, or
+    /// [`None`] if no gamma LUT is programmed. Requires colour management to have been enabled
+    /// on the CRTC.
+    ///
+    fn gamma_lut(&self) -> Option<&[ColorLut]> {
+        // SAFETY: `as_raw()` is a valid `drm_crtc_state`.
+        let blob = unsafe { (*self.as_raw()).gamma_lut };
+        if blob.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null gamma_lut blob is valid for the state's lifetime.
+        let (data, length) = unsafe { ((*blob).data, (*blob).length) };
+        let n = length / core::mem::size_of::<ColorLut>();
+        if data.is_null() || n == 0 {
+            return None;
+        }
+        // SAFETY: `ColorLut` is transparent over `drm_color_lut`; the blob holds `n` contiguous
+        // entries valid for the state's lifetime.
+        Some(unsafe { core::slice::from_raw_parts(data.cast::<ColorLut>(), n) })
     }
 }
 impl<T: AsRawCrtcState> RawCrtcState for T {}
