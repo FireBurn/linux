@@ -25,6 +25,48 @@ use core::{
     ptr::{null, null_mut, NonNull},
 };
 
+/// Plane rotation and reflection properties.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Rotation(u32);
+
+impl Rotation {
+    /// No rotation.
+    pub const ROTATE_0: Self = Self(bindings::DRM_MODE_ROTATE_0);
+    /// Rotate clockwise by 90 degrees.
+    pub const ROTATE_90: Self = Self(bindings::DRM_MODE_ROTATE_90);
+    /// Rotate clockwise by 180 degrees.
+    pub const ROTATE_180: Self = Self(bindings::DRM_MODE_ROTATE_180);
+    /// Rotate clockwise by 270 degrees.
+    pub const ROTATE_270: Self = Self(bindings::DRM_MODE_ROTATE_270);
+    /// Reflect across the X axis after rotation.
+    pub const REFLECT_X: Self = Self(bindings::DRM_MODE_REFLECT_X);
+    /// Reflect across the Y axis after rotation.
+    pub const REFLECT_Y: Self = Self(bindings::DRM_MODE_REFLECT_Y);
+
+    /// Return whether every bit in `other` is set.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Return the selected rotation without reflection bits.
+    pub const fn angle(self) -> Self {
+        Self(self.0 & bindings::DRM_MODE_ROTATE_MASK)
+    }
+
+    fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl BitOr for Rotation {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+
 /// The main trait for implementing the [`struct drm_plane`] API for [`Plane`].
 ///
 /// Any KMS driver should have at least one implementation of this type, which allows them to create
@@ -370,6 +412,28 @@ impl<T: DriverPlane> UnregisteredPlane<T> {
         // SAFETY: `as_raw()` is a valid, not-yet-registered plane; attaching a property before
         // registration is exactly what this helper is for.
         unsafe { bindings::drm_plane_enable_fb_damage_clips(self.as_raw()) }
+    }
+
+    /// Attach a rotation property to this plane, advertising `supported_rotations` (a bitmask of
+    /// `DRM_MODE_ROTATE_*` | `DRM_MODE_REFLECT_*`) with initial value `default_rotation`. The
+    /// selected value is then readable from the plane state via
+    /// [`RawPlaneState::rotation`](crate::drm::kms::plane::RawPlaneState::rotation).
+    ///
+    /// Call this during [`KmsDriver::probe`](crate::drm::kms::KmsDriver::probe), before the device
+    /// is registered.
+    pub fn create_rotation_property(
+        &self,
+        default_rotation: Rotation,
+        supported_rotations: Rotation,
+    ) -> Result {
+        // SAFETY: `as_raw()` is a valid, not-yet-registered plane.
+        to_result(unsafe {
+            bindings::drm_plane_create_rotation_property(
+                self.as_raw(),
+                default_rotation.bits(),
+                supported_rotations.bits(),
+            )
+        })
     }
 }
 
@@ -749,6 +813,14 @@ pub trait RawPlaneState: AsRawPlaneState {
     fn visible_destination(&self) -> Option<Rect> {
         self.visible().then(|| Rect::from_raw(&self.as_raw().dst))
     }
+
+    /// The plane's rotation/reflection (`DRM_MODE_ROTATE_*` | `DRM_MODE_REFLECT_*` bitmask), for a
+    /// plane with a rotation property (see
+    /// [`UnregisteredPlane::create_rotation_property`]). Defaults to `DRM_MODE_ROTATE_0`.
+    fn rotation(&self) -> Rotation {
+        Rotation(self.as_raw().rotation)
+    }
+
     /// Return the current [`OpaqueCrtc`] assigned to this plane, if there is one.
     ///
     /// The returned CRTC reference cannot outlive the plane-state borrow:
