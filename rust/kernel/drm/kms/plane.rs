@@ -617,6 +617,16 @@ pub trait RawPlaneState: AsRawPlaneState {
         unsafe { Self::Plane::from_raw(self.as_raw().plane) }
     }
 
+    /// Return the width of this plane's destination rectangle in CRTC pixels.
+    fn crtc_w(&self) -> u32 {
+        self.as_raw().crtc_w
+    }
+
+    /// Return the height of this plane's destination rectangle in CRTC pixels.
+    fn crtc_h(&self) -> u32 {
+        self.as_raw().crtc_h
+    }
+
     /// Return the current [`OpaqueCrtc`] assigned to this plane, if there is one.
     ///
     /// The returned CRTC reference cannot outlive the plane-state borrow:
