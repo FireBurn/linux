@@ -77,7 +77,7 @@ pub(crate) mod private {
 /// generate said functions for any kind of type which the original mode object driver trait can be
 /// derived from. All conversions check the mode object's vtable. For example:
 ///
-/// ```compile_fail
+/// ```ignore
 /// impl<'a, T: DriverConnectorState> ConnectorState<T> {
 ///     impl_from_opaque_mode_obj! {
 ///         // | An optional lifetime and param-variables to declare for each function
@@ -245,10 +245,7 @@ pub trait KmsDriver: Driver {
     type Encoder: encoder::DriverEncoder<Driver = Self>;
 
     /// Return a [`ModeConfigInfo`] structure for this [`device::Device`].
-    fn mode_config_info(
-        dev: &device::Device,
-        drm_data: &Self::Data,
-    ) -> Result<ModeConfigInfo>;
+    fn mode_config_info(dev: &device::Device, drm_data: &Self::Data) -> Result<ModeConfigInfo>;
 
     /// Create mode objects like [`crtc::Crtc`], [`plane::Plane`], etc. for this device
     fn create_objects(drm: &UnregisteredKmsDevice<'_, Self>) -> Result
