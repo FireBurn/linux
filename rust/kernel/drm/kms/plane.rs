@@ -5,8 +5,8 @@
 //! C header: [`include/drm/drm_plane.h`](srctree/include/drm/drm_plane.h)
 
 use super::{
-    atomic::*, crtc::*, framebuffer::*, KmsDriver, ModeObject, ModeObjectVtable, StaticModeObject,
-    UnregisteredKmsDevice, Sealed
+    atomic::*, crtc::*, framebuffer::*, KmsDriver, ModeObject, ModeObjectVtable, Sealed,
+    StaticModeObject, UnregisteredKmsDevice,
 };
 use crate::{
     alloc::KBox,
