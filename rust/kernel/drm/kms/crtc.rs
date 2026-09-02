@@ -644,6 +644,7 @@ pub trait AsRawCrtcState: private::AsRawCrtcState {
 pub(crate) mod private {
     use super::*;
 
+    /// The raw-pointer half of [`AsRawCrtcState`](super::AsRawCrtcState).
     #[allow(unreachable_pub)]
     pub trait AsRawCrtcState {
         /// Return a raw pointer to the DRM CRTC state
@@ -677,6 +678,13 @@ pub trait RawCrtcState: AsRawCrtcState {
         // atomic check context, and are invariant beyond that point - so our interface can ensure
         // this access is serialized
         unsafe { (*self.as_raw()).active }
+    }
+
+    /// Return the display mode programmed into this CRTC state.
+    fn mode(&self) -> &DisplayMode {
+        // SAFETY: `mode` is embedded in the CRTC state and therefore has the same lifetime. The
+        // atomic-state API serializes access while the mode can be changed.
+        unsafe { DisplayMode::as_ref(core::ptr::addr_of!((*self.as_raw()).mode)) }
     }
 }
 impl<T: AsRawCrtcState> RawCrtcState for T {}
