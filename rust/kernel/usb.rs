@@ -1465,6 +1465,76 @@ impl<T, S: UrbState> Deref for UrbHandle<T, S> {
     }
 }
 
+impl<T> UrbHandle<T, Idle> {
+    /// Returns the entire transfer-buffer allocation for an idle URB.
+    ///
+    /// The idle state proves that USB core cannot access the buffer while the
+    /// shared slice exists.
+    pub fn transfer_buffer(&self) -> &[u8] {
+        if self.transfer_buffer_capacity == 0 {
+            return &[];
+        }
+        // SAFETY: The URB is idle, its transfer buffer was allocated for
+        // `transfer_buffer_capacity` bytes in `init_common()`.
+        unsafe {
+            slice::from_raw_parts(
+                (*self.urb.as_ptr()).transfer_buffer.cast(),
+                self.transfer_buffer_capacity,
+            )
+        }
+    }
+
+    /// Returns the entire transfer-buffer allocation for an idle URB.
+    ///
+    /// The idle state proves that USB core cannot access the buffer while the
+    /// mutable slice exists.
+    pub fn transfer_buffer_mut(&mut self) -> &mut [u8] {
+        if self.transfer_buffer_capacity == 0 {
+            return &mut [];
+        }
+        // SAFETY: The URB is idle, its transfer buffer was allocated for
+        // `transfer_buffer_capacity` bytes in `init_common()`, and `&mut self`
+        // grants exclusive access for the returned borrow.
+        unsafe {
+            slice::from_raw_parts_mut(
+                (*self.urb.as_ptr()).transfer_buffer.cast(),
+                self.transfer_buffer_capacity,
+            )
+        }
+    }
+
+    /// Sets the number of transfer-buffer bytes used by the next submission.
+    pub fn set_transfer_buffer_length(&mut self, len: usize) -> Result {
+        if len > self.transfer_buffer_capacity {
+            return Err(EMSGSIZE);
+        }
+        let len = len.try_into()?;
+        // SAFETY: The URB is idle and `len` is within its backing allocation.
+        unsafe { (*self.urb.as_ptr()).transfer_buffer_length = len };
+        Ok(())
+    }
+}
+
+impl<T> UrbHandle<T, Active> {
+    /// Cancel any outstanding transfer and recover an idle, reusable handle.
+    pub fn into_idle(self) -> Pin<UrbHandle<T, Idle>> {
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: The active handle owns a live URB. `usb_kill_urb()` waits
+        // until its completion callback has returned.
+        unsafe { bindings::usb_kill_urb(this.urb.as_ptr()) };
+
+        let handle = UrbHandle {
+            urb: this.urb,
+            transfer_buffer_capacity: this.transfer_buffer_capacity,
+            _state: PhantomData,
+            _ty: PhantomData,
+        };
+        // SAFETY: The C URB allocation is stable independently of the Rust
+        // handle's address.
+        unsafe { Pin::new_unchecked(handle) }
+    }
+}
+
 impl<T, S: UrbState> Drop for UrbHandle<T, S> {
     fn drop(&mut self) {
         // SAFETY: `self.as_raw()` points to a valid, initialized C `struct urb`.
@@ -1493,7 +1563,7 @@ impl<T, S: UrbState> Drop for UrbHandle<T, S> {
             unsafe {
                 drop(KBox::from_raw(ptr::slice_from_raw_parts_mut(
                     urb.transfer_buffer.cast::<u8>(),
-                    urb.transfer_buffer_length as usize,
+                    self.transfer_buffer_capacity,
                 )));
             }
         }
@@ -1681,6 +1751,8 @@ impl<T> Urb<T> {
         transfer_flags: TransferFlags,
         interval: i32,
     ) -> Result<Pin<UrbHandle<T, Idle>>> {
+        let transfer_buffer_capacity = transfer_buffer.as_ref().map_or(0, |buffer| buffer.len());
+
         // SAFETY: `usb_alloc_urb` allocates a `struct urb` + ISO frame.
         let urb_ptr =
             unsafe { bindings::usb_alloc_urb(number_of_packets as c_int, mem_flags.as_raw()) };
@@ -1733,6 +1805,7 @@ impl<T> Urb<T> {
         let urb_handle = UrbHandle {
             // SAFETY: `urb_ptr` is guaranteed non-null by the null check above.
             urb: unsafe { NonNull::new_unchecked(urb_ptr) },
+            transfer_buffer_capacity,
             _state: PhantomData,
             _ty: PhantomData,
         };
@@ -1750,6 +1823,18 @@ impl<T> Urb<T> {
         self: Pin<UrbHandle<T, Idle>>,
         mem_flags: kernel::alloc::Flags,
     ) -> Result<UrbHandle<T, Active>> {
+        self.submit_recoverable(mem_flags)
+            .map_err(|(error, _handle)| error)
+    }
+
+    /// Submit the URB while returning the idle handle when submission fails.
+    ///
+    /// Queue implementations use this variant so a transient submission
+    /// error does not discard a preallocated URB and its transfer buffer.
+    pub fn submit_recoverable(
+        self: Pin<UrbHandle<T, Idle>>,
+        mem_flags: kernel::alloc::Flags,
+    ) -> core::result::Result<UrbHandle<T, Active>, (Error, Pin<UrbHandle<T, Idle>>)> {
         // SAFETY: The urb pointed to is not moved.
         let handle = unsafe { Pin::into_inner_unchecked(self) };
         // SAFETY: `handle.as_raw()` points to a valid, initialized `struct urb`.
@@ -1757,14 +1842,19 @@ impl<T> Urb<T> {
 
         if result == 0 {
             let urb = handle.urb;
+            let transfer_buffer_capacity = handle.transfer_buffer_capacity;
             core::mem::forget(handle);
             Ok(UrbHandle {
                 urb,
+                transfer_buffer_capacity,
                 _state: PhantomData,
                 _ty: PhantomData,
             })
         } else {
-            Err(Error::from_errno(result))
+            // SAFETY: Submission failed, so USB core did not take ownership
+            // and the handle remains idle and reusable.
+            let handle = unsafe { Pin::new_unchecked(handle) };
+            Err((Error::from_errno(result), handle))
         }
     }
 
